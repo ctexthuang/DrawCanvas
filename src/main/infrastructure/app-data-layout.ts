@@ -40,6 +40,7 @@ export type AppDataPaths = Readonly<{
   modelConfig: string
   projectsDirectory: string
   autosave: string
+  recentProjects: string
   historyDirectory: string
   generationHistory: string
   libraryDirectory: string
@@ -85,6 +86,7 @@ export function createAppDataPaths(storageDirectory: string): AppDataPaths {
     modelConfig: join(settingsDirectory, 'model-config.json'),
     projectsDirectory,
     autosave: join(projectsDirectory, 'autosave.drawcanvas.json'),
+    recentProjects: join(projectsDirectory, 'recent-projects.json'),
     historyDirectory,
     generationHistory: join(historyDirectory, 'generation-history.json'),
     libraryDirectory,

@@ -7,13 +7,17 @@ import type {
   GeneratedArtwork,
   ProviderConfig,
   ProviderConnectionTestResult,
+  RecentCanvasProject,
   ResourceCatalog,
+  SavePromptRequest,
   SaveProviderRequest,
+  SaveWorkflowRequest,
   StorageStats,
   TestProviderRequest,
   ThemeMode,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
+import { createRecentCanvasProject } from '../shared/domain/canvas-document'
 import {
   BUILTIN_PROVIDER_MODELS,
   DEFAULT_CHAT_MODEL_KEY,
@@ -52,7 +56,7 @@ const fallbackSettings: AppSettings = {
   theme: 'light',
   accentColor: '#ff5f77',
   storageDirectory: 'Draw Canvas Data',
-  favoriteImageIds: ['1', '2', '4', '6', '8'],
+  favoriteImageIds: [],
   enabledModelKeys: [DEFAULT_IMAGE_MODEL_KEY, DEFAULT_CHAT_MODEL_KEY],
   defaultModelKeys: { image: DEFAULT_IMAGE_MODEL_KEY, chat: DEFAULT_CHAT_MODEL_KEY },
   providers: fallbackProviders,
@@ -76,13 +80,26 @@ const fallbackStats: StorageStats = {
 const fallbackResources: ResourceCatalog = { prompts: seedPrompts, workflows: seedWorkflows }
 
 export function App() {
+  const [initialCanvasState] = useState(() => {
+    const autosave = window.desktop ? null : loadBrowserAutosave()
+    return {
+      document: autosave ?? createInitialCanvas(),
+      isActive: Boolean(autosave),
+    }
+  })
   const [page, setPage] = useState<AppPage>('home')
   const [settings, setSettings] = useState<AppSettings>(fallbackSettings)
   const [systemTheme, setSystemTheme] = useState<'light' | 'dark'>(() =>
     window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
   )
   const [stats, setStats] = useState<StorageStats>(fallbackStats)
-  const [canvasDocument, setCanvasDocument] = useState<CanvasDocument>(() => loadBrowserAutosave() ?? createInitialCanvas())
+  const [canvasDocument, setCanvasDocument] = useState<CanvasDocument>(initialCanvasState.document)
+  const [canvasIsActive, setCanvasIsActive] = useState(initialCanvasState.isActive)
+  const [recentProjects, setRecentProjects] = useState<ReadonlyArray<RecentCanvasProject>>(() =>
+    initialCanvasState.isActive
+      ? [createRecentCanvasProject(initialCanvasState.document, 'autosave')]
+      : [],
+  )
   const [generatedArtworks, setGeneratedArtworks] = useState<ReadonlyArray<GeneratedArtwork>>(loadBrowserHistory)
   const [libraryCatalog, setLibraryCatalog] = useState<ReadonlyArray<GeneratedArtwork>>(seedArtworks)
   const [resourceCatalog, setResourceCatalog] = useState<ResourceCatalog>(fallbackResources)
@@ -111,10 +128,11 @@ export function App() {
     let cancelled = false
     async function loadDesktopState(): Promise<void> {
       if (!window.desktop) return
-      const [settingsResult, statsResult, canvasResult, historyResult, libraryResult, resourcesResult] = await Promise.all([
+      const [settingsResult, statsResult, canvasResult, recentResult, historyResult, libraryResult, resourcesResult] = await Promise.all([
         window.desktop.settings.load(),
         window.desktop.storage.stats(),
         window.desktop.canvas.loadAutosave(),
+        window.desktop.canvas.listRecent(),
         window.desktop.history.load(),
         window.desktop.library.load(),
         window.desktop.resources.load(),
@@ -122,7 +140,11 @@ export function App() {
       if (cancelled) return
       if (settingsResult.ok) setSettings(settingsResult.value)
       if (statsResult.ok) setStats(statsResult.value)
-      if (canvasResult.ok && canvasResult.value) setCanvasDocument(canvasResult.value)
+      if (canvasResult.ok) {
+        if (canvasResult.value) setCanvasDocument(canvasResult.value)
+        setCanvasIsActive(Boolean(canvasResult.value))
+      }
+      if (recentResult.ok) setRecentProjects(recentResult.value)
       if (historyResult.ok) setGeneratedArtworks(historyResult.value)
       if (libraryResult.ok) setLibraryCatalog(libraryResult.value)
       if (resourcesResult.ok) setResourceCatalog(resourcesResult.value)
@@ -132,12 +154,23 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    if (!canvasIsActive) return
     const timeout = window.setTimeout(() => {
-      if (window.desktop) void window.desktop.canvas.saveAutosave(canvasDocument)
-      else localStorage.setItem('draw-canvas-autosave', JSON.stringify(canvasDocument))
+      setRecentProjects((current) => upsertRecentProject(
+        current,
+        createRecentCanvasProject(
+          canvasDocument,
+          current.find((project) => project.id === canvasDocument.id)?.location ?? 'autosave',
+        ),
+      ))
+      if (window.desktop) {
+        void window.desktop.canvas.saveAutosave(canvasDocument)
+      } else {
+        localStorage.setItem('draw-canvas-autosave', JSON.stringify(canvasDocument))
+      }
     }, 650)
     return () => window.clearTimeout(timeout)
-  }, [canvasDocument])
+  }, [canvasDocument, canvasIsActive])
 
   useEffect(() => {
     if (!window.desktop) localStorage.setItem('draw-canvas-generation-history', JSON.stringify(generatedArtworks))
@@ -172,20 +205,24 @@ export function App() {
       defaultImageModelKey,
       defaultImageModelName,
     ))
+    setCanvasIsActive(true)
     setPage('canvas')
   }
 
   async function openCanvasFile(): Promise<void> {
     if (!window.desktop) {
       notify('文件选择功能需要在 Electron 桌面端使用')
+      setCanvasIsActive(true)
       setPage('canvas')
       return
     }
     const result = await window.desktop.canvas.openFile()
     if (result.ok) {
       setCanvasDocument(result.value)
+      setCanvasIsActive(true)
       setPage('canvas')
       notify('项目已打开')
+      await refreshRecentProjects()
     } else if (result.error.code !== 'CANCELLED') notify(result.error.message)
   }
 
@@ -201,8 +238,62 @@ export function App() {
       return
     }
     const result = await window.desktop.canvas.saveFile(canvasDocument)
-    if (result.ok) notify(`已保存到 ${result.value}`)
+    if (result.ok) {
+      notify(`已保存到 ${result.value}`)
+      await refreshRecentProjects()
+    }
     else if (result.error.code !== 'CANCELLED') notify(result.error.message)
+  }
+
+  async function openRecentProject(id: string): Promise<void> {
+    if (!window.desktop) {
+      if (canvasIsActive && canvasDocument.id === id) setPage('canvas')
+      else notify('该最近项目只存在于桌面端数据目录')
+      return
+    }
+    const result = await window.desktop.canvas.loadRecent({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      await refreshRecentProjects()
+      return
+    }
+    setCanvasDocument(result.value)
+    setCanvasIsActive(true)
+    setPage('canvas')
+    notify('最近项目已恢复')
+    await refreshRecentProjects()
+  }
+
+  async function deleteRecentProject(project: RecentCanvasProject): Promise<void> {
+    const message = project.location === 'autosave'
+      ? `确定删除“${project.name}”吗？自动保存的画布数据会被删除，此操作不可撤销。`
+      : `确定删除“${project.name}”吗？Draw Canvas 数据目录中的项目文件会被删除；外部项目文件只会从最近列表移除。`
+    if (!window.confirm(message)) return
+
+    if (!window.desktop) {
+      if (canvasDocument.id === project.id) {
+        localStorage.removeItem('draw-canvas-autosave')
+        setCanvasIsActive(false)
+      }
+      setRecentProjects((current) => current.filter((item) => item.id !== project.id))
+      notify('最近项目已删除')
+      return
+    }
+
+    const result = await window.desktop.canvas.deleteRecent({ id: project.id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return
+    }
+    if (canvasDocument.id === project.id) setCanvasIsActive(false)
+    setRecentProjects(result.value)
+    notify('最近项目已删除')
+  }
+
+  async function refreshRecentProjects(): Promise<void> {
+    if (!window.desktop) return
+    const result = await window.desktop.canvas.listRecent()
+    if (result.ok) setRecentProjects(result.value)
   }
 
   function toggleFavorite(id: string): void {
@@ -210,6 +301,144 @@ export function App() {
       ? settings.favoriteImageIds.filter((favoriteId) => favoriteId !== id)
       : [...settings.favoriteImageIds, id]
     void updateSettings({ favoriteImageIds: next })
+  }
+
+  async function importLibraryImages(): Promise<void> {
+    if (!window.desktop) {
+      notify('本地图片导入需要在 Electron 桌面端使用')
+      return
+    }
+    const previousCount = libraryCatalog.length
+    const result = await window.desktop.library.importImages()
+    if (!result.ok) {
+      if (result.error.code !== 'CANCELLED') notify(result.error.message)
+      return
+    }
+    setLibraryCatalog(result.value)
+    notify(`已导入 ${Math.max(0, result.value.length - previousCount)} 张图片`)
+    void refreshStorageStats()
+  }
+
+  async function removeLibraryImage(id: string): Promise<void> {
+    if (!window.desktop) return
+    const result = await window.desktop.library.remove({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return
+    }
+    setLibraryCatalog(result.value)
+    if (settings.favoriteImageIds.includes(id)) {
+      await updateSettings({ favoriteImageIds: settings.favoriteImageIds.filter((item) => item !== id) })
+    }
+    notify('图片已从本地资源库删除')
+    void refreshStorageStats()
+  }
+
+  async function savePrompt(request: SavePromptRequest): Promise<boolean> {
+    if (!window.desktop) {
+      const prompt = { ...request, id: request.id ?? crypto.randomUUID() }
+      setResourceCatalog((current) => ({
+        ...current,
+        prompts: [prompt, ...current.prompts.filter((item) => item.id !== prompt.id)],
+      }))
+      notify('提示词已保存（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.resources.savePrompt(request)
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setResourceCatalog(result.value)
+    notify('提示词已保存')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function deletePrompt(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      setResourceCatalog((current) => ({ ...current, prompts: current.prompts.filter((item) => item.id !== id) }))
+      return true
+    }
+    const result = await window.desktop.resources.removePrompt({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setResourceCatalog(result.value)
+    notify('提示词已删除')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function saveWorkflow(request: SaveWorkflowRequest): Promise<boolean> {
+    if (!window.desktop) {
+      const workflow = {
+        id: request.id ?? crypto.randomUUID(),
+        title: request.title,
+        description: request.description,
+        accent: request.accent,
+        nodes: request.document.nodes.length,
+        document: request.document,
+      }
+      setResourceCatalog((current) => ({
+        ...current,
+        workflows: [workflow, ...current.workflows.filter((item) => item.id !== workflow.id)],
+      }))
+      notify('工作流已保存（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.resources.saveWorkflow(request)
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setResourceCatalog(result.value)
+    notify('当前画布已保存为工作流')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function deleteWorkflow(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      setResourceCatalog((current) => ({ ...current, workflows: current.workflows.filter((item) => item.id !== id) }))
+      return true
+    }
+    const result = await window.desktop.resources.removeWorkflow({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setResourceCatalog(result.value)
+    notify('工作流已删除')
+    void refreshStorageStats()
+    return true
+  }
+
+  function runWorkflow(id: string): void {
+    const workflow = resourceCatalog.workflows.find((item) => item.id === id)
+    if (!workflow?.document) {
+      notify('工作流没有可恢复的画布数据')
+      return
+    }
+    setCanvasDocument({
+      ...workflow.document,
+      id: crypto.randomUUID(),
+      name: workflow.title,
+      nodes: workflow.document.nodes.map((node) => ({ ...node })),
+      connections: workflow.document.connections.map((connection) => ({ ...connection })),
+      viewport: { ...workflow.document.viewport },
+      updatedAt: new Date().toISOString(),
+    })
+    setCanvasIsActive(true)
+    setPage('canvas')
+    notify(`工作流“${workflow.title}”已恢复到新画布`)
+  }
+
+  async function refreshStorageStats(): Promise<void> {
+    if (!window.desktop) return
+    const result = await window.desktop.storage.stats()
+    if (result.ok) setStats(result.value)
   }
 
   const generateCanvasImage = useCallback(async (request: GenerateImageRequest): Promise<GeneratedImageResult | null> => {
@@ -360,6 +589,7 @@ export function App() {
       }
       setSettings(result.value.settings)
       setStats(result.value.stats)
+      await refreshRecentProjects()
       const migrated = `${formatBytes(result.value.migratedBytes)} · ${result.value.migratedFileCount} 个文件`
       notify(result.value.sourceCleanupPending
         ? `数据已迁移（${migrated}），旧目录有文件未能清理`
@@ -381,13 +611,13 @@ export function App() {
   function renderPage() {
     switch (page) {
       case 'home':
-        return <HomePage onNewCanvas={() => newCanvas()} onOpenFile={() => void openCanvasFile()} />
+        return <HomePage onDeleteRecentProject={(project) => void deleteRecentProject(project)} onNewCanvas={() => newCanvas()} onOpenFile={() => void openCanvasFile()} onOpenRecentProject={(id) => void openRecentProject(id)} recentProjects={recentProjects} />
       case 'history':
-        return <HistoryPage artworks={libraryArtworks} notify={notify} />
+        return <HistoryPage artworks={generatedArtworks} loadImage={loadGeneratedImage} notify={notify} onNewCanvas={() => newCanvas()} />
       case 'gallery':
-        return <GalleryPage artworks={libraryArtworks} favoriteIds={settings.favoriteImageIds} onFavorite={toggleFavorite} />
+        return <GalleryPage artworks={libraryArtworks} favoriteIds={settings.favoriteImageIds} importedImageIds={libraryCatalog.map((artwork) => artwork.id)} loadImage={loadGeneratedImage} onFavorite={toggleFavorite} onImport={() => void importLibraryImages()} onRemove={(id) => void removeLibraryImage(id)} />
       case 'resources':
-        return <ResourcesPage notify={notify} onRunWorkflow={(id) => { newCanvas(); notify(`工作流 ${id} 已载入画布`) }} onUsePrompt={(prompt) => newCanvas(prompt)} prompts={resourceCatalog.prompts} workflows={resourceCatalog.workflows} />
+        return <ResourcesPage currentCanvas={canvasIsActive ? canvasDocument : null} notify={notify} onDeletePrompt={deletePrompt} onDeleteWorkflow={deleteWorkflow} onRunWorkflow={runWorkflow} onSavePrompt={savePrompt} onSaveWorkflow={saveWorkflow} onUsePrompt={(prompt) => newCanvas(prompt)} prompts={resourceCatalog.prompts} workflows={resourceCatalog.workflows} />
       case 'models':
         return <ModelSettingsPage defaultModelKeys={settings.defaultModelKeys} enabledModelKeys={settings.enabledModelKeys} onClearProviderApiKey={clearProviderApiKey} onModelConfigChange={(enabledModelKeys, defaultModelKeys) => void updateSettings({ enabledModelKeys, defaultModelKeys })} onSaveProvider={saveProvider} onSetProviderEnabled={setProviderEnabled} onTestProvider={testProvider} providers={settings.providers} />
       case 'settings':
@@ -399,7 +629,7 @@ export function App() {
 
   return (
     <div className={`app-root theme-${effectiveTheme}`} style={rootStyle}>
-      <AppShell activePage={page} onNavigate={setPage}>{renderPage()}</AppShell>
+      <AppShell activePage={page} generationHistoryCount={generatedArtworks.length} onNavigate={setPage}>{renderPage()}</AppShell>
       {toast && <div className="toast" role="status"><span />{toast}</div>}
     </div>
   )
@@ -421,6 +651,19 @@ function loadBrowserHistory(): ReadonlyArray<GeneratedArtwork> {
   } catch {
     return []
   }
+}
+
+function upsertRecentProject(
+  projects: ReadonlyArray<RecentCanvasProject>,
+  project: RecentCanvasProject,
+): ReadonlyArray<RecentCanvasProject> {
+  const existing = projects.find((item) => item.id === project.id)
+  const mergedProject = existing && Date.parse(existing.updatedAt) > Date.parse(project.updatedAt)
+    ? { ...project, updatedAt: existing.updatedAt }
+    : project
+  return [mergedProject, ...projects.filter((item) => item.id !== project.id)]
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    .slice(0, 50)
 }
 
 function formatBytes(bytes: number): string {

@@ -17,6 +17,7 @@ export type AppPage = 'home' | 'history' | 'gallery' | 'resources' | 'models' | 
 type AppShellProps = Readonly<{
   activePage: AppPage
   children: ReactNode
+  generationHistoryCount: number
   onNavigate: (page: AppPage) => void
 }>
 
@@ -32,7 +33,7 @@ const settingsItems = [
   { id: 'settings' as const, label: '系统设置', icon: Settings2 },
 ]
 
-export function AppShell({ activePage, children, onNavigate }: AppShellProps) {
+export function AppShell({ activePage, children, generationHistoryCount, onNavigate }: AppShellProps) {
   if (activePage === 'canvas') return <>{children}</>
 
   return (
@@ -63,7 +64,9 @@ export function AppShell({ activePage, children, onNavigate }: AppShellProps) {
             >
               <Icon size={18} />
               <span>{label}</span>
-              {id === 'history' && <span className="nav-count">24</span>}
+              {id === 'history' && generationHistoryCount > 0 && (
+                <span className="nav-count">{generationHistoryCount}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -99,4 +102,3 @@ export function AppShell({ activePage, children, onNavigate }: AppShellProps) {
     </div>
   )
 }
-

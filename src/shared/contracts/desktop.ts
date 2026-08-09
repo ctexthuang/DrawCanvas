@@ -108,6 +108,8 @@ export type CanvasNodeData = Readonly<{
   subtitle?: string
   x: number
   y: number
+  width?: number
+  height?: number
   color?: string
   modelKey?: string
   imageSize?: ImageGenerationSize
@@ -134,6 +136,23 @@ export type CanvasDocument = Readonly<{
   connections: ReadonlyArray<CanvasConnection>
   viewport: CanvasViewport
   updatedAt: string
+}>
+
+export type RecentCanvasProject = Readonly<{
+  id: string
+  name: string
+  updatedAt: string
+  nodeCount: number
+  colors: ReadonlyArray<string>
+  location: 'autosave' | 'file'
+}>
+
+export type LoadRecentCanvasProjectRequest = Readonly<{
+  id: string
+}>
+
+export type DeleteRecentCanvasProjectRequest = Readonly<{
+  id: string
 }>
 
 export type StorageCategory =
@@ -200,8 +219,19 @@ export type LoadedGeneratedImage = Readonly<{
   dataUrl: string
 }>
 
+export type RemoveLibraryImageRequest = Readonly<{
+  id: string
+}>
+
 export type PromptAsset = Readonly<{
   id: string
+  title: string
+  category: string
+  body: string
+}>
+
+export type SavePromptRequest = Readonly<{
+  id?: string
   title: string
   category: string
   body: string
@@ -213,6 +243,19 @@ export type WorkflowAsset = Readonly<{
   description: string
   nodes: number
   accent: string
+  document?: CanvasDocument
+}>
+
+export type SaveWorkflowRequest = Readonly<{
+  id?: string
+  title: string
+  description: string
+  accent: string
+  document: CanvasDocument
+}>
+
+export type RemoveResourceRequest = Readonly<{
+  id: string
 }>
 
 export type ResourceCatalog = Readonly<{
@@ -237,9 +280,15 @@ export type DesktopApi = Readonly<{
   }>
   library: Readonly<{
     load: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    importImages: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    remove: (request: RemoveLibraryImageRequest) => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
   }>
   resources: Readonly<{
     load: () => Promise<DesktopResult<ResourceCatalog>>
+    savePrompt: (request: SavePromptRequest) => Promise<DesktopResult<ResourceCatalog>>
+    removePrompt: (request: RemoveResourceRequest) => Promise<DesktopResult<ResourceCatalog>>
+    saveWorkflow: (request: SaveWorkflowRequest) => Promise<DesktopResult<ResourceCatalog>>
+    removeWorkflow: (request: RemoveResourceRequest) => Promise<DesktopResult<ResourceCatalog>>
   }>
   generation: Readonly<{
     generateImage: (request: GenerateImageRequest) => Promise<DesktopResult<GeneratedImageResult>>
@@ -253,6 +302,9 @@ export type DesktopApi = Readonly<{
   canvas: Readonly<{
     loadAutosave: () => Promise<DesktopResult<CanvasDocument | null>>
     saveAutosave: (document: CanvasDocument) => Promise<DesktopResult<null>>
+    listRecent: () => Promise<DesktopResult<ReadonlyArray<RecentCanvasProject>>>
+    loadRecent: (request: LoadRecentCanvasProjectRequest) => Promise<DesktopResult<CanvasDocument>>
+    deleteRecent: (request: DeleteRecentCanvasProjectRequest) => Promise<DesktopResult<ReadonlyArray<RecentCanvasProject>>>
     openFile: () => Promise<DesktopResult<CanvasDocument>>
     saveFile: (document: CanvasDocument) => Promise<DesktopResult<string>>
   }>

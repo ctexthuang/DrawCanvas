@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { readFile, stat, unlink, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { app, safeStorage } from 'electron/main'
 import type {
   AppSettings,
@@ -10,13 +10,19 @@ import type {
   LoadedGeneratedImage,
   ProviderConfig,
   ProviderConnectionStatus,
+  RecentCanvasProject,
+  RemoveLibraryImageRequest,
+  RemoveResourceRequest,
   ResourceCatalog,
+  SavePromptRequest,
   SaveProviderRequest,
+  SaveWorkflowRequest,
   StorageMigrationResult,
   StorageStats,
   ThemeMode,
   UpdateSettingsRequest,
 } from '../../shared/contracts/desktop'
+import { createRecentCanvasProject, isCanvasDocument } from '../../shared/domain/canvas-document'
 import {
   DEFAULT_CHAT_MODEL_KEY,
   DEFAULT_IMAGE_MODEL_KEY,
@@ -25,10 +31,9 @@ import {
   type ModelKind,
 } from '../../shared/domain/models'
 import {
-  seedArtworks,
-  seedPrompts,
-  seedResourceCatalog,
-  seedWorkflows,
+  legacySeedArtworks,
+  legacySeedPrompts,
+  legacySeedWorkflows,
 } from '../../shared/domain/seed-content'
 import {
   collectStorageStats,
@@ -44,6 +49,9 @@ import { JsonFileStore, readJsonFile } from '../infrastructure/json-store'
 import type { GeneratedImageMediaType } from '../infrastructure/image-generation-client'
 
 const MAX_STORED_IMAGE_BYTES = 25 * 1024 * 1024
+const MAX_LIBRARY_IMPORT_COUNT = 50
+const MAX_CANVAS_PROJECT_BYTES = 20 * 1024 * 1024
+const MAX_RECENT_PROJECTS = 50
 
 type SaveGeneratedImageRequest = Readonly<{
   bytes: Uint8Array
@@ -99,6 +107,16 @@ type ModelConfigDocument = Readonly<{
   providers: ReadonlyArray<StoredProvider>
 }>
 
+type StoredRecentCanvasProject = Readonly<Omit<RecentCanvasProject, 'location'> & {
+  relativePath?: string
+  externalPath?: string
+}>
+
+type StoredRecentProjectsDocument = Readonly<{
+  schemaVersion: 1
+  projects: ReadonlyArray<StoredRecentCanvasProject>
+}>
+
 const DEFAULT_ACCENT = '#ff5f77'
 const LEGACY_DEFAULT_MODELS = [
   'doubao-seedream-5-0-pro',
@@ -139,6 +157,7 @@ export class AppState {
   private readonly preferencesStore = new JsonFileStore<StoredPreferencesDocument>(() => this.settingsPath)
   private readonly modelConfigStore = new JsonFileStore<StoredModelConfigDocument>(() => this.modelConfigPath)
   private readonly autosaveStore = new JsonFileStore<CanvasDocument>(() => this.autosavePath)
+  private readonly recentProjectsStore = new JsonFileStore<StoredRecentProjectsDocument>(() => this.recentProjectsPath)
   private readonly historyStore = new JsonFileStore<ReadonlyArray<GeneratedArtwork>>(() => this.historyPath)
   private readonly libraryStore = new JsonFileStore<ReadonlyArray<GeneratedArtwork>>(() => this.paths.libraryCatalog)
   private readonly promptsStore = new JsonFileStore<ResourceCatalog['prompts']>(() => this.paths.prompts)
@@ -163,6 +182,10 @@ export class AppState {
 
   private get autosavePath(): string {
     return this.paths.autosave
+  }
+
+  private get recentProjectsPath(): string {
+    return this.paths.recentProjects
   }
 
   private get historyPath(): string {
@@ -347,7 +370,71 @@ export class AppState {
   async saveAutosave(document: CanvasDocument): Promise<void> {
     await this.withStorageOperation(async () => {
       await this.autosaveStore.write(document)
+      await this.recordRecentProjectUnsafe(document)
     })
+  }
+
+  async listRecentProjects(): Promise<ReadonlyArray<RecentCanvasProject>> {
+    return this.withStorageOperation(() => this.listRecentProjectsUnsafe())
+  }
+
+  async loadRecentProject(id: string): Promise<CanvasDocument | null> {
+    return this.withStorageOperation(async () => {
+      await this.listRecentProjectsUnsafe()
+      const autosave = await this.autosaveStore.read()
+      if (autosave && isCanvasDocument(autosave) && autosave.id === id) {
+        await this.recordRecentProjectUnsafe(autosave, undefined, new Date().toISOString())
+        return autosave
+      }
+
+      const stored = normalizeRecentProjectsDocument(await this.recentProjectsStore.read())
+      const project = stored.projects.find((item) => item.id === id)
+      const projectPath = project ? this.resolveRecentProjectPath(project) : null
+      if (!projectPath) return null
+      const document = await readCanvasProjectFile(projectPath)
+      if (document?.id === id) {
+        await this.recordRecentProjectUnsafe(document, projectPath, new Date().toISOString())
+        return document
+      }
+      await this.recentProjectsStore.write({
+        schemaVersion: 1,
+        projects: stored.projects.filter((item) => item.id !== id),
+      })
+      return null
+    })
+  }
+
+  async deleteRecentProject(id: string): Promise<ReadonlyArray<RecentCanvasProject>> {
+    return this.withStorageOperation(async () => {
+      const [storedValue, autosave] = await Promise.all([
+        this.recentProjectsStore.read(),
+        this.autosaveStore.read(),
+      ])
+      const stored = normalizeRecentProjectsDocument(storedValue)
+      const project = stored.projects.find((item) => item.id === id)
+
+      if (autosave && isCanvasDocument(autosave) && autosave.id === id) {
+        await this.autosaveStore.remove()
+      }
+
+      if (project?.relativePath) {
+        const managedProjectPath = this.resolveRecentProjectPath(project)
+        const managedDocument = managedProjectPath
+          ? await readCanvasProjectFile(managedProjectPath)
+          : null
+        if (managedProjectPath && managedDocument?.id === id) await unlink(managedProjectPath)
+      }
+
+      await this.recentProjectsStore.write({
+        schemaVersion: 1,
+        projects: stored.projects.filter((item) => item.id !== id),
+      })
+      return this.listRecentProjectsUnsafe()
+    })
+  }
+
+  async recordRecentProject(document: CanvasDocument, filePath: string, accessedAt = document.updatedAt): Promise<void> {
+    await this.withStorageOperation(() => this.recordRecentProjectUnsafe(document, filePath, accessedAt))
   }
 
   async loadHistory(): Promise<ReadonlyArray<GeneratedArtwork>> {
@@ -408,19 +495,115 @@ export class AppState {
   }
 
   async loadLibrary(): Promise<ReadonlyArray<GeneratedArtwork>> {
-    return this.withStorageOperation(async () => (await this.libraryStore.read()) ?? seedArtworks)
+    return this.withStorageOperation(async () => (await this.libraryStore.read()) ?? [])
+  }
+
+  async importLibraryImages(sourcePaths: ReadonlyArray<string>): Promise<ReadonlyArray<GeneratedArtwork>> {
+    return this.withStorageOperation(async () => {
+      if (sourcePaths.length === 0 || sourcePaths.length > MAX_LIBRARY_IMPORT_COUNT) {
+        throw new Error('Invalid library import count')
+      }
+      const current = (await this.libraryStore.read()) ?? []
+      const imported: GeneratedArtwork[] = []
+      const writtenPaths: string[] = []
+      try {
+        for (const sourcePath of sourcePaths) {
+          const fileStats = await stat(sourcePath)
+          if (!fileStats.isFile() || fileStats.size === 0 || fileStats.size > MAX_STORED_IMAGE_BYTES) {
+            throw new Error('Library image is invalid or too large')
+          }
+          const bytes = await readFile(sourcePath)
+          const extension = detectLibraryImageExtension(bytes)
+          if (!extension) throw new Error('Unsupported library image')
+          const id = randomUUID()
+          const imageFileName = `${id}.${extension}`
+          const imagePath = join(this.paths.imagesDirectory, imageFileName)
+          await writeFile(imagePath, bytes, { flag: 'wx' })
+          writtenPaths.push(imagePath)
+          const rawTitle = basename(sourcePath, extname(sourcePath)).trim()
+          imported.push({
+            id,
+            title: rawTitle.slice(0, 200) || '本地图片',
+            prompt: '',
+            model: '本地导入',
+            size: '原始尺寸',
+            createdAt: new Date().toISOString(),
+            palette: 'linear-gradient(145deg, #2e3445 0%, #7552be 52%, #f06b82 100%)',
+            tags: ['本地导入'],
+            imageFileName,
+          })
+        }
+        return await this.libraryStore.write([...imported.reverse(), ...current].slice(0, 1000))
+      } catch (error) {
+        await Promise.all(writtenPaths.map((filePath) => unlink(filePath).catch(() => undefined)))
+        throw error
+      }
+    })
+  }
+
+  async removeLibraryImage(request: RemoveLibraryImageRequest): Promise<ReadonlyArray<GeneratedArtwork>> {
+    return this.withStorageOperation(async () => {
+      const current = (await this.libraryStore.read()) ?? []
+      const artwork = current.find((item) => item.id === request.id)
+      if (!artwork) return current
+      const next = current.filter((item) => item.id !== request.id)
+      await this.libraryStore.write(next)
+      if (artwork.imageFileName && isGeneratedImageFileName(artwork.imageFileName)) {
+        await unlink(join(this.paths.imagesDirectory, artwork.imageFileName)).catch(() => undefined)
+      }
+      return next
+    })
   }
 
   async loadResources(): Promise<ResourceCatalog> {
+    return this.withStorageOperation(() => this.loadResourcesUnsafe())
+  }
+
+  async savePrompt(request: SavePromptRequest): Promise<ResourceCatalog> {
     return this.withStorageOperation(async () => {
-      const [prompts, workflows] = await Promise.all([
-        this.promptsStore.read(),
-        this.workflowsStore.read(),
-      ])
-      return {
-        prompts: prompts ?? seedPrompts,
-        workflows: workflows ?? seedWorkflows,
+      const prompt = {
+        id: request.id ?? randomUUID(),
+        title: request.title.trim(),
+        category: request.category.trim(),
+        body: request.body.trim(),
       }
+      await this.promptsStore.update((value) => [
+        prompt,
+        ...(value ?? []).filter((item) => item.id !== prompt.id),
+      ].slice(0, 1000))
+      return this.loadResourcesUnsafe()
+    })
+  }
+
+  async removePrompt(request: RemoveResourceRequest): Promise<ResourceCatalog> {
+    return this.withStorageOperation(async () => {
+      await this.promptsStore.update((value) => (value ?? []).filter((item) => item.id !== request.id))
+      return this.loadResourcesUnsafe()
+    })
+  }
+
+  async saveWorkflow(request: SaveWorkflowRequest): Promise<ResourceCatalog> {
+    return this.withStorageOperation(async () => {
+      const workflow = {
+        id: request.id ?? randomUUID(),
+        title: request.title.trim(),
+        description: request.description.trim(),
+        nodes: request.document.nodes.length,
+        accent: request.accent,
+        document: request.document,
+      }
+      await this.workflowsStore.update((value) => [
+        workflow,
+        ...(value ?? []).filter((item) => item.id !== workflow.id),
+      ].slice(0, 500))
+      return this.loadResourcesUnsafe()
+    })
+  }
+
+  async removeWorkflow(request: RemoveResourceRequest): Promise<ResourceCatalog> {
+    return this.withStorageOperation(async () => {
+      await this.workflowsStore.update((value) => (value ?? []).filter((item) => item.id !== request.id))
+      return this.loadResourcesUnsafe()
     })
   }
 
@@ -444,6 +627,118 @@ export class AppState {
 
   async getProjectsDirectory(): Promise<string> {
     return this.withStorageOperation(async () => this.paths.projectsDirectory)
+  }
+
+  private async recordRecentProjectUnsafe(document: CanvasDocument, filePath?: string, accessedAt = document.updatedAt): Promise<void> {
+    const current = normalizeRecentProjectsDocument(await this.recentProjectsStore.read())
+    const existing = current.projects.find((project) => project.id === document.id)
+    const summary = {
+      ...createRecentCanvasProject(document, filePath || existing?.relativePath || existing?.externalPath ? 'file' : 'autosave'),
+      updatedAt: latestTimestamp(existing?.updatedAt, accessedAt),
+    }
+    const fileReference = filePath
+      ? this.createProjectFileReference(filePath)
+      : existing
+        ? pickProjectFileReference(existing)
+        : {}
+    const project = toStoredRecentProject(summary, fileReference)
+    const projects = [
+      project,
+      ...current.projects.filter((item) => item.id !== document.id),
+    ].slice(0, MAX_RECENT_PROJECTS)
+    await this.recentProjectsStore.write({ schemaVersion: 1, projects })
+  }
+
+  private async listRecentProjectsUnsafe(): Promise<ReadonlyArray<RecentCanvasProject>> {
+    const stored = normalizeRecentProjectsDocument(await this.recentProjectsStore.read())
+    const projectsById = new Map(stored.projects.map((project) => [project.id, project]))
+    for (const discovered of await this.discoverManagedProjectsUnsafe()) {
+      if (!projectsById.has(discovered.id)) projectsById.set(discovered.id, discovered)
+    }
+
+    const autosave = await this.autosaveStore.read()
+    if (autosave && isCanvasDocument(autosave)) {
+      const existing = projectsById.get(autosave.id)
+      projectsById.set(autosave.id, toStoredRecentProject(
+        {
+          ...createRecentCanvasProject(autosave, existing ? 'file' : 'autosave'),
+          updatedAt: latestTimestamp(existing?.updatedAt, autosave.updatedAt),
+        },
+        existing ? pickProjectFileReference(existing) : {},
+      ))
+    }
+
+    const available: StoredRecentCanvasProject[] = []
+    const recent: RecentCanvasProject[] = []
+    for (const project of projectsById.values()) {
+      const projectPath = this.resolveRecentProjectPath(project)
+      const hasProjectFile = projectPath ? await isReadableProjectFile(projectPath) : false
+      const hasAutosave = Boolean(autosave && isCanvasDocument(autosave) && autosave.id === project.id)
+      if (!hasProjectFile && !hasAutosave) continue
+      const availableProject: StoredRecentCanvasProject = hasProjectFile
+        ? project
+        : removeProjectFileReference(project)
+      available.push(availableProject)
+      recent.push({
+        id: availableProject.id,
+        name: availableProject.name,
+        updatedAt: availableProject.updatedAt,
+        nodeCount: availableProject.nodeCount,
+        colors: availableProject.colors,
+        location: hasProjectFile ? 'file' : 'autosave',
+      })
+    }
+    available.sort(compareRecentProjects)
+    recent.sort(compareRecentProjects)
+    const nextDocument: StoredRecentProjectsDocument = {
+      schemaVersion: 1,
+      projects: available.slice(0, MAX_RECENT_PROJECTS),
+    }
+    if (!documentsEqual(stored, nextDocument)) await this.recentProjectsStore.write(nextDocument)
+    return recent.slice(0, MAX_RECENT_PROJECTS)
+  }
+
+  private async discoverManagedProjectsUnsafe(): Promise<ReadonlyArray<StoredRecentCanvasProject>> {
+    const entries = await readdir(this.paths.projectsDirectory, { withFileTypes: true })
+    const projects: StoredRecentCanvasProject[] = []
+    for (const entry of entries.slice(0, 200)) {
+      if (
+        !entry.isFile() ||
+        entry.name === 'autosave.drawcanvas.json' ||
+        entry.name === 'recent-projects.json' ||
+        !isSupportedProjectPath(entry.name)
+      ) continue
+      const document = await readCanvasProjectFile(join(this.paths.projectsDirectory, entry.name))
+      if (!document) continue
+      projects.push(toStoredRecentProject(
+        createRecentCanvasProject(document, 'file'),
+        { relativePath: entry.name },
+      ))
+    }
+    return projects
+  }
+
+  private createProjectFileReference(filePath: string): Pick<StoredRecentCanvasProject, 'relativePath' | 'externalPath'> {
+    const absolutePath = resolve(filePath)
+    const managedRelativePath = relative(this.paths.projectsDirectory, absolutePath)
+    if (
+      managedRelativePath &&
+      !managedRelativePath.startsWith('..') &&
+      !isAbsolute(managedRelativePath)
+    ) return { relativePath: managedRelativePath }
+    return { externalPath: absolutePath }
+  }
+
+  private resolveRecentProjectPath(project: StoredRecentCanvasProject): string | null {
+    if (project.relativePath) {
+      if (isAbsolute(project.relativePath) || project.relativePath.startsWith('..')) return null
+      const projectPath = resolve(this.paths.projectsDirectory, project.relativePath)
+      const managedRelativePath = relative(this.paths.projectsDirectory, projectPath)
+      if (!managedRelativePath || managedRelativePath.startsWith('..') || isAbsolute(managedRelativePath)) return null
+      return isSupportedProjectPath(projectPath) ? projectPath : null
+    }
+    if (!project.externalPath || !isAbsolute(project.externalPath)) return null
+    return isSupportedProjectPath(project.externalPath) ? resolve(project.externalPath) : null
   }
 
   private ensureInitialized(): Promise<void> {
@@ -514,9 +809,12 @@ export class AppState {
       const legacyHistory = await readJsonFile<ReadonlyArray<GeneratedArtwork>>(legacyHistoryPath)
       await this.historyStore.write(legacyHistory ?? [])
     }
-    if (!library) await this.libraryStore.write(seedArtworks)
-    if (!prompts) await this.promptsStore.write(seedResourceCatalog.prompts)
-    if (!workflows) await this.workflowsStore.write(seedResourceCatalog.workflows)
+    const normalizedLibrary = removeExactLegacyItems(library ?? [], legacySeedArtworks)
+    const normalizedPrompts = removeExactLegacyItems(prompts ?? [], legacySeedPrompts)
+    const normalizedWorkflows = removeExactLegacyItems(workflows ?? [], legacySeedWorkflows)
+    if (!documentsEqual(library, normalizedLibrary)) await this.libraryStore.write(normalizedLibrary)
+    if (!documentsEqual(prompts, normalizedPrompts)) await this.promptsStore.write(normalizedPrompts)
+    if (!documentsEqual(workflows, normalizedWorkflows)) await this.workflowsStore.write(normalizedWorkflows)
 
     await writeAppDataLocation(userDataDirectory, this.paths.root)
     await Promise.all([
@@ -603,11 +901,23 @@ export class AppState {
     )
   }
 
+  private async loadResourcesUnsafe(): Promise<ResourceCatalog> {
+    const [prompts, workflows] = await Promise.all([
+      this.promptsStore.read(),
+      this.workflowsStore.read(),
+    ])
+    return {
+      prompts: prompts ?? [],
+      workflows: workflows ?? [],
+    }
+  }
+
   private get stores(): ReadonlyArray<JsonFileStore<unknown>> {
     return [
       this.preferencesStore,
       this.modelConfigStore,
       this.autosaveStore,
+      this.recentProjectsStore,
       this.historyStore,
       this.libraryStore,
       this.promptsStore,
@@ -652,7 +962,8 @@ export class AppState {
         ? storedAccentColor
         : DEFAULT_ACCENT,
       storageDirectory: this.paths.root,
-      favoriteImageIds: uniqueStrings(value?.favoriteImageIds ?? ['1', '2', '4', '6', '8'], 500),
+      favoriteImageIds: uniqueStrings(value?.favoriteImageIds ?? [], 500)
+        .filter((id) => !legacySeedArtworks.some((artwork) => artwork.id === id)),
     }
   }
 
@@ -748,6 +1059,126 @@ export class AppState {
   }
 }
 
+function normalizeRecentProjectsDocument(value: unknown): StoredRecentProjectsDocument {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.projects)) {
+    return { schemaVersion: 1, projects: [] }
+  }
+  const projects = value.projects.flatMap((item): ReadonlyArray<StoredRecentCanvasProject> => {
+    if (
+      !isRecord(item) ||
+      !isBoundedString(item.id, 128) ||
+      !isBoundedString(item.name, 200) ||
+      !isBoundedString(item.updatedAt, 100) ||
+      typeof item.nodeCount !== 'number' ||
+      !Number.isInteger(item.nodeCount) ||
+      item.nodeCount < 0 ||
+      item.nodeCount > 500 ||
+      !Array.isArray(item.colors)
+    ) return []
+    const relativePath = typeof item.relativePath === 'string' && item.relativePath.length <= 1024
+      ? item.relativePath
+      : undefined
+    const externalPath = typeof item.externalPath === 'string' && item.externalPath.length <= 4096
+      ? item.externalPath
+      : undefined
+    return [{
+      id: item.id,
+      name: item.name,
+      updatedAt: item.updatedAt,
+      nodeCount: item.nodeCount,
+      colors: uniqueHexColors(item.colors),
+      ...(relativePath ? { relativePath } : {}),
+      ...(externalPath ? { externalPath } : {}),
+    }]
+  })
+  return { schemaVersion: 1, projects: projects.slice(0, MAX_RECENT_PROJECTS) }
+}
+
+function toStoredRecentProject(
+  project: RecentCanvasProject,
+  fileReference: Pick<StoredRecentCanvasProject, 'relativePath' | 'externalPath'> = {},
+): StoredRecentCanvasProject {
+  return {
+    id: project.id,
+    name: project.name,
+    updatedAt: project.updatedAt,
+    nodeCount: project.nodeCount,
+    colors: project.colors,
+    ...fileReference,
+  }
+}
+
+function pickProjectFileReference(
+  project: StoredRecentCanvasProject,
+): Pick<StoredRecentCanvasProject, 'relativePath' | 'externalPath'> {
+  if (project.relativePath) return { relativePath: project.relativePath }
+  if (project.externalPath) return { externalPath: project.externalPath }
+  return {}
+}
+
+function removeProjectFileReference(project: StoredRecentCanvasProject): StoredRecentCanvasProject {
+  return {
+    id: project.id,
+    name: project.name,
+    updatedAt: project.updatedAt,
+    nodeCount: project.nodeCount,
+    colors: project.colors,
+  }
+}
+
+function compareRecentProjects(
+  left: Pick<RecentCanvasProject, 'updatedAt'>,
+  right: Pick<RecentCanvasProject, 'updatedAt'>,
+): number {
+  return parseTimestamp(right.updatedAt) - parseTimestamp(left.updatedAt)
+}
+
+async function readCanvasProjectFile(filePath: string): Promise<CanvasDocument | null> {
+  try {
+    const fileStats = await stat(filePath)
+    if (!fileStats.isFile() || fileStats.size > MAX_CANVAS_PROJECT_BYTES) return null
+    const value: unknown = JSON.parse(await readFile(filePath, 'utf8'))
+    return isCanvasDocument(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+async function isReadableProjectFile(filePath: string): Promise<boolean> {
+  try {
+    const fileStats = await stat(filePath)
+    return fileStats.isFile() && fileStats.size <= MAX_CANVAS_PROJECT_BYTES
+  } catch {
+    return false
+  }
+}
+
+function isSupportedProjectPath(filePath: string): boolean {
+  return /\.(drawcanvas|json)$/i.test(filePath)
+}
+
+function uniqueHexColors(value: ReadonlyArray<unknown>): ReadonlyArray<string> {
+  return [...new Set(value.filter((item): item is string => typeof item === 'string' && /^#[0-9a-f]{6}$/i.test(item)))]
+    .slice(0, 3)
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength
+}
+
+function parseTimestamp(value: string): number {
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+function latestTimestamp(current: string | undefined, candidate: string): string {
+  return current && parseTimestamp(current) > parseTimestamp(candidate) ? current : candidate
+}
+
 function findProvider(modelConfig: ModelConfigDocument, id: string): StoredProvider {
   const provider = modelConfig.providers.find((item) => item.id === id)
   if (!provider) throw new Error(`Unknown provider: ${id}`)
@@ -828,6 +1259,28 @@ function migrateModelKey(key: string | undefined): string | undefined {
 
 function documentsEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function removeExactLegacyItems<T>(
+  items: ReadonlyArray<T>,
+  legacyItems: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  return items.filter((item) => !legacyItems.some((legacyItem) => documentsEqual(item, legacyItem)))
+}
+
+function detectLibraryImageExtension(bytes: Uint8Array): 'png' | 'jpg' | 'webp' | null {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+    bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a
+  ) return 'png'
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpg'
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) return 'webp'
+  return null
 }
 
 function extensionForMediaType(mediaType: GeneratedImageMediaType): 'png' | 'jpg' | 'webp' {

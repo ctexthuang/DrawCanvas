@@ -16,20 +16,32 @@ import { shell } from 'electron'
 import type {
   CanvasDocument,
   ClearProviderApiKeyRequest,
+  DeleteRecentCanvasProjectRequest,
   DesktopErrorCode,
   DesktopResult,
   GenerateImageRequest,
   GeneratedArtwork,
   LoadGeneratedImageRequest,
+  LoadRecentCanvasProjectRequest,
   ProviderConfig,
   ProviderConnectionTestResult,
+  RemoveLibraryImageRequest,
+  RemoveResourceRequest,
+  SavePromptRequest,
   SaveProviderRequest,
+  SaveWorkflowRequest,
   SetProviderEnabledRequest,
   TestProviderRequest,
   ThemeMode,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
-import { GENERATION_IPC_CHANNELS } from '../shared/contracts/ipc-channels'
+import {
+  CANVAS_IPC_CHANNELS,
+  GENERATION_IPC_CHANNELS,
+  LIBRARY_IPC_CHANNELS,
+  RESOURCE_IPC_CHANNELS,
+} from '../shared/contracts/ipc-channels'
+import { isCanvasDocument } from '../shared/domain/canvas-document'
 import { AppState, ProviderSecretUnavailableError } from './application/app-state'
 import {
   ImageGenerationService,
@@ -138,21 +150,6 @@ function normalizeApiKey(value: unknown): string | undefined | null {
   return key.length > 0 && key.length <= 8192 ? key : null
 }
 
-function isCanvasDocument(value: unknown): value is CanvasDocument {
-  if (!value || typeof value !== 'object') return false
-  const document = value as Partial<CanvasDocument>
-  return (
-    document.version === 1 &&
-    typeof document.id === 'string' &&
-    typeof document.name === 'string' &&
-    Array.isArray(document.nodes) &&
-    document.nodes.length <= 500 &&
-    Array.isArray(document.connections) &&
-    document.connections.length <= 1000 &&
-    Boolean(document.viewport)
-  )
-}
-
 function isGeneratedArtwork(value: unknown): value is GeneratedArtwork {
   if (!value || typeof value !== 'object') return false
   const artwork = value as Partial<GeneratedArtwork>
@@ -189,6 +186,35 @@ function isLoadGeneratedImageRequest(value: unknown): value is LoadGeneratedImag
   const request = value as Partial<LoadGeneratedImageRequest>
   return typeof request.fileName === 'string' &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|webp)$/i.test(request.fileName)
+}
+
+function isResourceItemRequest(value: unknown): value is RemoveResourceRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<RemoveResourceRequest>
+  return typeof request.id === 'string' && request.id.length > 0 && request.id.length <= 128
+}
+
+function isSavePromptRequest(value: unknown): value is SavePromptRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<SavePromptRequest>
+  return (
+    (request.id === undefined || (typeof request.id === 'string' && request.id.length > 0 && request.id.length <= 128)) &&
+    typeof request.title === 'string' && request.title.trim().length > 0 && request.title.length <= 200 &&
+    typeof request.category === 'string' && request.category.trim().length > 0 && request.category.length <= 100 &&
+    typeof request.body === 'string' && request.body.trim().length > 0 && request.body.length <= 20_000
+  )
+}
+
+function isSaveWorkflowRequest(value: unknown): value is SaveWorkflowRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<SaveWorkflowRequest>
+  return (
+    (request.id === undefined || (typeof request.id === 'string' && request.id.length > 0 && request.id.length <= 128)) &&
+    typeof request.title === 'string' && request.title.trim().length > 0 && request.title.length <= 200 &&
+    typeof request.description === 'string' && request.description.length <= 1000 &&
+    isHexColor(request.accent) &&
+    isCanvasDocument(request.document)
+  )
 }
 
 function registerIpc(): void {
@@ -382,7 +408,7 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'library:load',
+    LIBRARY_IPC_CHANNELS.load,
     trustedHandler(async () => {
       try {
         return success(await appState.loadLibrary())
@@ -393,12 +419,97 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'resources:load',
+    LIBRARY_IPC_CHANNELS.importImages,
+    trustedHandler(async () => {
+      const options: OpenDialogOptions = {
+        title: '导入本地图片',
+        defaultPath: app.getPath('pictures'),
+        buttonLabel: '导入图片',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled || result.filePaths.length === 0) {
+        return failure('CANCELLED', '已取消导入图片')
+      }
+      if (result.filePaths.length > 50) return failure('INVALID_INPUT', '每次最多导入 50 张图片')
+      try {
+        return success(await appState.importLibraryImages(result.filePaths))
+      } catch {
+        return failure('INVALID_FILE', '图片格式无效、文件过大或无法读取')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    LIBRARY_IPC_CHANNELS.remove,
+    trustedHandler(async (request: RemoveLibraryImageRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '图片资源标识无效')
+      try {
+        return success(await appState.removeLibraryImage(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除图片资源')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    RESOURCE_IPC_CHANNELS.load,
     trustedHandler(async () => {
       try {
         return success(await appState.loadResources())
       } catch {
         return failure('IO_ERROR', '无法读取资源数据')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    RESOURCE_IPC_CHANNELS.savePrompt,
+    trustedHandler(async (request: SavePromptRequest) => {
+      if (!isSavePromptRequest(request)) return failure('INVALID_INPUT', '提示词内容无效')
+      try {
+        return success(await appState.savePrompt(request))
+      } catch {
+        return failure('IO_ERROR', '无法保存提示词')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    RESOURCE_IPC_CHANNELS.removePrompt,
+    trustedHandler(async (request: RemoveResourceRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '提示词标识无效')
+      try {
+        return success(await appState.removePrompt(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除提示词')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    RESOURCE_IPC_CHANNELS.saveWorkflow,
+    trustedHandler(async (request: SaveWorkflowRequest) => {
+      if (!isSaveWorkflowRequest(request)) return failure('INVALID_INPUT', '工作流内容无效')
+      try {
+        return success(await appState.saveWorkflow(request))
+      } catch {
+        return failure('IO_ERROR', '无法保存工作流')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    RESOURCE_IPC_CHANNELS.removeWorkflow,
+    trustedHandler(async (request: RemoveResourceRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '工作流标识无效')
+      try {
+        return success(await appState.removeWorkflow(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除工作流')
       }
     }),
   )
@@ -489,7 +600,58 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'canvas:load-autosave',
-    trustedHandler(async () => success(await appState.loadAutosave())),
+    trustedHandler(async () => {
+      try {
+        const document = await appState.loadAutosave()
+        return !document || isCanvasDocument(document)
+          ? success(document)
+          : failure('INVALID_FILE', '自动保存项目数据无效')
+      } catch {
+        return failure('IO_ERROR', '无法读取自动保存项目')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    CANVAS_IPC_CHANNELS.listRecent,
+    trustedHandler(async () => {
+      try {
+        return success(await appState.listRecentProjects())
+      } catch {
+        return failure('IO_ERROR', '无法读取最近项目')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    CANVAS_IPC_CHANNELS.loadRecent,
+    trustedHandler(async (request: LoadRecentCanvasProjectRequest) => {
+      if (!request || typeof request.id !== 'string' || request.id.length === 0 || request.id.length > 128) {
+        return failure('INVALID_INPUT', '最近项目标识无效')
+      }
+      try {
+        const document = await appState.loadRecentProject(request.id)
+        return document && isCanvasDocument(document)
+          ? success(document)
+          : failure('NOT_FOUND', '最近项目不存在或已被移动')
+      } catch {
+        return failure('IO_ERROR', '无法打开最近项目')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    CANVAS_IPC_CHANNELS.deleteRecent,
+    trustedHandler(async (request: DeleteRecentCanvasProjectRequest) => {
+      if (!request || typeof request.id !== 'string' || request.id.length === 0 || request.id.length > 128) {
+        return failure('INVALID_INPUT', '最近项目标识无效')
+      }
+      try {
+        return success(await appState.deleteRecentProject(request.id))
+      } catch {
+        return failure('IO_ERROR', '无法删除最近项目')
+      }
+    }),
   )
 
   ipcMain.handle(
@@ -520,9 +682,9 @@ function registerIpc(): void {
       if (result.canceled || !result.filePaths[0]) return failure('CANCELLED', '已取消打开文件')
       try {
         const value: unknown = JSON.parse(await readFile(result.filePaths[0], 'utf8'))
-        return isCanvasDocument(value)
-          ? success(value)
-          : failure('INVALID_FILE', '不是有效的 Draw Canvas 项目')
+        if (!isCanvasDocument(value)) return failure('INVALID_FILE', '不是有效的 Draw Canvas 项目')
+        await appState.recordRecentProject(value, result.filePaths[0], new Date().toISOString()).catch(() => undefined)
+        return success(value)
       } catch {
         return failure('INVALID_FILE', '无法读取项目文件')
       }
@@ -547,6 +709,7 @@ function registerIpc(): void {
       if (result.canceled || !result.filePath) return failure('CANCELLED', '已取消保存')
       try {
         await writeFile(result.filePath, `${JSON.stringify(document, null, 2)}\n`, 'utf8')
+        await appState.recordRecentProject(document, result.filePath).catch(() => undefined)
         return success(result.filePath)
       } catch {
         return failure('IO_ERROR', '无法保存项目文件')

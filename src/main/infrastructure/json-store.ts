@@ -65,6 +65,18 @@ export class JsonFileStore<T> {
     })
   }
 
+  remove(): Promise<void> {
+    return this.enqueue(async () => {
+      try {
+        await unlink(this.pathFactory())
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
+      }
+      this.cachedValue = null
+      this.cached = true
+    })
+  }
+
   async drain(): Promise<void> {
     await this.queue
   }
