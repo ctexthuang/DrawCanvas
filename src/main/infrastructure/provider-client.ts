@@ -1,5 +1,9 @@
 import { net } from 'electron/main'
 import type { ProviderTestErrorCode } from '../../shared/contracts/desktop'
+import {
+  createOpenAiEndpointCandidates,
+  type OpenAiCompatibleProfile,
+} from './openai-compatible-endpoints'
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 const MAX_MODEL_COUNT = 500
@@ -25,43 +29,61 @@ export class ProviderRequestError extends Error {
 export async function testOpenAiCompatibleProvider(
   baseUrl: string,
   apiKey: string,
+  profile: OpenAiCompatibleProfile = 'openai',
 ): Promise<ProviderClientResult> {
   const startedAt = performance.now()
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 
   try {
-    const response = await net.fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      signal: controller.signal,
-      bypassCustomProtocolHandlers: true,
-    })
-    const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
+    const endpoints = createOpenAiEndpointCandidates(baseUrl, 'models', profile)
+    for (const [index, endpoint] of endpoints.entries()) {
+      const response = await net.fetch(endpoint, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'User-Agent': 'DrawCanvas/1.0',
+        },
+        signal: controller.signal,
+        bypassCustomProtocolHandlers: true,
+      })
+      const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
+      const body = await readLimitedBody(response, latencyMs)
+      const payload = parseJson(body)
+      const remoteMessage = extractRemoteErrorMessage(payload, body)
 
-    if (response.status === 401 || response.status === 403) {
-      throw new ProviderRequestError('AUTHENTICATION', 'API Key 无效或没有访问权限', latencyMs)
-    }
-    if (!response.ok) {
-      throw new ProviderRequestError(
-        'REMOTE',
-        `服务商返回异常状态（HTTP ${response.status}）`,
+      if (response.status === 401 || response.status === 403) {
+        throw new ProviderRequestError(
+          'AUTHENTICATION',
+          remoteMessage || 'API Key 无效或没有访问权限',
+          latencyMs,
+        )
+      }
+      if (!response.ok) {
+        if ((response.status === 404 || response.status === 405) && index < endpoints.length - 1) continue
+        throw new ProviderRequestError(
+          'REMOTE',
+          remoteMessage
+            ? `${remoteMessage}（HTTP ${response.status}）`
+            : `服务商返回异常状态（HTTP ${response.status}）`,
+          latencyMs,
+        )
+      }
+      if (payload === null) {
+        throw new ProviderRequestError('INVALID_RESPONSE', '服务商未返回有效的 JSON 数据', latencyMs)
+      }
+
+      const availableModelIds = extractModelIds(payload)
+      return {
         latencyMs,
-      )
+        availableModelIds,
+        message: availableModelIds.length
+          ? `连接成功，发现 ${availableModelIds.length} 个模型`
+          : '连接成功，接口未返回可识别的模型列表',
+      }
     }
-
-    const payload = await readLimitedJson(response, latencyMs)
-    const availableModelIds = extractModelIds(payload)
-    return {
-      latencyMs,
-      availableModelIds,
-      message: availableModelIds.length
-        ? `连接成功，发现 ${availableModelIds.length} 个模型`
-        : '连接成功，接口未返回可识别的模型列表',
-    }
+    throw new ProviderRequestError('REMOTE', '服务商没有提供可用的模型列表接口')
   } catch (error) {
     if (error instanceof ProviderRequestError) throw error
     const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
@@ -74,12 +96,12 @@ export async function testOpenAiCompatibleProvider(
   }
 }
 
-async function readLimitedJson(response: Response, latencyMs: number): Promise<unknown> {
+async function readLimitedBody(response: Response, latencyMs: number): Promise<Uint8Array> {
   const contentLength = Number(response.headers.get('content-length') ?? 0)
   if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
     throw new ProviderRequestError('INVALID_RESPONSE', '服务商响应数据过大', latencyMs)
   }
-  if (!response.body) return {}
+  if (!response.body) return new Uint8Array()
 
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
@@ -95,11 +117,32 @@ async function readLimitedJson(response: Response, latencyMs: number): Promise<u
     chunks.push(chunk.value)
   }
 
+  return Buffer.concat(chunks)
+}
+
+function parseJson(body: Uint8Array): unknown | null {
+  if (body.byteLength === 0) return {}
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
+    return JSON.parse(Buffer.from(body).toString('utf8')) as unknown
   } catch {
-    throw new ProviderRequestError('INVALID_RESPONSE', '服务商未返回有效的 JSON 数据', latencyMs)
+    return null
   }
+}
+
+function extractRemoteErrorMessage(payload: unknown | null, body: Uint8Array): string {
+  if (isRecord(payload)) {
+    const error = isRecord(payload.error) ? payload.error : null
+    const candidate = error?.message ?? payload.message ?? payload.detail
+    if (typeof candidate === 'string') return sanitizeRemoteMessage(candidate)
+  }
+  const contentTypeText = Buffer.from(body).toString('utf8').trim()
+  return contentTypeText && !contentTypeText.startsWith('<')
+    ? sanitizeRemoteMessage(contentTypeText)
+    : ''
+}
+
+function sanitizeRemoteMessage(value: string): string {
+  return value.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 300)
 }
 
 function extractModelIds(payload: unknown): ReadonlyArray<string> {

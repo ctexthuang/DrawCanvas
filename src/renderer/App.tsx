@@ -38,7 +38,8 @@ const fallbackProviders: ReadonlyArray<ProviderConfig> = [
   createFallbackProvider('volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
   createFallbackProvider('minimax', 'https://api.minimaxi.com/v1', true),
   createFallbackProvider('comfly', 'https://api.comfly.chat/v1', false),
-  createFallbackProvider('openai-relay', 'https://api.openai.com/v1', true),
+  createFallbackProvider('openai', 'https://api.openai.com/v1', true),
+  createFallbackProvider('openai-sub2api', '', false),
 ]
 
 function createFallbackProvider(id: string, baseUrl: string, enabled: boolean): ProviderConfig {

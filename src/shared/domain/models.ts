@@ -14,38 +14,32 @@ export function createProviderModelKey(providerId: string, remoteModelId: string
   return `${providerId}:${remoteModelId}`
 }
 
-export const DEFAULT_IMAGE_MODEL_KEY = createProviderModelKey('openai-relay', 'gpt-image-2')
-export const DEFAULT_CHAT_MODEL_KEY = createProviderModelKey('openai-relay', 'gpt-5.6-sol')
+export const DEFAULT_IMAGE_MODEL_KEY = createProviderModelKey('openai', 'gpt-image-2')
+export const DEFAULT_CHAT_MODEL_KEY = createProviderModelKey('openai', 'gpt-5.6-sol')
 
-export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
+type OpenAiModelCatalogEntry = Readonly<Omit<ProviderModelDefinition, 'key' | 'providerId'>>
+
+const OPENAI_MODEL_CATALOG: ReadonlyArray<OpenAiModelCatalogEntry> = [
   {
-    key: createProviderModelKey('openai-relay', 'gpt-image-2'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-image-2',
     displayName: 'GPT Image 2',
     kind: 'image',
-    description: 'OpenAI Relay 默认图像生成模型',
+    description: '默认图像生成模型',
     badge: '推荐',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-image-1.5'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-image-1.5',
     displayName: 'GPT Image 1.5',
     kind: 'image',
-    description: 'OpenAI Relay 通用图像生成模型',
+    description: '通用图像生成模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-image-1'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-image-1',
     displayName: 'GPT Image 1',
     kind: 'image',
-    description: 'OpenAI Relay 基础图像生成模型',
+    description: '基础图像生成模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.6-sol'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.6-sol',
     displayName: 'GPT-5.6 Sol',
     kind: 'chat',
@@ -53,8 +47,6 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     badge: '推荐',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.6-terra'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.6-terra',
     displayName: 'GPT-5.6 Terra',
     kind: 'chat',
@@ -62,69 +54,68 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     badge: '推荐',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.6-luna'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.6-luna',
     displayName: 'GPT-5.6 Luna',
     kind: 'chat',
     description: '面向低成本、高吞吐任务的轻量模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.5'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.5',
     displayName: 'GPT-5.5',
     kind: 'chat',
     description: '上一代复杂推理与专业工作模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.4'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.4',
     displayName: 'GPT-5.4',
     kind: 'chat',
     description: '稳定的通用推理与编码模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.4-mini'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.4-mini',
     displayName: 'GPT-5.4 mini',
     kind: 'chat',
     description: '低延迟的中小型任务模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-5.4-nano'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-5.4-nano',
     displayName: 'GPT-5.4 nano',
     kind: 'chat',
     description: '简单高频任务的低成本模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-4.1'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-4.1',
     displayName: 'GPT-4.1',
     kind: 'chat',
     description: '经典非推理通用模型',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-4.1-mini'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-4.1-mini',
     displayName: 'GPT-4.1 mini',
     kind: 'chat',
     description: '更快、更经济的 GPT-4.1 变体',
   },
   {
-    key: createProviderModelKey('openai-relay', 'gpt-4o-mini'),
-    providerId: 'openai-relay',
     remoteModelId: 'gpt-4o-mini',
     displayName: 'GPT-4o mini',
     kind: 'chat',
     description: '适合聚焦型对话任务的轻量模型',
   },
+]
+
+function createOpenAiProviderModels(providerId: 'openai' | 'openai-sub2api'): ReadonlyArray<ProviderModelDefinition> {
+  const providerLabel = providerId === 'openai' ? 'OpenAI' : 'OpenAI 中转'
+  return OPENAI_MODEL_CATALOG.map((model) => ({
+    ...model,
+    key: createProviderModelKey(providerId, model.remoteModelId),
+    providerId,
+    description: `${providerLabel} · ${model.description}`,
+  }))
+}
+
+export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
+  ...createOpenAiProviderModels('openai'),
+  ...createOpenAiProviderModels('openai-sub2api'),
   {
     key: createProviderModelKey('volcengine', 'doubao-seedream-5-0-260128'),
     providerId: 'volcengine',

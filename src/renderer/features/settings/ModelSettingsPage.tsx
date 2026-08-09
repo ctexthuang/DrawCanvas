@@ -49,7 +49,8 @@ const providerNames: Readonly<Record<string, Readonly<{ name: string; subtitle: 
   volcengine: { name: '火山引擎', subtitle: '豆包全模态模型', mark: '火' },
   minimax: { name: 'MiniMax', subtitle: 'H3 / M3 / Speech', mark: 'M' },
   // comfly: { name: 'Comfly', subtitle: '接口发现模型', mark: 'C' },
-  'openai-relay': { name: 'OpenAI Relay', subtitle: 'GPT Image 2', mark: 'O' },
+  openai: { name: 'OpenAI', subtitle: '官方 API', mark: 'O' },
+  'openai-sub2api': { name: 'OpenAI 中转', subtitle: 'sub2api 兼容站', mark: 'S' },
 }
 
 const disabledProviderIds = new Set(['apimart', 'comfly'])
@@ -78,9 +79,9 @@ export function ModelSettingsPage({
   onModelConfigChange,
 }: ModelSettingsPageProps) {
   const visibleProviders = providers.filter((item) => !disabledProviderIds.has(item.id))
-  const initialProviderId = visibleProviders.some((item) => item.id === 'openai-relay')
-    ? 'openai-relay'
-    : visibleProviders[0]?.id ?? 'openai-relay'
+  const initialProviderId = visibleProviders.some((item) => item.id === 'openai')
+    ? 'openai'
+    : visibleProviders[0]?.id ?? 'openai'
   const [activeProvider, setActiveProvider] = useState(initialProviderId)
   const provider = visibleProviders.find((item) => item.id === activeProvider) ?? visibleProviders[0]
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
@@ -100,7 +101,7 @@ export function ModelSettingsPage({
     setTestResult(null)
   }, [provider?.baseUrl, provider?.id])
 
-  const baseUrlError = getBaseUrlError(baseUrl)
+  const baseUrlError = getBaseUrlError(baseUrl, provider?.id)
   const isDirty = Boolean(provider && (baseUrl.trim().replace(/\/+$/, '') !== provider.baseUrl || apiKey.trim()))
   const busy = saving || testing || clearing || togglingProviderId === provider?.id
   const effectiveProvider = testResult?.provider ?? provider
@@ -242,9 +243,9 @@ export function ModelSettingsPage({
 
       <div className="settings-content">
         <section className="settings-panel provider-config-panel">
-          <div className="panel-title"><div><h2>{providerNames[provider?.id ?? '']?.name ?? provider?.id}</h2><p>配置服务商 API 根地址与访问凭证</p></div><span className={`connection-badge is-${provider?.enabled ? currentStatus : 'disabled'}`}><i />{provider?.enabled ? (testing ? '测试中' : statusLabels[currentStatus]) : '已停用'}</span></div>
+          <div className="panel-title"><div><h2>{providerNames[provider?.id ?? '']?.name ?? provider?.id}</h2><p>{provider?.id === 'openai' ? '使用 OpenAI 官方 API 与独立访问凭证' : provider?.id === 'openai-sub2api' ? '配置兼容 sub2api 的 OpenAI 中转站' : '配置服务商 API 根地址与访问凭证'}</p></div><span className={`connection-badge is-${provider?.enabled ? currentStatus : 'disabled'}`}><i />{provider?.enabled ? (testing ? '测试中' : statusLabels[currentStatus]) : '已停用'}</span></div>
           <div className="form-grid">
-            <label><span>Base URL</span><input aria-invalid={Boolean(baseUrlError)} disabled={busy} onChange={(event) => { setBaseUrl(event.target.value); setTestResult(null) }} placeholder="https://api.example.com/v1" value={baseUrl} />{baseUrlError && <small className="field-error">{baseUrlError}</small>}</label>
+            <label><span>Base URL</span><input aria-invalid={Boolean(baseUrlError)} disabled={busy || provider?.id === 'openai'} onChange={(event) => { setBaseUrl(event.target.value); setTestResult(null) }} placeholder={provider?.id === 'openai-sub2api' ? 'https://your-sub2api.example.com' : 'https://api.example.com/v1'} value={baseUrl} />{baseUrlError && <small className="field-error">{baseUrlError}</small>}{provider?.id === 'openai' && <small className="field-hint">官方地址固定为 https://api.openai.com/v1</small>}{provider?.id === 'openai-sub2api' && <small className="field-hint">支持填写 sub2api 根地址或 /v1 地址；本机服务可使用 http://localhost。</small>}</label>
             <label><span>API Key</span><div className="password-field"><input autoComplete="off" disabled={busy} onChange={(event) => { setApiKey(event.target.value); setTestResult(null) }} placeholder={provider?.hasApiKey ? '已安全保存 · 输入新密钥可覆盖' : 'sk-...'} type={showKey ? 'text' : 'password'} value={apiKey} /><button aria-label={showKey ? '隐藏 API Key' : '显示 API Key'} disabled={busy} onClick={() => setShowKey(!showKey)} type="button">{showKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div></label>
           </div>
           {testResult && <div className={`connection-result ${testResult.connected ? 'is-success' : 'is-error'}`} role="status">
@@ -292,13 +293,23 @@ export function ModelSettingsPage({
   )
 }
 
-function getBaseUrlError(value: string): string | null {
+function getBaseUrlError(value: string, providerId: string | undefined): string | null {
   if (!value.trim()) return '请输入接口地址'
   try {
     const url = new URL(value.trim())
-    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash
+    if (url.username || url.password || url.search || url.hash) {
+      return '地址不能包含账号、查询参数或片段'
+    }
+    const normalized = url.toString().replace(/\/+$/, '')
+    if (providerId === 'openai') {
+      return normalized === 'https://api.openai.com/v1' ? null : 'OpenAI 官方地址不可修改'
+    }
+    const isLoopbackRelay = providerId === 'openai-sub2api' &&
+      url.protocol === 'http:' &&
+      (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')
+    return url.protocol === 'https:' || isLoopbackRelay
       ? null
-      : '仅支持不含账号、查询参数的 HTTPS 地址'
+      : '仅支持 HTTPS；本机中转可使用 HTTP'
   } catch {
     return '接口地址格式无效'
   }

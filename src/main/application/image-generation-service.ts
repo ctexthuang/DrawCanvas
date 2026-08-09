@@ -51,10 +51,10 @@ export class ImageGenerationService {
       throw new ImageGenerationServiceError('PROVIDER_NOT_CONFIGURED', '请先在模型设置中保存该服务商的 API Key')
     }
 
-    if (provider.id !== 'openai-relay') {
+    if (provider.id !== 'openai' && provider.id !== 'openai-sub2api') {
       throw new ImageGenerationServiceError(
         'UNSUPPORTED_PROVIDER',
-        '该服务商的图片生成协议尚未接入，首版请使用 OpenAI 图片模型',
+        '该服务商的图片生成协议尚未接入，请使用 OpenAI 或 OpenAI 中转图片模型',
       )
     }
     const apiKey = await this.appState.loadProviderApiKey(provider.id)
@@ -69,6 +69,7 @@ export class ImageGenerationService {
         model.remoteModelId,
         request.prompt,
         request.size,
+        provider.id === 'openai-sub2api' ? 'sub2api' : 'openai',
       )
       const artwork = await this.appState.saveGeneratedImage({
         ...generated,

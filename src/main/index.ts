@@ -53,12 +53,14 @@ import { ProviderRequestError, testOpenAiCompatibleProvider } from './infrastruc
 const appState = new AppState()
 const imageGenerationService = new ImageGenerationService(appState)
 let mainWindow: BrowserWindow | null = null
+const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1'
 const PROVIDER_IDS = new Set([
   // 'apimart',
   'volcengine',
   'minimax',
   // 'comfly',
-  'openai-relay',
+  'openai',
+  'openai-sub2api',
 ])
 
 function success<T>(value: T): DesktopResult<T> {
@@ -106,18 +108,24 @@ function isHexColor(value: unknown): value is string {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
 }
 
-function normalizeBaseUrl(value: unknown): string | null {
+function normalizeBaseUrl(value: unknown, providerId: string): string | null {
   if (typeof value !== 'string' || value.length > 2048) return null
   try {
     const url = new URL(value.trim())
+    const isLoopbackRelay = providerId === 'openai-sub2api' &&
+      url.protocol === 'http:' &&
+      (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')
     if (
-      url.protocol !== 'https:' ||
+      (url.protocol !== 'https:' && !isLoopbackRelay) ||
       url.username ||
       url.password ||
       url.search ||
       url.hash
     ) return null
-    return url.toString().replace(/\/+$/, '')
+    const normalized = url.toString().replace(/\/+$/, '')
+    return providerId !== 'openai' || normalized === OPENAI_OFFICIAL_BASE_URL
+      ? normalized
+      : null
   } catch {
     return null
   }
@@ -274,8 +282,8 @@ function registerIpc(): void {
       if (!request || !isProviderId(request.id)) {
         return failure('INVALID_INPUT', '服务商配置无效')
       }
-      const baseUrl = normalizeBaseUrl(request.baseUrl)
-      if (!baseUrl) return failure('INVALID_INPUT', '接口地址必须是有效的 HTTPS 地址')
+      const baseUrl = normalizeBaseUrl(request.baseUrl, request.id)
+      if (!baseUrl) return failure('INVALID_INPUT', '接口地址无效；中转站仅允许 HTTPS 或本机 HTTP 地址')
       const apiKey = normalizeApiKey(request.apiKey)
       if (apiKey === null) return failure('INVALID_INPUT', 'API Key 格式无效')
       try {
@@ -294,8 +302,8 @@ function registerIpc(): void {
       if (!request || !isProviderId(request.id)) {
         return failure('INVALID_INPUT', '服务商配置无效')
       }
-      const baseUrl = normalizeBaseUrl(request.baseUrl)
-      if (!baseUrl) return failure('INVALID_INPUT', '接口地址必须是有效的 HTTPS 地址')
+      const baseUrl = normalizeBaseUrl(request.baseUrl, request.id)
+      if (!baseUrl) return failure('INVALID_INPUT', '接口地址无效；中转站仅允许 HTTPS 或本机 HTTP 地址')
       const draftApiKey = normalizeApiKey(request.apiKey)
       if (draftApiKey === null) return failure('INVALID_INPUT', 'API Key 格式无效')
 
@@ -306,7 +314,11 @@ function registerIpc(): void {
         const canPersist = draftApiKey === undefined && savedProvider.baseUrl === baseUrl
         const testedAt = new Date().toISOString()
         try {
-          const result = await testOpenAiCompatibleProvider(baseUrl, apiKey)
+          const result = await testOpenAiCompatibleProvider(
+            baseUrl,
+            apiKey,
+            request.id === 'openai-sub2api' ? 'sub2api' : 'openai',
+          )
           const provider = canPersist
             ? await appState.markProviderTest(
                 request.id,

@@ -101,7 +101,7 @@ type StoredModelConfigDocument = Readonly<{
 }>
 
 type ModelConfigDocument = Readonly<{
-  schemaVersion: 4
+  schemaVersion: 5
   enabledModelKeys: ReadonlyArray<string>
   defaultModelKeys: Readonly<Partial<Record<ModelKind, string>>>
   providers: ReadonlyArray<StoredProvider>
@@ -131,7 +131,8 @@ function defaultProviders(): ReadonlyArray<StoredProvider> {
     createDefaultProvider('volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
     createDefaultProvider('minimax', 'https://api.minimaxi.com/v1', true),
     createDefaultProvider('comfly', 'https://api.comfly.chat/v1', false),
-    createDefaultProvider('openai-relay', 'https://api.openai.com/v1', true),
+    createDefaultProvider('openai', 'https://api.openai.com/v1', true),
+    createDefaultProvider('openai-sub2api', '', false),
   ]
 }
 
@@ -969,8 +970,12 @@ export class AppState {
 
   private normalizeModelConfig(value: StoredModelConfigDocument | null): ModelConfigDocument {
     const storedProviders = Array.isArray(value?.providers) ? value.providers : []
+    const legacyOpenAiProvider = storedProviders.find((provider) => provider?.id === 'openai-relay')
+    const legacyOpenAiTarget = getLegacyOpenAiTarget(legacyOpenAiProvider)
     const providers = defaultProviders().map((fallback) => {
-      const stored = storedProviders.find((provider) => provider?.id === fallback.id)
+      const stored = storedProviders.find((provider) => provider?.id === fallback.id) ?? (
+        fallback.id === legacyOpenAiTarget ? legacyOpenAiProvider : undefined
+      )
       if (!stored) return fallback
       const connectionStatus = isConnectionStatus(stored.connectionStatus)
         ? stored.connectionStatus
@@ -981,10 +986,12 @@ export class AppState {
         !stored.encryptedApiKey
       return {
         id: fallback.id,
-        baseUrl: typeof stored.baseUrl === 'string' && stored.baseUrl && !shouldMigrateMiniMaxGlobalEndpoint
+        baseUrl: fallback.id === 'openai'
+          ? fallback.baseUrl
+          : typeof stored.baseUrl === 'string' && stored.baseUrl && !shouldMigrateMiniMaxGlobalEndpoint
           ? stored.baseUrl
           : fallback.baseUrl,
-        enabled: fallback.enabled === true && stored.enabled !== false,
+        enabled: typeof stored.enabled === 'boolean' ? stored.enabled : fallback.enabled,
         ...(typeof stored.encryptedApiKey === 'string' && stored.encryptedApiKey
           ? { encryptedApiKey: stored.encryptedApiKey }
           : {}),
@@ -996,22 +1003,25 @@ export class AppState {
       }
     })
     const storedEnabledModelKeys = (value?.schemaVersion ?? 0) >= 2
-      ? validModelKeys(value?.enabledModelKeys ?? [])
-      : migrateLegacyModelIds(value?.selectedModelIds ?? LEGACY_DEFAULT_MODELS)
-    const enabledModelKeys = (value?.schemaVersion ?? 0) < 3 && !storedEnabledModelKeys.includes(DEFAULT_CHAT_MODEL_KEY)
-      ? [...storedEnabledModelKeys, DEFAULT_CHAT_MODEL_KEY]
+      ? validModelKeys(value?.enabledModelKeys ?? [], legacyOpenAiTarget)
+      : migrateLegacyModelIds(value?.selectedModelIds ?? LEGACY_DEFAULT_MODELS, legacyOpenAiTarget)
+    const migratedDefaultChatKey = migrateModelKey('openai-relay:gpt-5.6-sol', legacyOpenAiTarget) ?? DEFAULT_CHAT_MODEL_KEY
+    const migratedDefaultImageKey = migrateModelKey('openai-relay:gpt-image-2', legacyOpenAiTarget) ?? DEFAULT_IMAGE_MODEL_KEY
+    const enabledModelKeys = (value?.schemaVersion ?? 0) < 3 && !storedEnabledModelKeys.includes(migratedDefaultChatKey)
+      ? [...storedEnabledModelKeys, migratedDefaultChatKey]
       : storedEnabledModelKeys
     const storedDefaultModelKeys = (value?.schemaVersion ?? 0) >= 2
       ? value?.defaultModelKeys
-      : { image: DEFAULT_IMAGE_MODEL_KEY }
+      : { image: migratedDefaultImageKey }
     const defaultModelKeys = normalizeDefaultModelKeys(
       (value?.schemaVersion ?? 0) < 3
-        ? { ...storedDefaultModelKeys, chat: DEFAULT_CHAT_MODEL_KEY }
+        ? { ...storedDefaultModelKeys, chat: migratedDefaultChatKey }
         : storedDefaultModelKeys,
       enabledModelKeys,
+      legacyOpenAiTarget,
     )
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       enabledModelKeys,
       defaultModelKeys,
       providers,
@@ -1203,34 +1213,44 @@ function uniqueStrings(value: ReadonlyArray<unknown>, limit: number): ReadonlyAr
     .slice(0, limit)
 }
 
-function validModelKeys(value: ReadonlyArray<unknown>): ReadonlyArray<string> {
+function validModelKeys(
+  value: ReadonlyArray<unknown>,
+  legacyOpenAiTarget: 'openai' | 'openai-sub2api' = 'openai',
+): ReadonlyArray<string> {
   return uniqueStrings(value, 500)
-    .map((key) => migrateModelKey(key))
+    .map((key) => migrateModelKey(key, legacyOpenAiTarget))
     .filter((key): key is string => Boolean(
       key && /^[a-z0-9-]+:.+$/i.test(key) && key.length <= 400,
     ))
 }
 
-function migrateLegacyModelIds(modelIds: ReadonlyArray<string>): ReadonlyArray<string> {
+function migrateLegacyModelIds(
+  modelIds: ReadonlyArray<string>,
+  openAiTarget: 'openai' | 'openai-sub2api' = 'openai',
+): ReadonlyArray<string> {
   const normalizedIds = uniqueStrings(modelIds, 500)
   const isUntouchedLegacyDefault =
     normalizedIds.length === LEGACY_DEFAULT_MODELS.length &&
     LEGACY_DEFAULT_MODELS.every((id) => normalizedIds.includes(id))
-  if (isUntouchedLegacyDefault) return [DEFAULT_IMAGE_MODEL_KEY]
+  const fallbackImageKey = `${openAiTarget}:gpt-image-2`
+  if (isUntouchedLegacyDefault) return [fallbackImageKey]
 
   const keys = normalizedIds.flatMap((modelId) =>
-    findBuiltinModelsByRemoteId(modelId).map((model) => model.key),
+    findBuiltinModelsByRemoteId(modelId)
+      .filter((model) => model.providerId === openAiTarget)
+      .map((model) => model.key),
   )
-  return keys.length ? validModelKeys(keys) : [DEFAULT_IMAGE_MODEL_KEY]
+  return keys.length ? validModelKeys(keys, openAiTarget) : [fallbackImageKey]
 }
 
 function normalizeDefaultModelKeys(
   value: Readonly<Partial<Record<ModelKind, string>>> | undefined,
   enabledModelKeys: ReadonlyArray<string>,
+  legacyOpenAiTarget: 'openai' | 'openai-sub2api' = 'openai',
 ): Readonly<Partial<Record<ModelKind, string>>> {
   const defaults: Partial<Record<ModelKind, string>> = {}
   for (const kind of ['image', 'video', 'chat', 'audio'] as const) {
-    const key = migrateModelKey(value?.[kind])
+    const key = migrateModelKey(value?.[kind], legacyOpenAiTarget)
     if (!key || !enabledModelKeys.includes(key) || inferModelKindFromKey(key) !== kind) continue
     defaults[kind] = key
   }
@@ -1247,7 +1267,13 @@ function inferModelKindFromKey(key: string): ModelKind {
   return 'chat'
 }
 
-function migrateModelKey(key: string | undefined): string | undefined {
+function migrateModelKey(
+  key: string | undefined,
+  legacyOpenAiTarget: 'openai' | 'openai-sub2api' = 'openai',
+): string | undefined {
+  if (key?.startsWith('openai-relay:')) {
+    return `${legacyOpenAiTarget}:${key.slice('openai-relay:'.length)}`
+  }
   if (key === 'volcengine:doubao-seedream-5-0-pro') {
     return 'volcengine:doubao-seedream-5-0-260128'
   }
@@ -1255,6 +1281,19 @@ function migrateModelKey(key: string | undefined): string | undefined {
     return 'volcengine:doubao-seedream-4-5-251128'
   }
   return key
+}
+
+function getLegacyOpenAiTarget(
+  provider: StoredProvider | undefined,
+): 'openai' | 'openai-sub2api' {
+  if (!provider?.baseUrl) return 'openai'
+  try {
+    return new URL(provider.baseUrl).hostname.toLowerCase() === 'api.openai.com'
+      ? 'openai'
+      : 'openai-sub2api'
+  } catch {
+    return 'openai-sub2api'
+  }
 }
 
 function documentsEqual(left: unknown, right: unknown): boolean {
