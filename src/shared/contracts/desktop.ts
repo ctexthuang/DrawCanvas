@@ -11,6 +11,8 @@ export type DesktopErrorCode =
   | 'STORAGE_CONFLICT'
   | 'UNAUTHORIZED'
   | 'ENCRYPTION_UNAVAILABLE'
+  | 'PROVIDER_ERROR'
+  | 'UNSUPPORTED_PROVIDER'
 
 export type DesktopError = Readonly<{
   code: DesktopErrorCode
@@ -107,6 +109,9 @@ export type CanvasNodeData = Readonly<{
   x: number
   y: number
   color?: string
+  modelKey?: string
+  imageSize?: ImageGenerationSize
+  imageFileName?: string
 }>
 
 export type CanvasConnection = Readonly<{
@@ -171,6 +176,28 @@ export type GeneratedArtwork = Readonly<{
   createdAt: string
   palette: string
   tags: ReadonlyArray<string>
+  modelKey?: string
+  imageFileName?: string
+}>
+
+export type ImageGenerationSize = '1024x1024' | '1536x1024' | '1024x1536'
+
+export type GenerateImageRequest = Readonly<{
+  prompt: string
+  modelKey?: string
+  size: ImageGenerationSize
+}>
+
+export type GeneratedImageResult = Readonly<{
+  artwork: GeneratedArtwork
+}>
+
+export type LoadGeneratedImageRequest = Readonly<{
+  fileName: string
+}>
+
+export type LoadedGeneratedImage = Readonly<{
+  dataUrl: string
 }>
 
 export type PromptAsset = Readonly<{
@@ -213,6 +240,10 @@ export type DesktopApi = Readonly<{
   }>
   resources: Readonly<{
     load: () => Promise<DesktopResult<ResourceCatalog>>
+  }>
+  generation: Readonly<{
+    generateImage: (request: GenerateImageRequest) => Promise<DesktopResult<GeneratedImageResult>>
+    loadImage: (request: LoadGeneratedImageRequest) => Promise<DesktopResult<LoadedGeneratedImage>>
   }>
   storage: Readonly<{
     changeDirectory: () => Promise<DesktopResult<StorageMigrationResult>>

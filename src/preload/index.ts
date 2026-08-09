@@ -4,12 +4,15 @@ import type {
   CanvasDocument,
   ClearProviderApiKeyRequest,
   DesktopApi,
+  GenerateImageRequest,
   GeneratedArtwork,
+  LoadGeneratedImageRequest,
   SaveProviderRequest,
   SetProviderEnabledRequest,
   TestProviderRequest,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
+import { GENERATION_IPC_CHANNELS } from '../shared/contracts/ipc-channels'
 
 const desktopApi: DesktopApi = {
   settings: {
@@ -31,6 +34,10 @@ const desktopApi: DesktopApi = {
   },
   resources: {
     load: () => ipcRenderer.invoke('resources:load'),
+  },
+  generation: {
+    generateImage: (request: GenerateImageRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateImage, request),
+    loadImage: (request: LoadGeneratedImageRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.loadImage, request),
   },
   storage: {
     changeDirectory: () => ipcRenderer.invoke('storage:change-directory'),

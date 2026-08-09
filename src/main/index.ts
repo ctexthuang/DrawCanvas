@@ -18,7 +18,9 @@ import type {
   ClearProviderApiKeyRequest,
   DesktopErrorCode,
   DesktopResult,
+  GenerateImageRequest,
   GeneratedArtwork,
+  LoadGeneratedImageRequest,
   ProviderConfig,
   ProviderConnectionTestResult,
   SaveProviderRequest,
@@ -27,11 +29,17 @@ import type {
   ThemeMode,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
+import { GENERATION_IPC_CHANNELS } from '../shared/contracts/ipc-channels'
 import { AppState, ProviderSecretUnavailableError } from './application/app-state'
+import {
+  ImageGenerationService,
+  ImageGenerationServiceError,
+} from './application/image-generation-service'
 import { AppDataMigrationError } from './infrastructure/app-data-layout'
 import { ProviderRequestError, testOpenAiCompatibleProvider } from './infrastructure/provider-client'
 
 const appState = new AppState()
+const imageGenerationService = new ImageGenerationService(appState)
 let mainWindow: BrowserWindow | null = null
 const PROVIDER_IDS = new Set([
   // 'apimart',
@@ -158,6 +166,29 @@ function isGeneratedArtwork(value: unknown): value is GeneratedArtwork {
     typeof artwork.palette === 'string' && artwork.palette.length <= 500 &&
     Array.isArray(artwork.tags) && artwork.tags.length <= 20
   )
+}
+
+function isGenerateImageRequest(value: unknown): value is GenerateImageRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<GenerateImageRequest>
+  return (
+    typeof request.prompt === 'string' &&
+    request.prompt.trim().length > 0 &&
+    request.prompt.length <= 20_000 &&
+    (request.modelKey === undefined || (
+      typeof request.modelKey === 'string' &&
+      request.modelKey.length > 0 &&
+      request.modelKey.length <= 400
+    )) &&
+    (request.size === '1024x1024' || request.size === '1536x1024' || request.size === '1024x1536')
+  )
+}
+
+function isLoadGeneratedImageRequest(value: unknown): value is LoadGeneratedImageRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<LoadGeneratedImageRequest>
+  return typeof request.fileName === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|webp)$/i.test(request.fileName)
 }
 
 function registerIpc(): void {
@@ -368,6 +399,41 @@ function registerIpc(): void {
         return success(await appState.loadResources())
       } catch {
         return failure('IO_ERROR', '无法读取资源数据')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.generateImage,
+    trustedHandler(async (request: GenerateImageRequest) => {
+      if (!isGenerateImageRequest(request)) {
+        return failure('INVALID_INPUT', '请输入有效提示词并选择支持的图片尺寸')
+      }
+      try {
+        return success(await imageGenerationService.generate({
+          ...request,
+          prompt: request.prompt.trim(),
+        }))
+      } catch (error) {
+        if (error instanceof ImageGenerationServiceError) {
+          return failure(
+            error.code === 'UNSUPPORTED_PROVIDER' ? 'UNSUPPORTED_PROVIDER' : 'PROVIDER_ERROR',
+            error.message,
+          )
+        }
+        return failure('IO_ERROR', '生成结果保存失败，请检查数据目录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.loadImage,
+    trustedHandler(async (request: LoadGeneratedImageRequest) => {
+      if (!isLoadGeneratedImageRequest(request)) return failure('INVALID_INPUT', '图片资源引用无效')
+      try {
+        return success(await imageGenerationService.loadImage(request.fileName))
+      } catch {
+        return failure('NOT_FOUND', '本地图片资源不存在或无法读取')
       }
     }),
   )

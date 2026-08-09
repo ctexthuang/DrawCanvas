@@ -1,10 +1,13 @@
+import { randomUUID } from 'node:crypto'
+import { readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { unlink } from 'node:fs/promises'
 import { app, safeStorage } from 'electron/main'
 import type {
   AppSettings,
   CanvasDocument,
   GeneratedArtwork,
+  ImageGenerationSize,
+  LoadedGeneratedImage,
   ProviderConfig,
   ProviderConnectionStatus,
   ResourceCatalog,
@@ -38,6 +41,18 @@ import {
   writeAppDataLocation,
 } from '../infrastructure/app-data-layout'
 import { JsonFileStore, readJsonFile } from '../infrastructure/json-store'
+import type { GeneratedImageMediaType } from '../infrastructure/image-generation-client'
+
+const MAX_STORED_IMAGE_BYTES = 25 * 1024 * 1024
+
+type SaveGeneratedImageRequest = Readonly<{
+  bytes: Uint8Array
+  mediaType: GeneratedImageMediaType
+  prompt: string
+  modelKey: string
+  modelName: string
+  size: ImageGenerationSize
+}>
 
 type StoredProvider = Readonly<{
   id: string
@@ -344,6 +359,52 @@ export class AppState {
       const current = value ?? []
       return [artwork, ...current.filter((item) => item.id !== artwork.id)].slice(0, 200)
     }))
+  }
+
+  async saveGeneratedImage(request: SaveGeneratedImageRequest): Promise<GeneratedArtwork> {
+    return this.withStorageOperation(async () => {
+      const id = randomUUID()
+      const imageFileName = `${id}.${extensionForMediaType(request.mediaType)}`
+      const imagePath = join(this.paths.imagesDirectory, imageFileName)
+      const artwork: GeneratedArtwork = {
+        id,
+        title: `${request.modelName} 生成结果`,
+        prompt: request.prompt,
+        model: request.modelName,
+        modelKey: request.modelKey,
+        size: request.size.replace('x', ' × '),
+        createdAt: new Date().toISOString(),
+        palette: 'linear-gradient(145deg, #29344d 0%, #7552be 48%, #f06b82 100%)',
+        tags: ['画布生成', '文生图'],
+        imageFileName,
+      }
+
+      await writeFile(imagePath, request.bytes, { flag: 'wx' })
+      try {
+        await this.historyStore.update((value) => {
+          const current = value ?? []
+          return [artwork, ...current.filter((item) => item.id !== artwork.id)].slice(0, 200)
+        })
+      } catch (error) {
+        await unlink(imagePath).catch(() => undefined)
+        throw error
+      }
+      return artwork
+    })
+  }
+
+  async loadGeneratedImage(fileName: string): Promise<LoadedGeneratedImage> {
+    return this.withStorageOperation(async () => {
+      if (!isGeneratedImageFileName(fileName)) throw new Error('Invalid generated image file name')
+      const imagePath = join(this.paths.imagesDirectory, fileName)
+      const fileStats = await stat(imagePath)
+      if (!fileStats.isFile() || fileStats.size > MAX_STORED_IMAGE_BYTES) {
+        throw new Error('Generated image is invalid or too large')
+      }
+      const bytes = await readFile(imagePath)
+      const mediaType = mediaTypeForFileName(fileName)
+      return { dataUrl: `data:${mediaType};base64,${bytes.toString('base64')}` }
+    })
   }
 
   async loadLibrary(): Promise<ReadonlyArray<GeneratedArtwork>> {
@@ -767,4 +828,20 @@ function migrateModelKey(key: string | undefined): string | undefined {
 
 function documentsEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function extensionForMediaType(mediaType: GeneratedImageMediaType): 'png' | 'jpg' | 'webp' {
+  if (mediaType === 'image/jpeg') return 'jpg'
+  if (mediaType === 'image/webp') return 'webp'
+  return 'png'
+}
+
+function isGeneratedImageFileName(fileName: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|webp)$/i.test(fileName)
+}
+
+function mediaTypeForFileName(fileName: string): GeneratedImageMediaType {
+  if (fileName.endsWith('.jpg')) return 'image/jpeg'
+  if (fileName.endsWith('.webp')) return 'image/webp'
+  return 'image/png'
 }

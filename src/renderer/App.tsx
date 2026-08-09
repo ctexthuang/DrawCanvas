@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import type {
   AppSettings,
   CanvasDocument,
+  GenerateImageRequest,
+  GeneratedImageResult,
   GeneratedArtwork,
   ProviderConfig,
   ProviderConnectionTestResult,
@@ -12,7 +14,11 @@ import type {
   ThemeMode,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
-import { DEFAULT_CHAT_MODEL_KEY, DEFAULT_IMAGE_MODEL_KEY } from '../shared/domain/models'
+import {
+  BUILTIN_PROVIDER_MODELS,
+  DEFAULT_CHAT_MODEL_KEY,
+  DEFAULT_IMAGE_MODEL_KEY,
+} from '../shared/domain/models'
 import { AppShell, type AppPage } from './components/AppShell'
 import { createInitialCanvas, InfiniteCanvas } from './features/canvas/InfiniteCanvas'
 import { GalleryPage } from './features/gallery/GalleryPage'
@@ -88,6 +94,10 @@ export function App() {
     () => [...generatedArtworks, ...libraryCatalog.filter((artwork) => !generatedArtworks.some((generated) => generated.id === artwork.id))],
     [generatedArtworks, libraryCatalog],
   )
+  const imageModels = useMemo(() => BUILTIN_PROVIDER_MODELS
+    .filter((model) => model.kind === 'image' && settings.enabledModelKeys.includes(model.key))
+    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
+    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -147,12 +157,21 @@ export function App() {
     else notify(result.error.message)
   }
 
-  function notify(message: string): void {
+  const notify = useCallback((message: string): void => {
     setToast(message)
-  }
+  }, [])
 
   function newCanvas(prompt?: string): void {
-    setCanvasDocument(createInitialCanvas('未命名画布', prompt))
+    const defaultImageModelKey = settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY
+    const defaultImageModelName = BUILTIN_PROVIDER_MODELS.find(
+      (model) => model.key === defaultImageModelKey,
+    )?.displayName ?? '默认图片模型'
+    setCanvasDocument(createInitialCanvas(
+      '未命名画布',
+      prompt,
+      defaultImageModelKey,
+      defaultImageModelName,
+    ))
     setPage('canvas')
   }
 
@@ -193,13 +212,31 @@ export function App() {
     void updateSettings({ favoriteImageIds: next })
   }
 
-  async function recordGeneratedArtwork(artwork: GeneratedArtwork): Promise<void> {
-    setGeneratedArtworks((current) => [artwork, ...current.filter((item) => item.id !== artwork.id)])
-    if (!window.desktop) return
-    const result = await window.desktop.history.record(artwork)
-    if (result.ok) setGeneratedArtworks(result.value)
-    else notify(result.error.message)
-  }
+  const generateCanvasImage = useCallback(async (request: GenerateImageRequest): Promise<GeneratedImageResult | null> => {
+    if (!window.desktop) {
+      notify('真实图片生成需要在 Electron 桌面端运行')
+      return null
+    }
+    const result = await window.desktop.generation.generateImage(request)
+    if (!result.ok) {
+      notify(result.error.message)
+      return null
+    }
+    setGeneratedArtworks((current) => [
+      result.value.artwork,
+      ...current.filter((item) => item.id !== result.value.artwork.id),
+    ])
+    void window.desktop.storage.stats().then((statsResult) => {
+      if (statsResult.ok) setStats(statsResult.value)
+    })
+    return result.value
+  }, [notify])
+
+  const loadGeneratedImage = useCallback(async (fileName: string): Promise<string | null> => {
+    if (!window.desktop) return null
+    const result = await window.desktop.generation.loadImage({ fileName })
+    return result.ok ? result.value.dataUrl : null
+  }, [])
 
   async function saveProvider(request: SaveProviderRequest): Promise<boolean> {
     if (!window.desktop) {
@@ -356,7 +393,7 @@ export function App() {
       case 'settings':
         return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} />
       case 'canvas':
-        return <InfiniteCanvas document={canvasDocument} notify={notify} onChange={setCanvasDocument} onClose={() => setPage('home')} onGenerated={(artwork) => void recordGeneratedArtwork(artwork)} onOpen={() => void openCanvasFile()} onSave={() => void saveCanvasFile()} />
+        return <InfiniteCanvas defaultImageModelKey={settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={setCanvasDocument} onClose={() => setPage('home')} onGenerateImage={generateCanvasImage} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onSave={() => void saveCanvasFile()} />
     }
   }
 
