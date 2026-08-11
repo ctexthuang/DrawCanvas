@@ -1,6 +1,24 @@
 export const GENERATION_IPC_CHANNELS = {
   generateImage: 'generation:generate-image',
+  generateVideo: 'generation:generate-video',
+  generateAudio: 'generation:generate-audio',
+  optimizePrompt: 'generation:optimize-prompt',
+  generateChatReply: 'generation:generate-chat-reply',
+  generateStoryboard: 'generation:generate-storyboard',
   loadImage: 'generation:load-image',
+} as const
+
+export const HISTORY_IPC_CHANNELS = {
+  load: 'history:load',
+  loadVideos: 'history:load-videos',
+  loadAudios: 'history:load-audios',
+  record: 'history:record',
+  remove: 'history:remove',
+  removeVideo: 'history:remove-video',
+  exportVideo: 'history:export-video',
+  removeAudio: 'history:remove-audio',
+  exportAudio: 'history:export-audio',
+  exportBatch: 'history:export-batch',
 } as const
 
 export const CANVAS_IPC_CHANNELS = {
@@ -12,6 +30,7 @@ export const CANVAS_IPC_CHANNELS = {
 export const LIBRARY_IPC_CHANNELS = {
   load: 'library:load',
   importImages: 'library:import-images',
+  importDroppedImages: 'library:import-dropped-images',
   remove: 'library:remove',
 } as const
 

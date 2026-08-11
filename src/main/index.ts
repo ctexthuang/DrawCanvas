@@ -1,12 +1,14 @@
 import { readFile, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative } from 'node:path'
-import { fileURLToPath, URL } from 'node:url'
+import { extname, isAbsolute, join, relative } from 'node:path'
+import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
   app,
   BrowserWindow,
   dialog,
   ipcMain,
+  net,
   nativeTheme,
+  protocol,
   session,
   type IpcMainInvokeEvent,
   type OpenDialogOptions,
@@ -19,12 +21,24 @@ import type {
   DeleteRecentCanvasProjectRequest,
   DesktopErrorCode,
   DesktopResult,
+  ExportGeneratedAudioRequest,
+  ExportGeneratedVideoRequest,
+  ExportHistoryBatchRequest,
+  GenerateAudioRequest,
+  GenerateChatReplyRequest,
   GenerateImageRequest,
+  GenerateStoryboardRequest,
+  GenerateVideoRequest,
   GeneratedArtwork,
+  ImportDroppedImagesRequest,
   LoadGeneratedImageRequest,
   LoadRecentCanvasProjectRequest,
+  OptimizePromptRequest,
   ProviderConfig,
   ProviderConnectionTestResult,
+  RemoveGeneratedVideoRequest,
+  RemoveGeneratedAudioRequest,
+  RemoveHistoryArtworkRequest,
   RemoveLibraryImageRequest,
   RemoveResourceRequest,
   SavePromptRequest,
@@ -38,20 +52,45 @@ import type {
 import {
   CANVAS_IPC_CHANNELS,
   GENERATION_IPC_CHANNELS,
+  HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
 import { isCanvasDocument } from '../shared/domain/canvas-document'
+import { isImageGenerationSize } from '../shared/domain/models'
 import { AppState, ProviderSecretUnavailableError } from './application/app-state'
 import {
   ImageGenerationService,
   ImageGenerationServiceError,
+  type ImageGenerationServiceErrorCode,
 } from './application/image-generation-service'
+import {
+  PromptOptimizationService,
+  PromptOptimizationServiceError,
+  type PromptOptimizationServiceErrorCode,
+} from './application/prompt-optimization-service'
+import {
+  VideoGenerationService,
+  VideoGenerationServiceError,
+} from './application/video-generation-service'
+import {
+  AudioGenerationService,
+  AudioGenerationServiceError,
+} from './application/audio-generation-service'
+import {
+  TextGenerationService,
+  TextGenerationServiceError,
+  type TextGenerationServiceErrorCode,
+} from './application/text-generation-service'
 import { AppDataMigrationError } from './infrastructure/app-data-layout'
 import { ProviderRequestError, testOpenAiCompatibleProvider } from './infrastructure/provider-client'
 
 const appState = new AppState()
 const imageGenerationService = new ImageGenerationService(appState)
+const promptOptimizationService = new PromptOptimizationService(appState)
+const textGenerationService = new TextGenerationService(appState)
+const videoGenerationService = new VideoGenerationService(appState)
+const audioGenerationService = new AudioGenerationService(appState)
 let mainWindow: BrowserWindow | null = null
 const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1'
 const PROVIDER_IDS = new Set([
@@ -63,12 +102,66 @@ const PROVIDER_IDS = new Set([
   'openai-sub2api',
 ])
 
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'drawcanvas-media',
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    stream: true,
+  },
+}])
+
 function success<T>(value: T): DesktopResult<T> {
   return { ok: true, value }
 }
 
 function failure<T>(code: DesktopErrorCode, message: string): DesktopResult<T> {
   return { ok: false, error: { code, message } }
+}
+
+function imageGenerationDesktopErrorCode(
+  code: ImageGenerationServiceErrorCode,
+): DesktopErrorCode {
+  switch (code) {
+    case 'UNSUPPORTED_PROVIDER': return 'UNSUPPORTED_PROVIDER'
+    case 'PROVIDER_NETWORK':
+    case 'PROVIDER_DNS':
+    case 'PROVIDER_CONNECTION_REFUSED':
+    case 'PROVIDER_CONNECTION_CLOSED':
+    case 'PROVIDER_TLS':
+    case 'PROVIDER_TIMEOUT':
+    case 'PROVIDER_AUTHENTICATION':
+    case 'PROVIDER_RATE_LIMIT':
+    case 'PROVIDER_REMOTE':
+    case 'PROVIDER_INVALID_RESPONSE':
+      return code
+    case 'MODEL_NOT_CONFIGURED':
+    case 'PROVIDER_NOT_CONFIGURED':
+    case 'PROVIDER_REQUEST':
+      return 'PROVIDER_ERROR'
+  }
+}
+
+function promptOptimizationDesktopErrorCode(
+  code: PromptOptimizationServiceErrorCode,
+): DesktopErrorCode {
+  switch (code) {
+    case 'UNSUPPORTED_PROVIDER': return 'UNSUPPORTED_PROVIDER'
+    case 'PROVIDER_NETWORK': return 'PROVIDER_NETWORK'
+    case 'PROVIDER_TIMEOUT': return 'PROVIDER_TIMEOUT'
+    case 'PROVIDER_AUTHENTICATION': return 'PROVIDER_AUTHENTICATION'
+    case 'PROVIDER_RATE_LIMIT': return 'PROVIDER_RATE_LIMIT'
+    case 'PROVIDER_REMOTE': return 'PROVIDER_REMOTE'
+    case 'PROVIDER_INVALID_RESPONSE': return 'PROVIDER_INVALID_RESPONSE'
+    case 'MODEL_NOT_CONFIGURED':
+    case 'PROVIDER_NOT_CONFIGURED':
+      return 'PROVIDER_ERROR'
+  }
+}
+
+function textGenerationDesktopErrorCode(code: TextGenerationServiceErrorCode): DesktopErrorCode {
+  return promptOptimizationDesktopErrorCode(code)
 }
 
 function isTrustedFrameUrl(frameUrl: string): boolean {
@@ -185,7 +278,125 @@ function isGenerateImageRequest(value: unknown): value is GenerateImageRequest {
       request.modelKey.length > 0 &&
       request.modelKey.length <= 400
     )) &&
-    (request.size === '1024x1024' || request.size === '1536x1024' || request.size === '1024x1536')
+    isImageGenerationSize(request.size) &&
+    isImageReferenceFileNames(request.referenceImageFileNames, 16)
+  )
+}
+
+function isOptimizePromptRequest(value: unknown): value is OptimizePromptRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<OptimizePromptRequest>
+  return (
+    typeof request.prompt === 'string' &&
+    request.prompt.trim().length > 0 &&
+    request.prompt.length <= 20_000 &&
+    (request.modelKey === undefined || (
+      typeof request.modelKey === 'string' &&
+      request.modelKey.length > 0 &&
+      request.modelKey.length <= 400
+    ))
+  )
+}
+
+function isGenerateChatReplyRequest(value: unknown): value is GenerateChatReplyRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<GenerateChatReplyRequest>
+  return (
+    Array.isArray(request.messages) &&
+    request.messages.length > 0 &&
+    request.messages.length <= 100 &&
+    request.messages.every((message) =>
+      Boolean(message) &&
+      (message.role === 'user' || message.role === 'assistant') &&
+      typeof message.content === 'string' &&
+      message.content.trim().length > 0 &&
+      message.content.length <= 20_000
+    ) &&
+    (request.modelKey === undefined || (
+      typeof request.modelKey === 'string' &&
+      request.modelKey.length > 0 &&
+      request.modelKey.length <= 400
+    ))
+  )
+}
+
+function isGenerateStoryboardRequest(value: unknown): value is GenerateStoryboardRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<GenerateStoryboardRequest>
+  return (
+    typeof request.theme === 'string' &&
+    request.theme.trim().length > 0 &&
+    request.theme.length <= 20_000 &&
+    typeof request.shotCount === 'number' &&
+    Number.isInteger(request.shotCount) &&
+    request.shotCount >= 2 &&
+    request.shotCount <= 12 &&
+    (request.modelKey === undefined || (
+      typeof request.modelKey === 'string' &&
+      request.modelKey.length > 0 &&
+      request.modelKey.length <= 400
+    ))
+  )
+}
+
+function isGenerateVideoRequest(value: unknown): value is GenerateVideoRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<GenerateVideoRequest>
+  return (
+    typeof request.prompt === 'string' &&
+    request.prompt.trim().length > 0 &&
+    request.prompt.length <= 20_000 &&
+    (request.modelKey === undefined || (
+      typeof request.modelKey === 'string' && request.modelKey.length > 0 && request.modelKey.length <= 400
+    )) &&
+    typeof request.duration === 'number' && Number.isInteger(request.duration) &&
+    request.duration >= 4 && request.duration <= 15 &&
+    (request.resolution === '720P' || request.resolution === '768P' || request.resolution === '1080P' || request.resolution === '2K') &&
+    (request.ratio === '16:9' || request.ratio === '9:16' || request.ratio === '1:1' || request.ratio === 'adaptive') &&
+    isImageReferenceFileNames(request.referenceImageFileNames, 12)
+  )
+}
+
+function isGenerateAudioRequest(value: unknown): value is GenerateAudioRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<GenerateAudioRequest>
+  return (
+    typeof request.text === 'string' &&
+    request.text.trim().length > 0 &&
+    request.text.length < 10_000 &&
+    (request.modelKey === undefined || (typeof request.modelKey === 'string' && request.modelKey.length > 0 && request.modelKey.length <= 400)) &&
+    typeof request.voiceId === 'string' &&
+    /^[A-Za-z][A-Za-z0-9_-]{0,199}$/.test(request.voiceId) &&
+    typeof request.speed === 'number' && Number.isFinite(request.speed) && request.speed >= 0.5 && request.speed <= 2 &&
+    typeof request.pitch === 'number' && Number.isInteger(request.pitch) && request.pitch >= -12 && request.pitch <= 12 &&
+    typeof request.emotion === 'string' && request.emotion.length <= 50
+  )
+}
+
+function isImageReferenceFileNames(value: unknown, maximum: number): boolean {
+  return value === undefined || (
+    Array.isArray(value) && value.length <= maximum && value.every((fileName) =>
+      typeof fileName === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|webp)$/i.test(fileName),
+    )
+  )
+}
+
+function isImportDroppedImagesRequest(value: unknown): value is ImportDroppedImagesRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<ImportDroppedImagesRequest>
+  return (
+    Array.isArray(request.paths) &&
+    request.paths.length > 0 &&
+    request.paths.length <= 50 &&
+    request.paths.every((filePath) =>
+      typeof filePath === 'string' &&
+      filePath.length > 0 &&
+      filePath.length <= 32_767 &&
+      !filePath.includes('\0') &&
+      isAbsolute(filePath) &&
+      ['.png', '.jpg', '.jpeg', '.webp'].includes(extname(filePath).toLowerCase()),
+    )
   )
 }
 
@@ -200,6 +411,13 @@ function isResourceItemRequest(value: unknown): value is RemoveResourceRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const request = value as Partial<RemoveResourceRequest>
   return typeof request.id === 'string' && request.id.length > 0 && request.id.length <= 128
+}
+
+function isExportHistoryBatchRequest(value: unknown): value is ExportHistoryBatchRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<ExportHistoryBatchRequest>
+  return (request.media === 'images' || request.media === 'videos' || request.media === 'audios') &&
+    isStringArray(request.ids, 200, 128) && request.ids.length > 0
 }
 
 function isSavePromptRequest(value: unknown): value is SavePromptRequest {
@@ -223,6 +441,11 @@ function isSaveWorkflowRequest(value: unknown): value is SaveWorkflowRequest {
     isHexColor(request.accent) &&
     isCanvasDocument(request.document)
   )
+}
+
+function safeExportFileName(value: string): string {
+  const normalized = value.replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 160)
+  return normalized || 'Draw Canvas 生成视频'
 }
 
 function registerIpc(): void {
@@ -397,7 +620,7 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'history:load',
+    HISTORY_IPC_CHANNELS.load,
     trustedHandler(async () => {
       try {
         return success(await appState.loadHistory())
@@ -408,13 +631,143 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'history:record',
+    HISTORY_IPC_CHANNELS.loadVideos,
+    trustedHandler(async () => {
+      try {
+        return success(await appState.loadVideoHistory())
+      } catch {
+        return failure('IO_ERROR', '无法读取视频生成历史')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.loadAudios,
+    trustedHandler(async () => {
+      try {
+        return success(await appState.loadAudioHistory())
+      } catch {
+        return failure('IO_ERROR', '无法读取语音生成历史')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.record,
     trustedHandler(async (artwork: GeneratedArtwork) => {
       if (!isGeneratedArtwork(artwork)) return failure('INVALID_INPUT', '生成记录无效')
       try {
         return success(await appState.recordArtwork(artwork))
       } catch {
         return failure('IO_ERROR', '无法保存生成记录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.remove,
+    trustedHandler(async (request: RemoveHistoryArtworkRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '生成记录标识无效')
+      try {
+        return success(await appState.removeHistoryArtwork(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除生成记录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.removeVideo,
+    trustedHandler(async (request: RemoveGeneratedVideoRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '视频记录标识无效')
+      try {
+        return success(await appState.removeGeneratedVideo(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除视频生成记录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.exportVideo,
+    trustedHandler(async (request: ExportGeneratedVideoRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '视频记录标识无效')
+      try {
+        const video = await appState.getGeneratedVideo(request.id)
+        if (!video) return failure('NOT_FOUND', '视频生成记录不存在')
+        const extension = extname(video.videoFileName).slice(1).toLowerCase()
+        const options: SaveDialogOptions = {
+          title: '导出生成视频',
+          defaultPath: `${safeExportFileName(video.title)}.${extension}`,
+          filters: [{ name: '视频文件', extensions: [extension] }],
+        }
+        const result = mainWindow
+          ? await dialog.showSaveDialog(mainWindow, options)
+          : await dialog.showSaveDialog(options)
+        if (result.canceled || !result.filePath) return failure('CANCELLED', '已取消导出')
+        await appState.exportGeneratedVideo(video.id, result.filePath)
+        return success(null)
+      } catch {
+        return failure('IO_ERROR', '无法导出生成视频')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.removeAudio,
+    trustedHandler(async (request: RemoveGeneratedAudioRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '语音记录标识无效')
+      try {
+        return success(await appState.removeGeneratedAudio(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除语音生成记录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.exportAudio,
+    trustedHandler(async (request: ExportGeneratedAudioRequest) => {
+      if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '语音记录标识无效')
+      try {
+        const audio = await appState.getGeneratedAudio(request.id)
+        if (!audio) return failure('NOT_FOUND', '语音生成记录不存在')
+        const options: SaveDialogOptions = {
+          title: '导出生成语音',
+          defaultPath: `${safeExportFileName(audio.title)}.mp3`,
+          filters: [{ name: 'MP3 音频', extensions: ['mp3'] }],
+        }
+        const result = mainWindow
+          ? await dialog.showSaveDialog(mainWindow, options)
+          : await dialog.showSaveDialog(options)
+        if (result.canceled || !result.filePath) return failure('CANCELLED', '已取消导出')
+        await appState.exportGeneratedAudio(audio.id, result.filePath)
+        return success(null)
+      } catch {
+        return failure('IO_ERROR', '无法导出生成语音')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    HISTORY_IPC_CHANNELS.exportBatch,
+    trustedHandler(async (request: ExportHistoryBatchRequest) => {
+      if (!isExportHistoryBatchRequest(request)) return failure('INVALID_INPUT', '批量导出内容无效')
+      const options: OpenDialogOptions = {
+        title: '选择批量导出目录',
+        properties: ['openDirectory', 'createDirectory'],
+        defaultPath: await appState.getStorageDirectory(),
+        buttonLabel: '导出到这里',
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled || !result.filePaths[0]) return failure('CANCELLED', '已取消批量导出')
+      try {
+        const exportedCount = await appState.exportHistoryBatch(request, result.filePaths[0])
+        return success({ exportedCount, directory: result.filePaths[0] })
+      } catch {
+        return failure('IO_ERROR', '批量导出失败，请检查目标目录权限和本地文件')
       }
     }),
   )
@@ -449,6 +802,20 @@ function registerIpc(): void {
       if (result.filePaths.length > 50) return failure('INVALID_INPUT', '每次最多导入 50 张图片')
       try {
         return success(await appState.importLibraryImages(result.filePaths))
+      } catch {
+        return failure('INVALID_FILE', '图片格式无效、文件过大或无法读取')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    LIBRARY_IPC_CHANNELS.importDroppedImages,
+    trustedHandler(async (request: ImportDroppedImagesRequest) => {
+      if (!isImportDroppedImagesRequest(request)) {
+        return failure('INVALID_INPUT', '拖入的图片文件无效或数量超过 50 张')
+      }
+      try {
+        return success(await appState.importLibraryImages(request.paths))
       } catch {
         return failure('INVALID_FILE', '图片格式无效、文件过大或无法读取')
       }
@@ -540,7 +907,7 @@ function registerIpc(): void {
       } catch (error) {
         if (error instanceof ImageGenerationServiceError) {
           return failure(
-            error.code === 'UNSUPPORTED_PROVIDER' ? 'UNSUPPORTED_PROVIDER' : 'PROVIDER_ERROR',
+            imageGenerationDesktopErrorCode(error.code),
             error.message,
           )
         }
@@ -557,6 +924,119 @@ function registerIpc(): void {
         return success(await imageGenerationService.loadImage(request.fileName))
       } catch {
         return failure('NOT_FOUND', '本地图片资源不存在或无法读取')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.optimizePrompt,
+    trustedHandler(async (request: OptimizePromptRequest) => {
+      if (!isOptimizePromptRequest(request)) {
+        return failure('INVALID_INPUT', '请先输入需要优化的创意提示词')
+      }
+      try {
+        return success(await promptOptimizationService.optimize({
+          ...request,
+          prompt: request.prompt.trim(),
+        }))
+      } catch (error) {
+        if (error instanceof PromptOptimizationServiceError) {
+          return failure(
+            promptOptimizationDesktopErrorCode(error.code),
+            error.message,
+          )
+        }
+        return failure('PROVIDER_ERROR', '提示词优化失败，请稍后重试')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.generateChatReply,
+    trustedHandler(async (request: GenerateChatReplyRequest) => {
+      if (!isGenerateChatReplyRequest(request)) {
+        return failure('INVALID_INPUT', '对话消息为空或格式无效')
+      }
+      try {
+        return success(await textGenerationService.chat({
+          ...request,
+          messages: request.messages.map((message) => ({
+            role: message.role,
+            content: message.content.trim(),
+          })),
+        }))
+      } catch (error) {
+        if (error instanceof TextGenerationServiceError) {
+          return failure(textGenerationDesktopErrorCode(error.code), error.message)
+        }
+        return failure('PROVIDER_ERROR', 'AI 对话失败，请稍后重试')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.generateStoryboard,
+    trustedHandler(async (request: GenerateStoryboardRequest) => {
+      if (!isGenerateStoryboardRequest(request)) {
+        return failure('INVALID_INPUT', '请输入主题并选择 2～12 个分镜')
+      }
+      try {
+        return success(await textGenerationService.storyboard({
+          ...request,
+          theme: request.theme.trim(),
+        }))
+      } catch (error) {
+        if (error instanceof TextGenerationServiceError) {
+          return failure(textGenerationDesktopErrorCode(error.code), error.message)
+        }
+        return failure('PROVIDER_ERROR', '分镜生成失败，请稍后重试')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.generateVideo,
+    trustedHandler(async (request: GenerateVideoRequest) => {
+      if (!isGenerateVideoRequest(request)) {
+        return failure('INVALID_INPUT', '请输入有效的视频提示词、时长、清晰度和画面比例')
+      }
+      try {
+        return success(await videoGenerationService.generate({
+          ...request,
+          prompt: request.prompt.trim(),
+        }))
+      } catch (error) {
+        if (error instanceof VideoGenerationServiceError) {
+          return failure(
+            error.code === 'UNSUPPORTED_PROVIDER' ? 'UNSUPPORTED_PROVIDER' : 'PROVIDER_ERROR',
+            error.message,
+          )
+        }
+        return failure('IO_ERROR', '生成视频保存失败，请检查数据目录')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.generateAudio,
+    trustedHandler(async (request: GenerateAudioRequest) => {
+      if (!isGenerateAudioRequest(request)) {
+        return failure('INVALID_INPUT', '请输入少于 10000 字的文本并选择有效音色参数')
+      }
+      try {
+        return success(await audioGenerationService.generate({
+          ...request,
+          text: request.text.trim(),
+          voiceId: request.voiceId.trim(),
+        }))
+      } catch (error) {
+        if (error instanceof AudioGenerationServiceError) {
+          return failure(
+            error.code === 'UNSUPPORTED_PROVIDER' ? 'UNSUPPORTED_PROVIDER' : 'PROVIDER_ERROR',
+            error.message,
+          )
+        }
+        return failure('IO_ERROR', '生成语音保存失败，请检查数据目录')
       }
     }),
   )
@@ -792,6 +1272,32 @@ function getWindowBackground(): string {
     : '#f3f4f6'
 }
 
+async function registerMediaProtocol(): Promise<void> {
+  await protocol.handle('drawcanvas-media', async (request) => {
+    try {
+      const url = new URL(request.url)
+      const fileName = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+      if (
+        url.search ||
+        url.hash ||
+        !(
+          (url.host === 'video' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp4|webm)$/i.test(fileName)) ||
+          (url.host === 'audio' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.mp3$/i.test(fileName))
+        )
+      ) return new Response(null, { status: 404 })
+      const filePath = url.host === 'audio'
+        ? await appState.resolveStoredAudioPath(fileName)
+        : await appState.resolveStoredVideoPath(fileName)
+      return net.fetch(pathToFileURL(filePath).toString(), {
+        headers: request.headers,
+        bypassCustomProtocolHandlers: true,
+      })
+    } catch {
+      return new Response(null, { status: 404 })
+    }
+  })
+}
+
 app.whenReady().then(async () => {
   try {
     applyNativeTheme((await appState.loadSettings()).theme)
@@ -799,6 +1305,7 @@ app.whenReady().then(async () => {
     applyNativeTheme('light')
   }
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
+  await registerMediaProtocol()
   registerIpc()
   createWindow()
   app.on('activate', () => {

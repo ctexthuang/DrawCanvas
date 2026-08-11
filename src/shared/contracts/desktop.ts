@@ -1,4 +1,6 @@
-import type { ModelKind } from '../domain/models'
+import type { ImageGenerationSize, ModelKind } from '../domain/models'
+
+export type { ImageGenerationSize } from '../domain/models'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -12,6 +14,16 @@ export type DesktopErrorCode =
   | 'UNAUTHORIZED'
   | 'ENCRYPTION_UNAVAILABLE'
   | 'PROVIDER_ERROR'
+  | 'PROVIDER_NETWORK'
+  | 'PROVIDER_DNS'
+  | 'PROVIDER_CONNECTION_REFUSED'
+  | 'PROVIDER_CONNECTION_CLOSED'
+  | 'PROVIDER_TLS'
+  | 'PROVIDER_TIMEOUT'
+  | 'PROVIDER_AUTHENTICATION'
+  | 'PROVIDER_RATE_LIMIT'
+  | 'PROVIDER_REMOTE'
+  | 'PROVIDER_INVALID_RESPONSE'
   | 'UNSUPPORTED_PROVIDER'
 
 export type DesktopError = Readonly<{
@@ -99,7 +111,27 @@ export type ProviderConnectionTestResult =
       }>
     }>
 
-export type CanvasNodeType = 'prompt' | 'generator' | 'image' | 'note' | 'chat' | 'video'
+export type CanvasNodeType = 'prompt' | 'storyboard' | 'shot-list' | 'generator' | 'compositor' | 'image' | 'reference-folder' | 'note' | 'chat' | 'video' | 'audio'
+export type CanvasGenerationStatus = 'queued' | 'generating' | 'succeeded' | 'failed'
+export type CanvasWorkflowStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'skipped'
+export type ImageGenerationCount = 1 | 2 | 3 | 4
+export type VideoGenerationResolution = '720P' | '768P' | '1080P' | '2K'
+export type VideoGenerationRatio = '16:9' | '9:16' | '1:1' | 'adaptive'
+
+export type CanvasChatMessage = Readonly<{
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: string
+}>
+
+export type StoryboardShot = Readonly<{
+  id: string
+  index: number
+  title: string
+  prompt: string
+  durationSeconds: number
+}>
 
 export type CanvasNodeData = Readonly<{
   id: string
@@ -113,7 +145,31 @@ export type CanvasNodeData = Readonly<{
   color?: string
   modelKey?: string
   imageSize?: ImageGenerationSize
+  generationCount?: ImageGenerationCount
+  generationStatus?: CanvasGenerationStatus
+  generationStartedAt?: string
+  generationCompletedAt?: string
+  generationError?: string
+  generationBatchId?: string
+  generationBatchIndex?: number
   imageFileName?: string
+  imageFileNames?: ReadonlyArray<string>
+  collapsed?: boolean
+  workflowStatus?: CanvasWorkflowStatus
+  workflowError?: string
+  chatMessages?: ReadonlyArray<CanvasChatMessage>
+  storyboardShotCount?: number
+  storyboardShots?: ReadonlyArray<StoryboardShot>
+  videoFileName?: string
+  videoPromptId?: string
+  videoDuration?: number
+  videoResolution?: VideoGenerationResolution
+  videoRatio?: VideoGenerationRatio
+  audioFileName?: string
+  audioVoiceId?: string
+  audioSpeed?: number
+  audioPitch?: number
+  audioEmotion?: string
 }>
 
 export type CanvasConnection = Readonly<{
@@ -199,12 +255,45 @@ export type GeneratedArtwork = Readonly<{
   imageFileName?: string
 }>
 
-export type ImageGenerationSize = '1024x1024' | '1536x1024' | '1024x1536'
-
 export type GenerateImageRequest = Readonly<{
   prompt: string
   modelKey?: string
   size: ImageGenerationSize
+  referenceImageFileNames?: ReadonlyArray<string>
+}>
+
+export type OptimizePromptRequest = Readonly<{
+  prompt: string
+  modelKey?: string
+}>
+
+export type OptimizedPromptResult = Readonly<{
+  prompt: string
+  modelKey: string
+  modelName: string
+}>
+
+export type GenerateChatReplyRequest = Readonly<{
+  messages: ReadonlyArray<Pick<CanvasChatMessage, 'role' | 'content'>>
+  modelKey?: string
+}>
+
+export type GeneratedChatReply = Readonly<{
+  content: string
+  modelKey: string
+  modelName: string
+}>
+
+export type GenerateStoryboardRequest = Readonly<{
+  theme: string
+  shotCount: number
+  modelKey?: string
+}>
+
+export type GeneratedStoryboard = Readonly<{
+  shots: ReadonlyArray<StoryboardShot>
+  modelKey: string
+  modelName: string
 }>
 
 export type GeneratedImageResult = Readonly<{
@@ -219,8 +308,97 @@ export type LoadedGeneratedImage = Readonly<{
   dataUrl: string
 }>
 
+export type GeneratedVideoAsset = Readonly<{
+  id: string
+  title: string
+  prompt: string
+  model: string
+  modelKey: string
+  duration: number
+  resolution: VideoGenerationResolution
+  ratio: VideoGenerationRatio
+  createdAt: string
+  videoFileName: string
+  referenceImageFileNames: ReadonlyArray<string>
+}>
+
+export type GenerateVideoRequest = Readonly<{
+  prompt: string
+  modelKey?: string
+  duration: number
+  resolution: VideoGenerationResolution
+  ratio: VideoGenerationRatio
+  referenceImageFileNames?: ReadonlyArray<string>
+}>
+
+export type GeneratedVideoResult = Readonly<{
+  video: GeneratedVideoAsset
+}>
+
+export type GeneratedAudioAsset = Readonly<{
+  id: string
+  title: string
+  text: string
+  model: string
+  modelKey: string
+  voiceId: string
+  speed: number
+  pitch: number
+  emotion: string
+  durationMs: number
+  createdAt: string
+  audioFileName: string
+}>
+
+export type GenerateAudioRequest = Readonly<{
+  text: string
+  modelKey?: string
+  voiceId: string
+  speed: number
+  pitch: number
+  emotion: string
+}>
+
+export type GeneratedAudioResult = Readonly<{
+  audio: GeneratedAudioAsset
+}>
+
 export type RemoveLibraryImageRequest = Readonly<{
   id: string
+}>
+
+export type ImportDroppedImagesRequest = Readonly<{
+  paths: ReadonlyArray<string>
+}>
+
+export type RemoveHistoryArtworkRequest = Readonly<{
+  id: string
+}>
+
+export type RemoveGeneratedVideoRequest = Readonly<{
+  id: string
+}>
+
+export type ExportGeneratedVideoRequest = Readonly<{
+  id: string
+}>
+
+export type RemoveGeneratedAudioRequest = Readonly<{
+  id: string
+}>
+
+export type ExportGeneratedAudioRequest = Readonly<{
+  id: string
+}>
+
+export type ExportHistoryBatchRequest = Readonly<{
+  media: 'images' | 'videos' | 'audios'
+  ids: ReadonlyArray<string>
+}>
+
+export type ExportHistoryBatchResult = Readonly<{
+  exportedCount: number
+  directory: string
 }>
 
 export type PromptAsset = Readonly<{
@@ -276,7 +454,15 @@ export type DesktopApi = Readonly<{
   }>
   history: Readonly<{
     load: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    loadVideos: () => Promise<DesktopResult<ReadonlyArray<GeneratedVideoAsset>>>
+    loadAudios: () => Promise<DesktopResult<ReadonlyArray<GeneratedAudioAsset>>>
     record: (artwork: GeneratedArtwork) => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    remove: (request: RemoveHistoryArtworkRequest) => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    removeVideo: (request: RemoveGeneratedVideoRequest) => Promise<DesktopResult<ReadonlyArray<GeneratedVideoAsset>>>
+    exportVideo: (request: ExportGeneratedVideoRequest) => Promise<DesktopResult<null>>
+    removeAudio: (request: RemoveGeneratedAudioRequest) => Promise<DesktopResult<ReadonlyArray<GeneratedAudioAsset>>>
+    exportAudio: (request: ExportGeneratedAudioRequest) => Promise<DesktopResult<null>>
+    exportBatch: (request: ExportHistoryBatchRequest) => Promise<DesktopResult<ExportHistoryBatchResult>>
   }>
   library: Readonly<{
     load: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
@@ -292,6 +478,11 @@ export type DesktopApi = Readonly<{
   }>
   generation: Readonly<{
     generateImage: (request: GenerateImageRequest) => Promise<DesktopResult<GeneratedImageResult>>
+    generateVideo: (request: GenerateVideoRequest) => Promise<DesktopResult<GeneratedVideoResult>>
+    generateAudio: (request: GenerateAudioRequest) => Promise<DesktopResult<GeneratedAudioResult>>
+    optimizePrompt: (request: OptimizePromptRequest) => Promise<DesktopResult<OptimizedPromptResult>>
+    generateChatReply: (request: GenerateChatReplyRequest) => Promise<DesktopResult<GeneratedChatReply>>
+    generateStoryboard: (request: GenerateStoryboardRequest) => Promise<DesktopResult<GeneratedStoryboard>>
     loadImage: (request: LoadGeneratedImageRequest) => Promise<DesktopResult<LoadedGeneratedImage>>
   }>
   storage: Readonly<{

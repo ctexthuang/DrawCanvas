@@ -68,10 +68,15 @@ export function HomePage({ onDeleteRecentProject, onNewCanvas, onOpenFile, onOpe
         </div>
         <div className="hero-visual" aria-hidden="true">
           <div className="hero-grid" />
-          <div className="mini-node node-a"><span>提示词</span><strong>未来主义城市...</strong></div>
-          <div className="mini-node node-b"><span>图像模型</span><strong>Seedream 5.0</strong></div>
-          <div className="mini-node node-c"><span>生成结果</span><i /></div>
-          <svg viewBox="0 0 460 250"><path d="M130 75 C210 75 170 165 260 165"/><path d="M285 90 C335 90 315 150 360 150"/></svg>
+          <div className="hero-flow">
+            <div className="mini-node node-a"><span>提示词</span><strong>未来主义城市...</strong></div>
+            <div className="mini-node node-b"><span>图像模型</span><strong>Seedream 5.0</strong></div>
+            <div className="mini-node node-c"><span>生成结果</span><i /></div>
+            <svg viewBox="0 0 660 325">
+              <path d="M190 83 C230 83 210 199 250 199"/>
+              <path d="M410 199 C465 199 445 126 500 126"/>
+            </svg>
+          </div>
         </div>
       </section>
 

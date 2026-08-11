@@ -19,6 +19,7 @@ type AppShellProps = Readonly<{
   children: ReactNode
   generationHistoryCount: number
   onNavigate: (page: AppPage) => void
+  onNewCanvas: () => void
 }>
 
 const primaryItems = [
@@ -33,7 +34,7 @@ const settingsItems = [
   { id: 'settings' as const, label: '系统设置', icon: Settings2 },
 ]
 
-export function AppShell({ activePage, children, generationHistoryCount, onNavigate }: AppShellProps) {
+export function AppShell({ activePage, children, generationHistoryCount, onNavigate, onNewCanvas }: AppShellProps) {
   if (activePage === 'canvas') return <>{children}</>
 
   return (
@@ -49,7 +50,7 @@ export function AppShell({ activePage, children, generationHistoryCount, onNavig
           </div>
         </div>
 
-        <button className="new-canvas-button" onClick={() => onNavigate('canvas')} type="button">
+        <button className="new-canvas-button" onClick={onNewCanvas} type="button">
           <Sparkles size={17} />
           新建无限画布
         </button>

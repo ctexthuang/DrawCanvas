@@ -43,9 +43,13 @@ export type AppDataPaths = Readonly<{
   recentProjects: string
   historyDirectory: string
   generationHistory: string
+  videoGenerationHistory: string
+  audioGenerationHistory: string
   libraryDirectory: string
   libraryCatalog: string
   imagesDirectory: string
+  videosDirectory: string
+  audiosDirectory: string
   resourcesDirectory: string
   prompts: string
   workflows: string
@@ -89,9 +93,13 @@ export function createAppDataPaths(storageDirectory: string): AppDataPaths {
     recentProjects: join(projectsDirectory, 'recent-projects.json'),
     historyDirectory,
     generationHistory: join(historyDirectory, 'generation-history.json'),
+    videoGenerationHistory: join(historyDirectory, 'video-generation-history.json'),
+    audioGenerationHistory: join(historyDirectory, 'audio-generation-history.json'),
     libraryDirectory,
     libraryCatalog: join(libraryDirectory, 'catalog.json'),
     imagesDirectory: join(libraryDirectory, 'images'),
+    videosDirectory: join(libraryDirectory, 'videos'),
+    audiosDirectory: join(libraryDirectory, 'audios'),
     resourcesDirectory,
     prompts: join(resourcesDirectory, 'prompts.json'),
     workflows: join(resourcesDirectory, 'workflows.json'),
@@ -106,6 +114,8 @@ export async function ensureAppDataLayout(paths: AppDataPaths): Promise<void> {
     mkdir(paths.projectsDirectory, { recursive: true }),
     mkdir(paths.historyDirectory, { recursive: true }),
     mkdir(paths.imagesDirectory, { recursive: true }),
+    mkdir(paths.videosDirectory, { recursive: true }),
+    mkdir(paths.audiosDirectory, { recursive: true }),
     mkdir(paths.resourcesDirectory, { recursive: true }),
     mkdir(paths.databaseDirectory, { recursive: true }),
     mkdir(paths.cacheDirectory, { recursive: true }),

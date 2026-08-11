@@ -1,5 +1,58 @@
 export type ModelKind = 'image' | 'video' | 'chat' | 'audio'
 
+export const IMAGE_GENERATION_SIZES = [
+  'auto',
+  '720x1280',
+  '832x1248',
+  '864x1152',
+  '1024x1024',
+  '1024x1536',
+  '1152x864',
+  '1152x2048',
+  '1248x832',
+  '1280x720',
+  '1296x3024',
+  '1344x576',
+  '1440x2560',
+  '1536x1024',
+  '1664x2496',
+  '1728x2304',
+  '2048x1152',
+  '2048x2048',
+  '2160x3840',
+  '2304x1728',
+  '2496x1664',
+  '2560x1440',
+  '3024x1296',
+  '3840x2160',
+] as const
+
+export type ImageGenerationSize = typeof IMAGE_GENERATION_SIZES[number]
+
+export type ImageGenerationAspectRatio =
+  | '1:1'
+  | '4:3'
+  | '3:4'
+  | '3:2'
+  | '2:3'
+  | '16:9'
+  | '9:16'
+  | '21:9'
+  | '9:21'
+
+export type ImageGenerationResolutionTier = 'standard' | '2k' | '4k'
+
+export type ImageGenerationSizeMapping = Readonly<{
+  value: Exclude<ImageGenerationSize, 'auto'>
+  aspectRatio: ImageGenerationAspectRatio
+  tier: ImageGenerationResolutionTier
+}>
+
+export type ImageGenerationSizeOption = Readonly<{
+  value: ImageGenerationSize
+  label: string
+}>
+
 export type ProviderModelDefinition = Readonly<{
   key: string
   providerId: string
@@ -8,6 +61,7 @@ export type ProviderModelDefinition = Readonly<{
   kind: ModelKind
   description: string
   badge?: string
+  imageSizeMappings?: ReadonlyArray<ImageGenerationSizeMapping>
 }>
 
 export function createProviderModelKey(providerId: string, remoteModelId: string): string {
@@ -16,6 +70,14 @@ export function createProviderModelKey(providerId: string, remoteModelId: string
 
 export const DEFAULT_IMAGE_MODEL_KEY = createProviderModelKey('openai', 'gpt-image-2')
 export const DEFAULT_CHAT_MODEL_KEY = createProviderModelKey('openai', 'gpt-5.6-sol')
+
+function imageSizeMapping(
+  value: ImageGenerationSizeMapping['value'],
+  aspectRatio: ImageGenerationAspectRatio,
+  tier: ImageGenerationResolutionTier,
+): ImageGenerationSizeMapping {
+  return { value, aspectRatio, tier }
+}
 
 type OpenAiModelCatalogEntry = Readonly<Omit<ProviderModelDefinition, 'key' | 'providerId'>>
 
@@ -26,18 +88,38 @@ const OPENAI_MODEL_CATALOG: ReadonlyArray<OpenAiModelCatalogEntry> = [
     kind: 'image',
     description: '默认图像生成模型',
     badge: '推荐',
+    imageSizeMappings: [
+      imageSizeMapping('1024x1024', '1:1', 'standard'),
+      imageSizeMapping('1536x1024', '3:2', 'standard'),
+      imageSizeMapping('1024x1536', '2:3', 'standard'),
+      imageSizeMapping('2048x2048', '1:1', '2k'),
+      imageSizeMapping('2048x1152', '16:9', '2k'),
+      imageSizeMapping('1152x2048', '9:16', '2k'),
+      imageSizeMapping('3840x2160', '16:9', '4k'),
+      imageSizeMapping('2160x3840', '9:16', '4k'),
+    ],
   },
   {
     remoteModelId: 'gpt-image-1.5',
     displayName: 'GPT Image 1.5',
     kind: 'image',
     description: '通用图像生成模型',
+    imageSizeMappings: [
+      imageSizeMapping('1024x1024', '1:1', 'standard'),
+      imageSizeMapping('1536x1024', '3:2', 'standard'),
+      imageSizeMapping('1024x1536', '2:3', 'standard'),
+    ],
   },
   {
     remoteModelId: 'gpt-image-1',
     displayName: 'GPT Image 1',
     kind: 'image',
     description: '基础图像生成模型',
+    imageSizeMappings: [
+      imageSizeMapping('1024x1024', '1:1', 'standard'),
+      imageSizeMapping('1536x1024', '3:2', 'standard'),
+      imageSizeMapping('1024x1536', '2:3', 'standard'),
+    ],
   },
   {
     remoteModelId: 'gpt-5.6-sol',
@@ -124,6 +206,17 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     kind: 'image',
     description: '火山方舟最新图片生成模型，支持知识增强与专业场景生成',
     badge: '推荐',
+    imageSizeMappings: [
+      imageSizeMapping('2048x2048', '1:1', '2k'),
+      imageSizeMapping('2304x1728', '4:3', '2k'),
+      imageSizeMapping('1728x2304', '3:4', '2k'),
+      imageSizeMapping('2496x1664', '3:2', '2k'),
+      imageSizeMapping('1664x2496', '2:3', '2k'),
+      imageSizeMapping('2560x1440', '16:9', '2k'),
+      imageSizeMapping('1440x2560', '9:16', '2k'),
+      imageSizeMapping('3024x1296', '21:9', '2k'),
+      imageSizeMapping('1296x3024', '9:21', '2k'),
+    ],
   },
   {
     key: createProviderModelKey('volcengine', 'doubao-seedream-5-0-lite-260128'),
@@ -132,6 +225,17 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     displayName: 'Doubao Seedream 5.0 Lite',
     kind: 'image',
     description: 'Seedream 5.0 轻量版本，适合低延迟图片生成',
+    imageSizeMappings: [
+      imageSizeMapping('2048x2048', '1:1', '2k'),
+      imageSizeMapping('2304x1728', '4:3', '2k'),
+      imageSizeMapping('1728x2304', '3:4', '2k'),
+      imageSizeMapping('2496x1664', '3:2', '2k'),
+      imageSizeMapping('1664x2496', '2:3', '2k'),
+      imageSizeMapping('2560x1440', '16:9', '2k'),
+      imageSizeMapping('1440x2560', '9:16', '2k'),
+      imageSizeMapping('3024x1296', '21:9', '2k'),
+      imageSizeMapping('1296x3024', '9:21', '2k'),
+    ],
   },
   {
     key: createProviderModelKey('volcengine', 'doubao-seedream-4-5-251128'),
@@ -140,6 +244,17 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     displayName: 'Doubao Seedream 4.5',
     kind: 'image',
     description: '支持高质量生成、图像编辑与 4K 输出的稳定版本',
+    imageSizeMappings: [
+      imageSizeMapping('2048x2048', '1:1', '2k'),
+      imageSizeMapping('2304x1728', '4:3', '2k'),
+      imageSizeMapping('1728x2304', '3:4', '2k'),
+      imageSizeMapping('2496x1664', '3:2', '2k'),
+      imageSizeMapping('1664x2496', '2:3', '2k'),
+      imageSizeMapping('2560x1440', '16:9', '2k'),
+      imageSizeMapping('1440x2560', '9:16', '2k'),
+      imageSizeMapping('3024x1296', '21:9', '2k'),
+      imageSizeMapping('1296x3024', '9:21', '2k'),
+    ],
   },
   {
     key: createProviderModelKey('volcengine', 'doubao-seedance-2-0-260128'),
@@ -190,6 +305,16 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
     displayName: 'MiniMax Image 01',
     kind: 'image',
     description: '支持文生图与主体参考图生图的高质量图片模型',
+    imageSizeMappings: [
+      imageSizeMapping('1024x1024', '1:1', 'standard'),
+      imageSizeMapping('1280x720', '16:9', 'standard'),
+      imageSizeMapping('1152x864', '4:3', 'standard'),
+      imageSizeMapping('1248x832', '3:2', 'standard'),
+      imageSizeMapping('832x1248', '2:3', 'standard'),
+      imageSizeMapping('864x1152', '3:4', 'standard'),
+      imageSizeMapping('720x1280', '9:16', 'standard'),
+      imageSizeMapping('1344x576', '21:9', 'standard'),
+    ],
   },
   {
     key: createProviderModelKey('minimax', 'MiniMax-H3'),
@@ -283,4 +408,74 @@ export function findBuiltinModelByKey(key: string): ProviderModelDefinition | un
 
 export function findBuiltinModelsByRemoteId(remoteModelId: string): ReadonlyArray<ProviderModelDefinition> {
   return BUILTIN_PROVIDER_MODELS.filter((model) => model.remoteModelId === remoteModelId)
+}
+
+const IMAGE_GENERATION_SIZE_SET: ReadonlySet<string> = new Set(IMAGE_GENERATION_SIZES)
+
+export function isImageGenerationSize(value: unknown): value is ImageGenerationSize {
+  return typeof value === 'string' && IMAGE_GENERATION_SIZE_SET.has(value)
+}
+
+export function imageGenerationSizeOptionsForModel(modelKey: string): ReadonlyArray<ImageGenerationSizeOption> {
+  const model = findBuiltinModelByKey(modelKey)
+  const mappings = model?.kind === 'image' && model.imageSizeMappings?.length
+    ? model.imageSizeMappings
+    : [imageSizeMapping('1024x1024', '1:1', 'standard')]
+  return mappings.map((mapping) => ({
+    value: mapping.value,
+    label: imageGenerationSizeLabel(mapping),
+  }))
+}
+
+export function defaultImageGenerationSizeForModel(modelKey: string): ImageGenerationSize {
+  const model = findBuiltinModelByKey(modelKey)
+  return model?.kind === 'image' && model.imageSizeMappings?.length
+    ? model.imageSizeMappings[0].value
+    : '1024x1024'
+}
+
+export function isImageGenerationSizeSupported(modelKey: string, size: ImageGenerationSize): boolean {
+  const model = findBuiltinModelByKey(modelKey)
+  return Boolean(model?.kind === 'image' && model.imageSizeMappings?.some((mapping) => mapping.value === size))
+}
+
+export function normalizeImageGenerationSize(
+  modelKey: string,
+  size: ImageGenerationSize | undefined,
+): ImageGenerationSize {
+  if (size && isImageGenerationSizeSupported(modelKey, size)) return size
+  const model = findBuiltinModelByKey(modelKey)
+  if (size && size !== 'auto' && model?.kind === 'image' && model.imageSizeMappings?.length) {
+    const sourceRatio = imageSizeRatio(size)
+    const matchingRatio = model.imageSizeMappings.find((candidate) =>
+      Math.abs(imageSizeRatio(candidate.value) - sourceRatio) < 0.001,
+    )
+    if (matchingRatio) return matchingRatio.value
+    const nearestRatio = model.imageSizeMappings.reduce((nearest, candidate) =>
+      Math.abs(Math.log(imageSizeRatio(candidate.value) / sourceRatio)) <
+      Math.abs(Math.log(imageSizeRatio(nearest.value) / sourceRatio))
+        ? candidate
+        : nearest,
+    )
+    return nearestRatio.value
+  }
+  return defaultImageGenerationSizeForModel(modelKey)
+}
+
+function imageGenerationSizeLabel(mapping: ImageGenerationSizeMapping): string {
+  const [width, height] = mapping.value.split('x')
+  return `${mapping.aspectRatio} · ${imageResolutionTierLabel(mapping.tier)} · ${width} × ${height}`
+}
+
+function imageResolutionTierLabel(tier: ImageGenerationResolutionTier): string {
+  switch (tier) {
+    case 'standard': return '标准'
+    case '2k': return '2K'
+    case '4k': return '4K'
+  }
+}
+
+function imageSizeRatio(size: Exclude<ImageGenerationSize, 'auto'>): number {
+  const [width, height] = size.split('x').map(Number)
+  return width / height
 }

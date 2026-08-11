@@ -1,14 +1,26 @@
 // Sandboxed preload scripts run as bundled CommonJS and use Electron's preload-safe polyfill.
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   CanvasDocument,
   ClearProviderApiKeyRequest,
   DeleteRecentCanvasProjectRequest,
   DesktopApi,
+  ExportGeneratedAudioRequest,
+  ExportGeneratedVideoRequest,
+  ExportHistoryBatchRequest,
+  GenerateAudioRequest,
+  GenerateChatReplyRequest,
   GenerateImageRequest,
+  GenerateStoryboardRequest,
+  GenerateVideoRequest,
   GeneratedArtwork,
+  ImportDroppedImagesRequest,
   LoadGeneratedImageRequest,
   LoadRecentCanvasProjectRequest,
+  OptimizePromptRequest,
+  RemoveGeneratedVideoRequest,
+  RemoveGeneratedAudioRequest,
+  RemoveHistoryArtworkRequest,
   RemoveLibraryImageRequest,
   RemoveResourceRequest,
   SavePromptRequest,
@@ -21,11 +33,20 @@ import type {
 import {
   CANVAS_IPC_CHANNELS,
   GENERATION_IPC_CHANNELS,
+  HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
 
-const desktopApi: DesktopApi = {
+type FileDropDesktopApi = DesktopApi & Readonly<{
+  library: DesktopApi['library'] & Readonly<{
+    importDroppedImages: (
+      files: ReadonlyArray<File>,
+    ) => ReturnType<DesktopApi['library']['importImages']>
+  }>
+}>
+
+const desktopApi: FileDropDesktopApi = {
   settings: {
     load: () => ipcRenderer.invoke('settings:load'),
     update: (request: UpdateSettingsRequest) => ipcRenderer.invoke('settings:update', request),
@@ -37,12 +58,35 @@ const desktopApi: DesktopApi = {
     setProviderEnabled: (request: SetProviderEnabledRequest) => ipcRenderer.invoke('models:set-provider-enabled', request),
   },
   history: {
-    load: () => ipcRenderer.invoke('history:load'),
-    record: (artwork: GeneratedArtwork) => ipcRenderer.invoke('history:record', artwork),
+    load: () => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.load),
+    loadVideos: () => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.loadVideos),
+    loadAudios: () => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.loadAudios),
+    record: (artwork: GeneratedArtwork) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.record, artwork),
+    remove: (request: RemoveHistoryArtworkRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.remove, request),
+    removeVideo: (request: RemoveGeneratedVideoRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.removeVideo, request),
+    exportVideo: (request: ExportGeneratedVideoRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.exportVideo, request),
+    removeAudio: (request: RemoveGeneratedAudioRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.removeAudio, request),
+    exportAudio: (request: ExportGeneratedAudioRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.exportAudio, request),
+    exportBatch: (request: ExportHistoryBatchRequest) => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.exportBatch, request),
   },
   library: {
     load: () => ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.load),
     importImages: () => ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.importImages),
+    importDroppedImages: async (files: ReadonlyArray<File>) => {
+      const paths = [...new Set(files.slice(0, 50).flatMap((file) => {
+        try {
+          const path = webUtils.getPathForFile(file)
+          return path ? [path] : []
+        } catch {
+          return []
+        }
+      }))]
+      if (paths.length === 0) {
+        return { ok: false, error: { code: 'INVALID_FILE', message: '没有可导入的本地图片文件' } }
+      }
+      const request: ImportDroppedImagesRequest = { paths }
+      return ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.importDroppedImages, request)
+    },
     remove: (request: RemoveLibraryImageRequest) => ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.remove, request),
   },
   resources: {
@@ -54,6 +98,11 @@ const desktopApi: DesktopApi = {
   },
   generation: {
     generateImage: (request: GenerateImageRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateImage, request),
+    generateVideo: (request: GenerateVideoRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateVideo, request),
+    generateAudio: (request: GenerateAudioRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateAudio, request),
+    optimizePrompt: (request: OptimizePromptRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.optimizePrompt, request),
+    generateChatReply: (request: GenerateChatReplyRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateChatReply, request),
+    generateStoryboard: (request: GenerateStoryboardRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateStoryboard, request),
     loadImage: (request: LoadGeneratedImageRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.loadImage, request),
   },
   storage: {

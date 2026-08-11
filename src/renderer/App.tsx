@@ -2,9 +2,15 @@ import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'r
 import type {
   AppSettings,
   CanvasDocument,
+  GenerateAudioRequest,
+  GenerateChatReplyRequest,
   GenerateImageRequest,
-  GeneratedImageResult,
+  GenerateStoryboardRequest,
+  GenerateVideoRequest,
   GeneratedArtwork,
+  GeneratedAudioAsset,
+  GeneratedVideoAsset,
+  OptimizePromptRequest,
   ProviderConfig,
   ProviderConnectionTestResult,
   RecentCanvasProject,
@@ -17,14 +23,26 @@ import type {
   ThemeMode,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
-import { createRecentCanvasProject } from '../shared/domain/canvas-document'
+import {
+  createRecentCanvasProject,
+  recoverInterruptedGenerationTasks,
+} from '../shared/domain/canvas-document'
 import {
   BUILTIN_PROVIDER_MODELS,
   DEFAULT_CHAT_MODEL_KEY,
   DEFAULT_IMAGE_MODEL_KEY,
 } from '../shared/domain/models'
 import { AppShell, type AppPage } from './components/AppShell'
-import { createInitialCanvas, InfiniteCanvas } from './features/canvas/InfiniteCanvas'
+import {
+  createInitialCanvas,
+  InfiniteCanvas,
+  type CanvasImageGenerationOutcome,
+  type CanvasAudioGenerationOutcome,
+  type CanvasChatGenerationOutcome,
+  type CanvasPromptOptimizationOutcome,
+  type CanvasStoryboardGenerationOutcome,
+  type CanvasVideoGenerationOutcome,
+} from './features/canvas/InfiniteCanvas'
 import { GalleryPage } from './features/gallery/GalleryPage'
 import { HistoryPage } from './features/history/HistoryPage'
 import { HomePage } from './features/home/HomePage'
@@ -82,7 +100,10 @@ const fallbackResources: ResourceCatalog = { prompts: seedPrompts, workflows: se
 
 export function App() {
   const [initialCanvasState] = useState(() => {
-    const autosave = window.desktop ? null : loadBrowserAutosave()
+    const browserAutosave = window.desktop ? null : loadBrowserAutosave()
+    const autosave = browserAutosave
+      ? recoverInterruptedGenerationTasks(browserAutosave)
+      : null
     return {
       document: autosave ?? createInitialCanvas(),
       isActive: Boolean(autosave),
@@ -102,6 +123,8 @@ export function App() {
       : [],
   )
   const [generatedArtworks, setGeneratedArtworks] = useState<ReadonlyArray<GeneratedArtwork>>(loadBrowserHistory)
+  const [generatedVideos, setGeneratedVideos] = useState<ReadonlyArray<GeneratedVideoAsset>>([])
+  const [generatedAudios, setGeneratedAudios] = useState<ReadonlyArray<GeneratedAudioAsset>>([])
   const [libraryCatalog, setLibraryCatalog] = useState<ReadonlyArray<GeneratedArtwork>>(seedArtworks)
   const [resourceCatalog, setResourceCatalog] = useState<ResourceCatalog>(fallbackResources)
   const [storageChanging, setStorageChanging] = useState(false)
@@ -114,6 +137,18 @@ export function App() {
   )
   const imageModels = useMemo(() => BUILTIN_PROVIDER_MODELS
     .filter((model) => model.kind === 'image' && settings.enabledModelKeys.includes(model.key))
+    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
+    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
+  const videoModels = useMemo(() => BUILTIN_PROVIDER_MODELS
+    .filter((model) => model.kind === 'video' && settings.enabledModelKeys.includes(model.key))
+    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
+    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
+  const chatModels = useMemo(() => BUILTIN_PROVIDER_MODELS
+    .filter((model) => model.kind === 'chat' && settings.enabledModelKeys.includes(model.key))
+    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
+    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
+  const audioModels = useMemo(() => BUILTIN_PROVIDER_MODELS
+    .filter((model) => model.kind === 'audio' && settings.enabledModelKeys.includes(model.key))
     .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
     .map((model) => ({ key: model.key, label: model.displayName })), [settings])
 
@@ -129,12 +164,14 @@ export function App() {
     let cancelled = false
     async function loadDesktopState(): Promise<void> {
       if (!window.desktop) return
-      const [settingsResult, statsResult, canvasResult, recentResult, historyResult, libraryResult, resourcesResult] = await Promise.all([
+      const [settingsResult, statsResult, canvasResult, recentResult, historyResult, videoHistoryResult, audioHistoryResult, libraryResult, resourcesResult] = await Promise.all([
         window.desktop.settings.load(),
         window.desktop.storage.stats(),
         window.desktop.canvas.loadAutosave(),
         window.desktop.canvas.listRecent(),
         window.desktop.history.load(),
+        window.desktop.history.loadVideos(),
+        window.desktop.history.loadAudios(),
         window.desktop.library.load(),
         window.desktop.resources.load(),
       ])
@@ -142,11 +179,13 @@ export function App() {
       if (settingsResult.ok) setSettings(settingsResult.value)
       if (statsResult.ok) setStats(statsResult.value)
       if (canvasResult.ok) {
-        if (canvasResult.value) setCanvasDocument(canvasResult.value)
+        if (canvasResult.value) setCanvasDocument(recoverInterruptedGenerationTasks(canvasResult.value))
         setCanvasIsActive(Boolean(canvasResult.value))
       }
       if (recentResult.ok) setRecentProjects(recentResult.value)
       if (historyResult.ok) setGeneratedArtworks(historyResult.value)
+      if (videoHistoryResult.ok) setGeneratedVideos(videoHistoryResult.value)
+      if (audioHistoryResult.ok) setGeneratedAudios(audioHistoryResult.value)
       if (libraryResult.ok) setLibraryCatalog(libraryResult.value)
       if (resourcesResult.ok) setResourceCatalog(resourcesResult.value)
     }
@@ -195,13 +234,29 @@ export function App() {
     setToast(message)
   }, [])
 
-  function newCanvas(prompt?: string): void {
+  async function newCanvas(prompt?: string): Promise<void> {
+    let knownProjects = recentProjects
+    if (canvasIsActive && window.desktop) {
+      const saveResult = await window.desktop.canvas.saveAutosave(canvasDocument)
+      if (!saveResult.ok) {
+        notify(`无法保留当前画布：${saveResult.error.message}`)
+        return
+      }
+      const recentResult = await window.desktop.canvas.listRecent()
+      if (recentResult.ok) {
+        knownProjects = recentResult.value
+        setRecentProjects(recentResult.value)
+      }
+    } else if (canvasIsActive) {
+      localStorage.setItem('draw-canvas-autosave', JSON.stringify(canvasDocument))
+    }
+
     const defaultImageModelKey = settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY
     const defaultImageModelName = BUILTIN_PROVIDER_MODELS.find(
       (model) => model.key === defaultImageModelKey,
     )?.displayName ?? '默认图片模型'
     setCanvasDocument(createInitialCanvas(
-      '未命名画布',
+      nextUntitledCanvasName(knownProjects, canvasIsActive ? canvasDocument.name : undefined),
       prompt,
       defaultImageModelKey,
       defaultImageModelName,
@@ -219,7 +274,7 @@ export function App() {
     }
     const result = await window.desktop.canvas.openFile()
     if (result.ok) {
-      setCanvasDocument(result.value)
+      setCanvasDocument(recoverInterruptedGenerationTasks(result.value))
       setCanvasIsActive(true)
       setPage('canvas')
       notify('项目已打开')
@@ -258,7 +313,7 @@ export function App() {
       await refreshRecentProjects()
       return
     }
-    setCanvasDocument(result.value)
+    setCanvasDocument(recoverInterruptedGenerationTasks(result.value))
     setCanvasIsActive(true)
     setPage('canvas')
     notify('最近项目已恢复')
@@ -333,6 +388,99 @@ export function App() {
     }
     notify('图片已从本地资源库删除')
     void refreshStorageStats()
+  }
+
+  async function removeHistoryArtwork(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      setGeneratedArtworks((current) => current.filter((artwork) => artwork.id !== id))
+      setSettings((current) => ({
+        ...current,
+        favoriteImageIds: current.favoriteImageIds.filter((favoriteId) => favoriteId !== id),
+      }))
+      notify('生成记录已删除（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.history.remove({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setGeneratedArtworks(result.value)
+    setSettings((current) => ({
+      ...current,
+      favoriteImageIds: current.favoriteImageIds.filter((favoriteId) => favoriteId !== id),
+    }))
+    notify('生成记录和本地图片已删除')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function removeHistoryVideo(id: string): Promise<boolean> {
+    if (!window.desktop) return false
+    const result = await window.desktop.history.removeVideo({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setGeneratedVideos(result.value)
+    notify('视频生成记录已删除')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function exportHistoryVideo(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      notify('视频导出需要在 Electron 桌面端运行')
+      return false
+    }
+    const result = await window.desktop.history.exportVideo({ id })
+    if (!result.ok) {
+      if (result.error.code !== 'CANCELLED') notify(result.error.message)
+      return false
+    }
+    notify('视频已导出')
+    return true
+  }
+
+  async function removeHistoryAudio(id: string): Promise<boolean> {
+    if (!window.desktop) return false
+    const result = await window.desktop.history.removeAudio({ id })
+    if (!result.ok) {
+      notify(result.error.message)
+      return false
+    }
+    setGeneratedAudios(result.value)
+    notify('语音生成记录已删除')
+    void refreshStorageStats()
+    return true
+  }
+
+  async function exportHistoryAudio(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      notify('语音导出需要在 Electron 桌面端运行')
+      return false
+    }
+    const result = await window.desktop.history.exportAudio({ id })
+    if (!result.ok) {
+      if (result.error.code !== 'CANCELLED') notify(result.error.message)
+      return false
+    }
+    notify('语音已导出')
+    return true
+  }
+
+  async function exportHistoryBatch(media: 'images' | 'videos' | 'audios', ids: ReadonlyArray<string>): Promise<boolean> {
+    if (!window.desktop) {
+      notify('批量导出需要在 Electron 桌面端运行')
+      return false
+    }
+    const result = await window.desktop.history.exportBatch({ media, ids })
+    if (!result.ok) {
+      if (result.error.code !== 'CANCELLED') notify(result.error.message)
+      return false
+    }
+    notify(`已导出 ${result.value.exportedCount} 个文件`)
+    return true
   }
 
   async function savePrompt(request: SavePromptRequest): Promise<boolean> {
@@ -422,13 +570,14 @@ export function App() {
       notify('工作流没有可恢复的画布数据')
       return
     }
+    const recoveredDocument = recoverInterruptedGenerationTasks(workflow.document)
     setCanvasDocument({
-      ...workflow.document,
+      ...recoveredDocument,
       id: crypto.randomUUID(),
       name: workflow.title,
-      nodes: workflow.document.nodes.map((node) => ({ ...node })),
-      connections: workflow.document.connections.map((connection) => ({ ...connection })),
-      viewport: { ...workflow.document.viewport },
+      nodes: recoveredDocument.nodes.map((node) => ({ ...node })),
+      connections: recoveredDocument.connections.map((connection) => ({ ...connection })),
+      viewport: { ...recoveredDocument.viewport },
       updatedAt: new Date().toISOString(),
     })
     setCanvasIsActive(true)
@@ -442,15 +591,13 @@ export function App() {
     if (result.ok) setStats(result.value)
   }
 
-  const generateCanvasImage = useCallback(async (request: GenerateImageRequest): Promise<GeneratedImageResult | null> => {
+  const generateCanvasImage = useCallback(async (request: GenerateImageRequest): Promise<CanvasImageGenerationOutcome> => {
     if (!window.desktop) {
-      notify('真实图片生成需要在 Electron 桌面端运行')
-      return null
+      return { ok: false, error: '真实图片生成需要在 Electron 桌面端运行' }
     }
     const result = await window.desktop.generation.generateImage(request)
     if (!result.ok) {
-      notify(result.error.message)
-      return null
+      return { ok: false, error: result.error.message }
     }
     setGeneratedArtworks((current) => [
       result.value.artwork,
@@ -459,8 +606,102 @@ export function App() {
     void window.desktop.storage.stats().then((statsResult) => {
       if (statsResult.ok) setStats(statsResult.value)
     })
-    return result.value
-  }, [notify])
+    return { ok: true, value: result.value }
+  }, [])
+
+  const generateCanvasVideo = useCallback(async (request: GenerateVideoRequest): Promise<CanvasVideoGenerationOutcome> => {
+    if (!window.desktop) {
+      return { ok: false, error: '真实视频生成需要在 Electron 桌面端运行' }
+    }
+    const result = await window.desktop.generation.generateVideo(request)
+    if (!result.ok) return { ok: false, error: result.error.message }
+    setGeneratedVideos((current) => [
+      result.value.video,
+      ...current.filter((video) => video.id !== result.value.video.id),
+    ])
+    void window.desktop.storage.stats().then((statsResult) => {
+      if (statsResult.ok) setStats(statsResult.value)
+    })
+    return { ok: true, value: result.value }
+  }, [])
+
+  const generateCanvasAudio = useCallback(async (request: GenerateAudioRequest): Promise<CanvasAudioGenerationOutcome> => {
+    if (!window.desktop) return { ok: false, error: '真实语音生成需要在 Electron 桌面端运行' }
+    const result = await window.desktop.generation.generateAudio(request)
+    if (!result.ok) return { ok: false, error: result.error.message }
+    setGeneratedAudios((current) => [
+      result.value.audio,
+      ...current.filter((audio) => audio.id !== result.value.audio.id),
+    ])
+    void window.desktop.storage.stats().then((statsResult) => {
+      if (statsResult.ok) setStats(statsResult.value)
+    })
+    return { ok: true, value: result.value }
+  }, [])
+
+  const optimizeCanvasPrompt = useCallback(async (request: OptimizePromptRequest): Promise<CanvasPromptOptimizationOutcome> => {
+    if (!window.desktop) {
+      return { ok: false, error: '提示词优化需要在 Electron 桌面端运行' }
+    }
+    const result = await window.desktop.generation.optimizePrompt(request)
+    return result.ok
+      ? { ok: true, value: result.value }
+      : { ok: false, error: result.error.message }
+  }, [])
+
+  const generateCanvasChatReply = useCallback(async (request: GenerateChatReplyRequest): Promise<CanvasChatGenerationOutcome> => {
+    if (!window.desktop) return { ok: false, error: 'AI 对话需要在 Electron 桌面端运行' }
+    const result = await window.desktop.generation.generateChatReply(request)
+    return result.ok
+      ? { ok: true, value: result.value }
+      : { ok: false, error: result.error.message }
+  }, [])
+
+  const generateCanvasStoryboard = useCallback(async (request: GenerateStoryboardRequest): Promise<CanvasStoryboardGenerationOutcome> => {
+    if (!window.desktop) return { ok: false, error: '分镜生成需要在 Electron 桌面端运行' }
+    const result = await window.desktop.generation.generateStoryboard(request)
+    return result.ok
+      ? { ok: true, value: result.value }
+      : { ok: false, error: result.error.message }
+  }, [])
+
+  const importCanvasReferenceImages = useCallback(async (): Promise<ReadonlyArray<GeneratedArtwork>> => {
+    if (!window.desktop) {
+      notify('本地参考图导入需要在 Electron 桌面端运行')
+      return []
+    }
+    const previousIds = new Set(libraryCatalog.map((artwork) => artwork.id))
+    const result = await window.desktop.library.importImages()
+    if (!result.ok) {
+      if (result.error.code !== 'CANCELLED') notify(result.error.message)
+      return []
+    }
+    const imported = result.value.filter((artwork) => !previousIds.has(artwork.id))
+    setLibraryCatalog(result.value)
+    if (imported.length > 0) notify(`已向画布导入 ${imported.length} 张本地参考图`)
+    void refreshStorageStats()
+    return imported
+  }, [libraryCatalog, notify])
+
+  const importDroppedCanvasReferenceImages = useCallback(async (
+    files: ReadonlyArray<File>,
+  ): Promise<ReadonlyArray<GeneratedArtwork>> => {
+    if (!window.desktop) {
+      notify('拖入本地参考图需要在 Electron 桌面端运行')
+      return []
+    }
+    const previousIds = new Set(libraryCatalog.map((artwork) => artwork.id))
+    const result = await window.desktop.library.importDroppedImages(files)
+    if (!result.ok) {
+      notify(result.error.message)
+      return []
+    }
+    const imported = result.value.filter((artwork) => !previousIds.has(artwork.id))
+    setLibraryCatalog(result.value)
+    if (imported.length > 0) notify(`已拖入 ${imported.length} 张本地参考图`)
+    void refreshStorageStats()
+    return imported
+  }, [libraryCatalog, notify])
 
   const loadGeneratedImage = useCallback(async (fileName: string): Promise<string | null> => {
     if (!window.desktop) return null
@@ -612,25 +853,25 @@ export function App() {
   function renderPage() {
     switch (page) {
       case 'home':
-        return <HomePage onDeleteRecentProject={(project) => void deleteRecentProject(project)} onNewCanvas={() => newCanvas()} onOpenFile={() => void openCanvasFile()} onOpenRecentProject={(id) => void openRecentProject(id)} recentProjects={recentProjects} />
+        return <HomePage onDeleteRecentProject={(project) => void deleteRecentProject(project)} onNewCanvas={() => void newCanvas()} onOpenFile={() => void openCanvasFile()} onOpenRecentProject={(id) => void openRecentProject(id)} recentProjects={recentProjects} />
       case 'history':
-        return <HistoryPage artworks={generatedArtworks} loadImage={loadGeneratedImage} notify={notify} onNewCanvas={() => newCanvas()} />
+        return <HistoryPage artworks={generatedArtworks} audios={generatedAudios} loadImage={loadGeneratedImage} notify={notify} onExportAudio={exportHistoryAudio} onExportBatch={exportHistoryBatch} onExportVideo={exportHistoryVideo} onNewCanvas={() => void newCanvas()} onRemove={removeHistoryArtwork} onRemoveAudio={removeHistoryAudio} onRemoveVideo={removeHistoryVideo} videos={generatedVideos} />
       case 'gallery':
         return <GalleryPage artworks={libraryArtworks} favoriteIds={settings.favoriteImageIds} importedImageIds={libraryCatalog.map((artwork) => artwork.id)} loadImage={loadGeneratedImage} onFavorite={toggleFavorite} onImport={() => void importLibraryImages()} onRemove={(id) => void removeLibraryImage(id)} />
       case 'resources':
-        return <ResourcesPage currentCanvas={canvasIsActive ? canvasDocument : null} notify={notify} onDeletePrompt={deletePrompt} onDeleteWorkflow={deleteWorkflow} onRunWorkflow={runWorkflow} onSavePrompt={savePrompt} onSaveWorkflow={saveWorkflow} onUsePrompt={(prompt) => newCanvas(prompt)} prompts={resourceCatalog.prompts} workflows={resourceCatalog.workflows} />
+        return <ResourcesPage currentCanvas={canvasIsActive ? canvasDocument : null} notify={notify} onDeletePrompt={deletePrompt} onDeleteWorkflow={deleteWorkflow} onRunWorkflow={runWorkflow} onSavePrompt={savePrompt} onSaveWorkflow={saveWorkflow} onUsePrompt={(prompt) => void newCanvas(prompt)} prompts={resourceCatalog.prompts} workflows={resourceCatalog.workflows} />
       case 'models':
         return <ModelSettingsPage defaultModelKeys={settings.defaultModelKeys} enabledModelKeys={settings.enabledModelKeys} onClearProviderApiKey={clearProviderApiKey} onModelConfigChange={(enabledModelKeys, defaultModelKeys) => void updateSettings({ enabledModelKeys, defaultModelKeys })} onSaveProvider={saveProvider} onSetProviderEnabled={setProviderEnabled} onTestProvider={testProvider} providers={settings.providers} />
       case 'settings':
         return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} />
       case 'canvas':
-        return <InfiniteCanvas defaultImageModelKey={settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={setCanvasDocument} onClose={() => setPage('home')} onGenerateImage={generateCanvasImage} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onSave={() => void saveCanvasFile()} />
+        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={settings.defaultModelKeys.audio ?? audioModels[0]?.key ?? ''} defaultChatModelKey={settings.defaultModelKeys.chat ?? chatModels[0]?.key ?? ''} defaultImageModelKey={settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY} defaultVideoModelKey={settings.defaultModelKeys.video ?? videoModels[0]?.key ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
     }
   }
 
   return (
     <div className={`app-root theme-${effectiveTheme}`} style={rootStyle}>
-      <AppShell activePage={page} generationHistoryCount={generatedArtworks.length} onNavigate={setPage}>{renderPage()}</AppShell>
+      <AppShell activePage={page} generationHistoryCount={generatedArtworks.length + generatedVideos.length + generatedAudios.length} onNavigate={setPage} onNewCanvas={() => void newCanvas()}>{renderPage()}</AppShell>
       {toast && <div className="toast" role="status"><span />{toast}</div>}
     </div>
   )
@@ -665,6 +906,20 @@ function upsertRecentProject(
   return [mergedProject, ...projects.filter((item) => item.id !== project.id)]
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
     .slice(0, 50)
+}
+
+function nextUntitledCanvasName(
+  projects: ReadonlyArray<RecentCanvasProject>,
+  currentCanvasName?: string,
+): string {
+  const names = new Set(projects.map((project) => project.name.trim()))
+  if (currentCanvasName?.trim()) names.add(currentCanvasName.trim())
+  if (!names.has('未命名画布')) return '未命名画布'
+  for (let index = 2; index <= 10_000; index += 1) {
+    const candidate = `未命名画布 ${index}`
+    if (!names.has(candidate)) return candidate
+  }
+  return `未命名画布 ${Date.now()}`
 }
 
 function formatBytes(bytes: number): string {

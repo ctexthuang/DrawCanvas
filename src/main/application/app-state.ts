@@ -1,16 +1,20 @@
-import { randomUUID } from 'node:crypto'
-import { readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { copyFile, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { app, safeStorage } from 'electron/main'
 import type {
   AppSettings,
   CanvasDocument,
+  ExportHistoryBatchRequest,
+  GeneratedAudioAsset,
   GeneratedArtwork,
+  GeneratedVideoAsset,
   ImageGenerationSize,
   LoadedGeneratedImage,
   ProviderConfig,
   ProviderConnectionStatus,
   RecentCanvasProject,
+  RemoveHistoryArtworkRequest,
   RemoveLibraryImageRequest,
   RemoveResourceRequest,
   ResourceCatalog,
@@ -21,6 +25,8 @@ import type {
   StorageStats,
   ThemeMode,
   UpdateSettingsRequest,
+  VideoGenerationRatio,
+  VideoGenerationResolution,
 } from '../../shared/contracts/desktop'
 import { createRecentCanvasProject, isCanvasDocument } from '../../shared/domain/canvas-document'
 import {
@@ -45,10 +51,13 @@ import {
   type AppDataPaths,
   writeAppDataLocation,
 } from '../infrastructure/app-data-layout'
-import { JsonFileStore, readJsonFile } from '../infrastructure/json-store'
+import { JsonFileStore, readJsonFile, writeJsonFile } from '../infrastructure/json-store'
 import type { GeneratedImageMediaType } from '../infrastructure/image-generation-client'
 
 const MAX_STORED_IMAGE_BYTES = 25 * 1024 * 1024
+const MAX_REFERENCE_IMAGE_BYTES = 45 * 1024 * 1024
+const MAX_STORED_VIDEO_BYTES = 300 * 1024 * 1024
+const MAX_STORED_AUDIO_BYTES = 50 * 1024 * 1024
 const MAX_LIBRARY_IMPORT_COUNT = 50
 const MAX_CANVAS_PROJECT_BYTES = 20 * 1024 * 1024
 const MAX_RECENT_PROJECTS = 50
@@ -60,6 +69,37 @@ type SaveGeneratedImageRequest = Readonly<{
   modelKey: string
   modelName: string
   size: ImageGenerationSize
+}>
+
+export type StoredImageInput = Readonly<{
+  fileName: string
+  bytes: Uint8Array
+  mediaType: GeneratedImageMediaType
+}>
+
+type SaveGeneratedVideoRequest = Readonly<{
+  bytes: Uint8Array
+  mediaType: 'video/mp4' | 'video/webm'
+  prompt: string
+  modelKey: string
+  modelName: string
+  duration: number
+  resolution: VideoGenerationResolution
+  ratio: VideoGenerationRatio
+  referenceImageFileNames: ReadonlyArray<string>
+}>
+
+export type SaveGeneratedAudioRequest = Readonly<{
+  bytes: Uint8Array
+  mediaType: 'audio/mpeg'
+  text: string
+  modelKey: string
+  modelName: string
+  voiceId: string
+  speed: number
+  pitch: number
+  emotion: string
+  durationMs: number
 }>
 
 type StoredProvider = Readonly<{
@@ -160,6 +200,8 @@ export class AppState {
   private readonly autosaveStore = new JsonFileStore<CanvasDocument>(() => this.autosavePath)
   private readonly recentProjectsStore = new JsonFileStore<StoredRecentProjectsDocument>(() => this.recentProjectsPath)
   private readonly historyStore = new JsonFileStore<ReadonlyArray<GeneratedArtwork>>(() => this.historyPath)
+  private readonly videoHistoryStore = new JsonFileStore<ReadonlyArray<GeneratedVideoAsset>>(() => this.paths.videoGenerationHistory)
+  private readonly audioHistoryStore = new JsonFileStore<ReadonlyArray<GeneratedAudioAsset>>(() => this.paths.audioGenerationHistory)
   private readonly libraryStore = new JsonFileStore<ReadonlyArray<GeneratedArtwork>>(() => this.paths.libraryCatalog)
   private readonly promptsStore = new JsonFileStore<ResourceCatalog['prompts']>(() => this.paths.prompts)
   private readonly workflowsStore = new JsonFileStore<ResourceCatalog['workflows']>(() => this.paths.workflows)
@@ -370,6 +412,16 @@ export class AppState {
 
   async saveAutosave(document: CanvasDocument): Promise<void> {
     await this.withStorageOperation(async () => {
+      const previousAutosave = await this.autosaveStore.read()
+      if (
+        previousAutosave &&
+        isCanvasDocument(previousAutosave) &&
+        previousAutosave.id !== document.id
+      ) {
+        const archivedProjectPath = this.archivedAutosavePath(previousAutosave.id)
+        await writeJsonFile(archivedProjectPath, previousAutosave)
+        await this.recordRecentProjectUnsafe(previousAutosave, archivedProjectPath)
+      }
       await this.autosaveStore.write(document)
       await this.recordRecentProjectUnsafe(document)
     })
@@ -442,11 +494,161 @@ export class AppState {
     return this.withStorageOperation(async () => (await this.historyStore.read()) ?? [])
   }
 
+  async loadVideoHistory(): Promise<ReadonlyArray<GeneratedVideoAsset>> {
+    return this.withStorageOperation(async () => (await this.videoHistoryStore.read()) ?? [])
+  }
+
+  async loadAudioHistory(): Promise<ReadonlyArray<GeneratedAudioAsset>> {
+    return this.withStorageOperation(async () => (await this.audioHistoryStore.read()) ?? [])
+  }
+
   async recordArtwork(artwork: GeneratedArtwork): Promise<ReadonlyArray<GeneratedArtwork>> {
     return this.withStorageOperation(() => this.historyStore.update((value) => {
       const current = value ?? []
       return [artwork, ...current.filter((item) => item.id !== artwork.id)].slice(0, 200)
     }))
+  }
+
+  async removeHistoryArtwork(request: RemoveHistoryArtworkRequest): Promise<ReadonlyArray<GeneratedArtwork>> {
+    return this.withStorageOperation(async () => {
+      let removedArtwork: GeneratedArtwork | undefined
+      const next = await this.historyStore.update((value) => {
+        const current = value ?? []
+        removedArtwork = current.find((item) => item.id === request.id)
+        return removedArtwork ? current.filter((item) => item.id !== request.id) : current
+      })
+      if (!removedArtwork) return next
+
+      await this.preferencesStore.update((value) => {
+        const current = this.normalizePreferences(value)
+        return {
+          ...current,
+          favoriteImageIds: current.favoriteImageIds.filter((id) => id !== request.id),
+        }
+      })
+
+      const imageFileName = removedArtwork.imageFileName
+      if (imageFileName && isGeneratedImageFileName(imageFileName)) {
+        const library = (await this.libraryStore.read()) ?? []
+        const isStillReferenced = library.some((artwork) => artwork.imageFileName === imageFileName) ||
+          await this.isImageReferencedByCanvasUnsafe(imageFileName)
+        if (!isStillReferenced) {
+          await unlink(join(this.paths.imagesDirectory, imageFileName)).catch(() => undefined)
+        }
+      }
+      return next
+    })
+  }
+
+  async getGeneratedVideo(id: string): Promise<GeneratedVideoAsset | null> {
+    return this.withStorageOperation(async () => {
+      const videos = (await this.videoHistoryStore.read()) ?? []
+      return videos.find((video) => video.id === id) ?? null
+    })
+  }
+
+  async exportGeneratedVideo(id: string, targetPath: string): Promise<void> {
+    await this.withStorageOperation(async () => {
+      if (!isAbsolute(targetPath)) throw new Error('Invalid video export path')
+      const videos = (await this.videoHistoryStore.read()) ?? []
+      const video = videos.find((item) => item.id === id)
+      if (!video || !isGeneratedVideoFileName(video.videoFileName)) {
+        throw new Error('Generated video not found')
+      }
+      await copyFile(join(this.paths.videosDirectory, video.videoFileName), targetPath)
+    })
+  }
+
+  async removeGeneratedVideo(request: Readonly<{ id: string }>): Promise<ReadonlyArray<GeneratedVideoAsset>> {
+    return this.withStorageOperation(async () => {
+      let removedVideo: GeneratedVideoAsset | undefined
+      const next = await this.videoHistoryStore.update((value) => {
+        const current = value ?? []
+        removedVideo = current.find((item) => item.id === request.id)
+        return removedVideo ? current.filter((item) => item.id !== request.id) : current
+      })
+      if (!removedVideo || !isGeneratedVideoFileName(removedVideo.videoFileName)) return next
+      if (!(await this.isVideoReferencedByCanvasUnsafe(removedVideo.videoFileName))) {
+        await unlink(join(this.paths.videosDirectory, removedVideo.videoFileName)).catch(() => undefined)
+      }
+      return next
+    })
+  }
+
+  async getGeneratedAudio(id: string): Promise<GeneratedAudioAsset | null> {
+    return this.withStorageOperation(async () => {
+      const audios = (await this.audioHistoryStore.read()) ?? []
+      return audios.find((audio) => audio.id === id) ?? null
+    })
+  }
+
+  async exportGeneratedAudio(id: string, targetPath: string): Promise<void> {
+    await this.withStorageOperation(async () => {
+      if (!isAbsolute(targetPath)) throw new Error('Invalid audio export path')
+      const audios = (await this.audioHistoryStore.read()) ?? []
+      const audio = audios.find((item) => item.id === id)
+      if (!audio || !isGeneratedAudioFileName(audio.audioFileName)) {
+        throw new Error('Generated audio not found')
+      }
+      await copyFile(join(this.paths.audiosDirectory, audio.audioFileName), targetPath)
+    })
+  }
+
+  async removeGeneratedAudio(request: Readonly<{ id: string }>): Promise<ReadonlyArray<GeneratedAudioAsset>> {
+    return this.withStorageOperation(async () => {
+      let removedAudio: GeneratedAudioAsset | undefined
+      const next = await this.audioHistoryStore.update((value) => {
+        const current = value ?? []
+        removedAudio = current.find((item) => item.id === request.id)
+        return removedAudio ? current.filter((item) => item.id !== request.id) : current
+      })
+      if (!removedAudio || !isGeneratedAudioFileName(removedAudio.audioFileName)) return next
+      if (!(await this.isAudioReferencedByCanvasUnsafe(removedAudio.audioFileName))) {
+        await unlink(join(this.paths.audiosDirectory, removedAudio.audioFileName)).catch(() => undefined)
+      }
+      return next
+    })
+  }
+
+  async exportHistoryBatch(request: ExportHistoryBatchRequest, targetDirectory: string): Promise<number> {
+    return this.withStorageOperation(async () => {
+      if (!isAbsolute(targetDirectory) || request.ids.length === 0 || request.ids.length > 200) {
+        throw new Error('Invalid batch export request')
+      }
+      const selectedIds = new Set(request.ids)
+      const files: ReadonlyArray<Readonly<{ sourcePath: string; targetName: string }>> = request.media === 'images'
+        ? ((await this.historyStore.read()) ?? []).flatMap((artwork) =>
+            selectedIds.has(artwork.id) && artwork.imageFileName && isGeneratedImageFileName(artwork.imageFileName)
+              ? [{
+                  sourcePath: join(this.paths.imagesDirectory, artwork.imageFileName),
+                  targetName: batchExportFileName(artwork.title, artwork.id, extname(artwork.imageFileName)),
+                }]
+              : [],
+          )
+        : request.media === 'videos'
+          ? ((await this.videoHistoryStore.read()) ?? []).flatMap((video) =>
+              selectedIds.has(video.id) && isGeneratedVideoFileName(video.videoFileName)
+                ? [{
+                    sourcePath: join(this.paths.videosDirectory, video.videoFileName),
+                    targetName: batchExportFileName(video.title, video.id, extname(video.videoFileName)),
+                  }]
+                : [],
+            )
+          : ((await this.audioHistoryStore.read()) ?? []).flatMap((audio) =>
+              selectedIds.has(audio.id) && isGeneratedAudioFileName(audio.audioFileName)
+                ? [{
+                    sourcePath: join(this.paths.audiosDirectory, audio.audioFileName),
+                    targetName: batchExportFileName(audio.title, audio.id, '.mp3'),
+                  }]
+                : [],
+            )
+      let exportedCount = 0
+      for (const file of files) {
+        await copyFile(file.sourcePath, join(targetDirectory, file.targetName))
+        exportedCount += 1
+      }
+      return exportedCount
+    })
   }
 
   async saveGeneratedImage(request: SaveGeneratedImageRequest): Promise<GeneratedArtwork> {
@@ -492,6 +694,129 @@ export class AppState {
       const bytes = await readFile(imagePath)
       const mediaType = mediaTypeForFileName(fileName)
       return { dataUrl: `data:${mediaType};base64,${bytes.toString('base64')}` }
+    })
+  }
+
+  async loadStoredImages(fileNames: ReadonlyArray<string>): Promise<ReadonlyArray<StoredImageInput>> {
+    return this.withStorageOperation(async () => {
+      const uniqueFileNames = [...new Set(fileNames)]
+      if (uniqueFileNames.length > 16 || uniqueFileNames.some((fileName) => !isGeneratedImageFileName(fileName))) {
+        throw new Error('Invalid stored image references')
+      }
+      const storedFiles = await Promise.all(uniqueFileNames.map(async (fileName) => {
+        const imagePath = join(this.paths.imagesDirectory, fileName)
+        const fileStats = await stat(imagePath)
+        if (!fileStats.isFile() || fileStats.size === 0 || fileStats.size > MAX_STORED_IMAGE_BYTES) {
+          throw new Error('Stored image reference is invalid')
+        }
+        return { fileName, imagePath, size: fileStats.size }
+      }))
+      if (storedFiles.reduce((total, file) => total + file.size, 0) > MAX_REFERENCE_IMAGE_BYTES) {
+        throw new Error('Stored image references are too large')
+      }
+      return Promise.all(storedFiles.map(async ({ fileName, imagePath }): Promise<StoredImageInput> => {
+        return {
+          fileName,
+          bytes: await readFile(imagePath),
+          mediaType: mediaTypeForFileName(fileName),
+        }
+      }))
+    })
+  }
+
+  async saveGeneratedVideo(request: SaveGeneratedVideoRequest): Promise<GeneratedVideoAsset> {
+    return this.withStorageOperation(async () => {
+      if (request.bytes.byteLength === 0 || request.bytes.byteLength > MAX_STORED_VIDEO_BYTES) {
+        throw new Error('Generated video is invalid or too large')
+      }
+      const id = randomUUID()
+      const extension = request.mediaType === 'video/webm' ? 'webm' : 'mp4'
+      const videoFileName = `${id}.${extension}`
+      const videoPath = join(this.paths.videosDirectory, videoFileName)
+      const video: GeneratedVideoAsset = {
+        id,
+        title: `${request.modelName} 生成视频`,
+        prompt: request.prompt,
+        model: request.modelName,
+        modelKey: request.modelKey,
+        duration: request.duration,
+        resolution: request.resolution,
+        ratio: request.ratio,
+        createdAt: new Date().toISOString(),
+        videoFileName,
+        referenceImageFileNames: [...request.referenceImageFileNames],
+      }
+      await writeFile(videoPath, request.bytes, { flag: 'wx' })
+      try {
+        await this.videoHistoryStore.update((value) => [
+          video,
+          ...(value ?? []).filter((item) => item.id !== video.id),
+        ].slice(0, 200))
+      } catch (error) {
+        await unlink(videoPath).catch(() => undefined)
+        throw error
+      }
+      return video
+    })
+  }
+
+  async saveGeneratedAudio(request: SaveGeneratedAudioRequest): Promise<GeneratedAudioAsset> {
+    return this.withStorageOperation(async () => {
+      if (request.bytes.byteLength === 0 || request.bytes.byteLength > MAX_STORED_AUDIO_BYTES) {
+        throw new Error('Generated audio is invalid or too large')
+      }
+      const id = randomUUID()
+      const audioFileName = `${id}.mp3`
+      const audioPath = join(this.paths.audiosDirectory, audioFileName)
+      const audio: GeneratedAudioAsset = {
+        id,
+        title: `${request.modelName} 生成语音`,
+        text: request.text,
+        model: request.modelName,
+        modelKey: request.modelKey,
+        voiceId: request.voiceId,
+        speed: request.speed,
+        pitch: request.pitch,
+        emotion: request.emotion,
+        durationMs: request.durationMs,
+        createdAt: new Date().toISOString(),
+        audioFileName,
+      }
+      await writeFile(audioPath, request.bytes, { flag: 'wx' })
+      try {
+        await this.audioHistoryStore.update((value) => [
+          audio,
+          ...(value ?? []).filter((item) => item.id !== audio.id),
+        ].slice(0, 200))
+      } catch (error) {
+        await unlink(audioPath).catch(() => undefined)
+        throw error
+      }
+      return audio
+    })
+  }
+
+  async resolveStoredAudioPath(fileName: string): Promise<string> {
+    return this.withStorageOperation(async () => {
+      if (!isGeneratedAudioFileName(fileName)) throw new Error('Invalid generated audio file name')
+      const audioPath = join(this.paths.audiosDirectory, fileName)
+      const fileStats = await stat(audioPath)
+      if (!fileStats.isFile() || fileStats.size === 0 || fileStats.size > MAX_STORED_AUDIO_BYTES) {
+        throw new Error('Generated audio is invalid or too large')
+      }
+      return audioPath
+    })
+  }
+
+  async resolveStoredVideoPath(fileName: string): Promise<string> {
+    return this.withStorageOperation(async () => {
+      if (!isGeneratedVideoFileName(fileName)) throw new Error('Invalid generated video file name')
+      const videoPath = join(this.paths.videosDirectory, fileName)
+      const fileStats = await stat(videoPath)
+      if (!fileStats.isFile() || fileStats.size === 0 || fileStats.size > MAX_STORED_VIDEO_BYTES) {
+        throw new Error('Generated video is invalid or too large')
+      }
+      return videoPath
     })
   }
 
@@ -550,7 +875,12 @@ export class AppState {
       const next = current.filter((item) => item.id !== request.id)
       await this.libraryStore.write(next)
       if (artwork.imageFileName && isGeneratedImageFileName(artwork.imageFileName)) {
-        await unlink(join(this.paths.imagesDirectory, artwork.imageFileName)).catch(() => undefined)
+        const history = (await this.historyStore.read()) ?? []
+        const isStillReferenced = history.some((item) => item.imageFileName === artwork.imageFileName) ||
+          await this.isImageReferencedByCanvasUnsafe(artwork.imageFileName)
+        if (!isStillReferenced) {
+          await unlink(join(this.paths.imagesDirectory, artwork.imageFileName)).catch(() => undefined)
+        }
       }
       return next
     })
@@ -728,6 +1058,64 @@ export class AppState {
       !isAbsolute(managedRelativePath)
     ) return { relativePath: managedRelativePath }
     return { externalPath: absolutePath }
+  }
+
+  private archivedAutosavePath(documentId: string): string {
+    const identifier = createHash('sha256').update(documentId).digest('hex')
+    return join(this.paths.projectsDirectory, `autosave-${identifier}.drawcanvas`)
+  }
+
+  private async isImageReferencedByCanvasUnsafe(fileName: string): Promise<boolean> {
+    const referencesImage = (document: CanvasDocument | null | undefined): boolean => Boolean(
+      document?.nodes.some((node) =>
+        node.imageFileName === fileName || node.imageFileNames?.includes(fileName),
+      ),
+    )
+    const autosave = await this.autosaveStore.read()
+    if (referencesImage(autosave)) return true
+    const workflows = (await this.workflowsStore.read()) ?? []
+    if (workflows.some((workflow) => referencesImage(workflow.document))) return true
+    const entries = await readdir(this.paths.projectsDirectory, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.drawcanvas')) continue
+      const document = await readCanvasProjectFile(join(this.paths.projectsDirectory, entry.name))
+      if (referencesImage(document)) return true
+    }
+    return false
+  }
+
+  private async isVideoReferencedByCanvasUnsafe(fileName: string): Promise<boolean> {
+    const referencesVideo = (document: CanvasDocument | null | undefined): boolean => Boolean(
+      document?.nodes.some((node) => node.videoFileName === fileName),
+    )
+    const autosave = await this.autosaveStore.read()
+    if (referencesVideo(autosave)) return true
+    const workflows = (await this.workflowsStore.read()) ?? []
+    if (workflows.some((workflow) => referencesVideo(workflow.document))) return true
+    const entries = await readdir(this.paths.projectsDirectory, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.drawcanvas')) continue
+      const document = await readCanvasProjectFile(join(this.paths.projectsDirectory, entry.name))
+      if (referencesVideo(document)) return true
+    }
+    return false
+  }
+
+  private async isAudioReferencedByCanvasUnsafe(fileName: string): Promise<boolean> {
+    const referencesAudio = (document: CanvasDocument | null | undefined): boolean => Boolean(
+      document?.nodes.some((node) => node.audioFileName === fileName),
+    )
+    const autosave = await this.autosaveStore.read()
+    if (referencesAudio(autosave)) return true
+    const workflows = (await this.workflowsStore.read()) ?? []
+    if (workflows.some((workflow) => referencesAudio(workflow.document))) return true
+    const entries = await readdir(this.paths.projectsDirectory, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.drawcanvas')) continue
+      const document = await readCanvasProjectFile(join(this.paths.projectsDirectory, entry.name))
+      if (referencesAudio(document)) return true
+    }
+    return false
   }
 
   private resolveRecentProjectPath(project: StoredRecentCanvasProject): string | null {
@@ -920,6 +1308,8 @@ export class AppState {
       this.autosaveStore,
       this.recentProjectsStore,
       this.historyStore,
+      this.videoHistoryStore,
+      this.audioHistoryStore,
       this.libraryStore,
       this.promptsStore,
       this.workflowsStore,
@@ -1330,6 +1720,20 @@ function extensionForMediaType(mediaType: GeneratedImageMediaType): 'png' | 'jpg
 
 function isGeneratedImageFileName(fileName: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|webp)$/i.test(fileName)
+}
+
+function isGeneratedVideoFileName(fileName: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp4|webm)$/i.test(fileName)
+}
+
+function isGeneratedAudioFileName(fileName: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.mp3$/i.test(fileName)
+}
+
+function batchExportFileName(title: string, id: string, extension: string): string {
+  const safeTitle = title.replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 120) || 'Draw Canvas 生成结果'
+  const safeId = id.replace(/[^a-z0-9-]/gi, '').slice(0, 8) || 'item'
+  return `${safeTitle}-${safeId}${extension}`
 }
 
 function mediaTypeForFileName(fileName: string): GeneratedImageMediaType {

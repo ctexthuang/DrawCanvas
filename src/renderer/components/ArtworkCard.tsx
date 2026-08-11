@@ -1,19 +1,53 @@
 import { Download, Heart, MoreHorizontal, Trash2 } from 'lucide-react'
-import type { CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import type { Artwork } from '../domain/catalog'
 
 type ArtworkCardProps = Readonly<{
+  actionsMode?: 'inline' | 'menu'
   artwork: Artwork
+  downloadDisabled?: boolean
   favorite?: boolean
   imageUrl?: string
+  onDownload?: (artwork: Artwork) => void
   onFavorite?: (id: string) => void
   onOpen: (artwork: Artwork) => void
   onRemove?: (artwork: Artwork) => void
 }>
 
-export function ArtworkCard({ artwork, favorite = false, imageUrl, onFavorite, onOpen, onRemove }: ArtworkCardProps) {
+export function ArtworkCard({
+  actionsMode = 'inline',
+  artwork,
+  downloadDisabled = false,
+  favorite = false,
+  imageUrl,
+  onDownload,
+  onFavorite,
+  onOpen,
+  onRemove,
+}: ArtworkCardProps) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuOpen(false)
+    }
+    window.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [menuOpen])
+
+  const showMenuActions = actionsMode === 'menu' && Boolean(onDownload || onRemove)
+
   return (
-    <article className="artwork-card">
+    <article className={menuOpen ? 'artwork-card is-menu-open' : 'artwork-card'}>
       <button className="artwork-preview" onClick={() => onOpen(artwork)} type="button">
         {imageUrl ? (
           <img alt={artwork.title} className="artwork-image" src={imageUrl} />
@@ -31,7 +65,44 @@ export function ArtworkCard({ artwork, favorite = false, imageUrl, onFavorite, o
             <strong>{artwork.title}</strong>
             <span>{artwork.model}</span>
           </div>
-          {onFavorite || onRemove ? (
+          {showMenuActions ? (
+            <div className="artwork-menu-wrap" ref={menuRef}>
+              <button
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                aria-label={`${artwork.title}的更多操作`}
+                className="icon-button"
+                onClick={() => setMenuOpen((current) => !current)}
+                type="button"
+              >
+                <MoreHorizontal size={18} />
+              </button>
+              {menuOpen && (
+                <div className="artwork-card-menu" role="menu">
+                  {onDownload && (
+                    <button
+                      disabled={downloadDisabled}
+                      onClick={() => { setMenuOpen(false); onDownload(artwork) }}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <Download size={14} /> 下载图片
+                    </button>
+                  )}
+                  {onRemove && (
+                    <button
+                      className="is-danger"
+                      onClick={() => { setMenuOpen(false); onRemove(artwork) }}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <Trash2 size={14} /> 删除记录
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : onFavorite || onRemove ? (
             <div className="artwork-actions">
               {onFavorite && (
                 <button
@@ -54,7 +125,17 @@ export function ArtworkCard({ artwork, favorite = false, imageUrl, onFavorite, o
         <div className="artwork-meta">
           <span>{artwork.size}</span>
           <span>{formatCreatedAt(artwork.createdAt)}</span>
-          <Download size={13} />
+          {onDownload ? (
+            <button
+              aria-label={`下载${artwork.title}`}
+              className="artwork-download-button"
+              disabled={downloadDisabled}
+              onClick={() => onDownload(artwork)}
+              type="button"
+            >
+              <Download size={13} />
+            </button>
+          ) : <Download aria-hidden="true" size={13} />}
         </div>
       </div>
     </article>
