@@ -113,8 +113,26 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --config.blockExoticSubdeps=false
 
-      - name: Install WiX Toolset
-        run: choco install wixtoolset --version=3.14.0 --yes --no-progress
+      - name: Ensure WiX Toolset
+        shell: pwsh
+        run: |
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          $light = Get-Command light.exe -ErrorAction SilentlyContinue
+
+          if ($null -eq $candle -or $null -eq $light) {
+            choco install wixtoolset --yes --no-progress
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+            $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+            $light = Get-Command light.exe -ErrorAction SilentlyContinue
+          }
+
+          if ($null -eq $candle -or $null -eq $light) {
+            throw 'WiX Toolset 安装后仍找不到 candle.exe 或 light.exe'
+          }
+
+          Split-Path -Parent $candle.Source | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "candle.exe: $($candle.Source)"
+          Write-Host "light.exe: $($light.Source)"
 
       - name: Sync package version from tag
         run: node .github/scripts/set-release-version.mjs "${{ github.ref_name }}"
