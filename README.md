@@ -41,7 +41,7 @@ pnpm make
 
 1. 在 `macos-15` Apple Silicon runner 构建 arm64 DMG/ZIP。
 2. 在 `macos-15-intel` runner 构建 x64 DMG/ZIP。
-3. 在 `windows-2022` runner 构建 x64 Squirrel 安装程序。
+3. 在 `windows-2022` runner 同时构建 x64 Squirrel EXE 快速安装程序，以及可选择安装目录和盘符的 WiX MSI 安装程序。
 4. 查找当前 tag 可达的上一个语义化 tag，收集该 tag 之后到当前 tag 的全部 commit。
 5. 严格验证 macOS `.app` 的 ad-hoc 签名，并为全部安装包生成 `SHA256SUMS.txt`。
 6. 创建或更新同名 GitHub Release，写入增量提交记录并上传全部安装包与校验文件。

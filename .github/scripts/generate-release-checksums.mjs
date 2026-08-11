@@ -5,7 +5,7 @@ import { basename, extname, join, resolve } from 'node:path'
 
 const releaseAssetsDirectory = resolve(process.argv[2] ?? 'release-assets')
 const outputPath = join(releaseAssetsDirectory, 'SHA256SUMS.txt')
-const allowedExtensions = new Set(['.dmg', '.exe', '.nupkg', '.zip'])
+const allowedExtensions = new Set(['.dmg', '.exe', '.msi', '.nupkg', '.zip'])
 const allowedNames = new Set(['RELEASES'])
 
 async function collectReleaseAssets(directory) {

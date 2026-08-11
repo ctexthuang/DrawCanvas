@@ -113,6 +113,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --config.blockExoticSubdeps=false
 
+      - name: Install WiX Toolset
+        run: choco install wixtoolset --version=3.14.0 --yes --no-progress
+
       - name: Sync package version from tag
         run: node .github/scripts/set-release-version.mjs "${{ github.ref_name }}"
 
@@ -122,12 +125,29 @@ jobs:
       - name: Make Windows installer
         run: pnpm exec electron-forge make --arch=x64
 
+      - name: Verify Windows installers
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path dist/make -Recurse -File -Filter '*-Setup.exe' | Select-Object -First 1
+          $msi = Get-ChildItem -Path dist/make -Recurse -File -Filter '*.msi' | Select-Object -First 1
+
+          if ($null -eq $setup) {
+            throw '没有找到 Squirrel EXE 安装程序'
+          }
+          if ($null -eq $msi) {
+            throw '没有找到可选择安装目录的 WiX MSI 安装程序'
+          }
+
+          Write-Host "Squirrel installer: $($setup.FullName)"
+          Write-Host "WiX installer: $($msi.FullName)"
+
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
           name: package-windows-x64
           path: |
             dist/make/**/*.exe
+            dist/make/**/*.msi
             dist/make/**/*.nupkg
             dist/make/**/RELEASES
           if-no-files-found: error
@@ -175,7 +195,7 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
-          mapfile -d '' assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.nupkg' -o -name 'RELEASES' -o -name 'SHA256SUMS.txt' \) -print0)
+          mapfile -d '' assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' -o -name '*.nupkg' -o -name 'RELEASES' -o -name 'SHA256SUMS.txt' \) -print0)
           if (( ${#assets[@]} == 0 )); then
             echo '没有找到可发布的安装包' >&2
             exit 1

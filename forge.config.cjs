@@ -89,6 +89,26 @@ const config = {
         setupExe: `Draw-Canvas-${packageMetadata.version}-x64-Setup.exe`,
       },
     },
+    {
+      name: '@electron-forge/maker-wix',
+      platforms: ['win32'],
+      config: {
+        name: packageMetadata.productName,
+        shortName: 'DrawCanvas',
+        manufacturer: packageMetadata.author,
+        description: packageMetadata.description,
+        exe: 'DrawCanvas.exe',
+        icon: `${appIconPath}.ico`,
+        arch: 'x64',
+        defaultInstallMode: 'perMachine',
+        programFilesFolderName: packageMetadata.productName,
+        shortcutFolderName: packageMetadata.productName,
+        upgradeCode: '9607665E-23C3-4BAF-97A7-AB14BA34A786',
+        ui: {
+          chooseDirectory: true,
+        },
+      },
+    },
   ],
 }
 
