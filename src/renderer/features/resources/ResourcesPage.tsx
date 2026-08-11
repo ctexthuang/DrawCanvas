@@ -22,6 +22,9 @@ import type {
 } from '../../../shared/contracts/desktop'
 import { PageHeader } from '../../components/PageHeader'
 
+// 工作流保存暂未开放；保留底层读写能力以兼容已经保存的本地工作流。
+const WORKFLOW_SAVING_ENABLED = false
+
 type ResourcesPageProps = Readonly<{
   currentCanvas: CanvasDocument | null
   prompts: ReadonlyArray<PromptAsset>
@@ -66,6 +69,10 @@ export function ResourcesPage({
       setPromptDraft({ title: '', category: '通用', body: '' })
       return
     }
+    if (!WORKFLOW_SAVING_ENABLED) {
+      notify('工作流保存功能暂未开放')
+      return
+    }
     if (!currentCanvas) {
       notify('请先新建或打开一个画布，再保存为工作流')
       return
@@ -91,7 +98,7 @@ export function ResourcesPage({
 
   async function submitWorkflow(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    if (!workflowDraft || saving) return
+    if (!WORKFLOW_SAVING_ENABLED || !workflowDraft || saving) return
     setSaving(true)
     try {
       if (await onSaveWorkflow(workflowDraft)) setWorkflowDraft(null)
@@ -113,7 +120,9 @@ export function ResourcesPage({
   return (
     <div className="page content-page resources-page">
       <PageHeader
-        actions={<button className="primary-button compact" disabled={tab === 'workflows' && !currentCanvas} onClick={createResource} type="button"><Plus size={16} /> {tab === 'prompts' ? '新建提示词' : '保存当前画布'}</button>}
+        actions={tab === 'prompts' || WORKFLOW_SAVING_ENABLED
+          ? <button className="primary-button compact" disabled={tab === 'workflows' && !currentCanvas} onClick={createResource} type="button"><Plus size={16} /> {tab === 'prompts' ? '新建提示词' : '保存当前画布'}</button>
+          : undefined}
         description="管理真实保存的提示词与画布工作流"
         onSearch={setQuery}
         search={query}
@@ -148,11 +157,11 @@ export function ResourcesPage({
                 {workflow.document?.nodes.slice(0, 12).map((node) => <span key={node.id} style={workflowNodeStyle(workflow.document?.nodes ?? [], node, workflow.accent)} />)}
               </div>
               <div className="workflow-info"><div><strong>{workflow.title}</strong><p>{workflow.description || '保存自本地画布'}</p></div><span>{workflow.nodes} 个节点</span></div>
-              <div className="workflow-actions"><button onClick={() => workflow.document && setWorkflowDraft({ id: workflow.id, title: workflow.title, description: workflow.description, accent: workflow.accent, document: workflow.document })} type="button"><Edit3 size={14} /> 编辑</button><button onClick={() => void deleteWorkflow(workflow)} type="button"><Trash2 size={14} /> 删除</button></div>
+              <div className="workflow-actions">{WORKFLOW_SAVING_ENABLED && <button onClick={() => workflow.document && setWorkflowDraft({ id: workflow.id, title: workflow.title, description: workflow.description, accent: workflow.accent, document: workflow.document })} type="button"><Edit3 size={14} /> 编辑</button>}<button onClick={() => void deleteWorkflow(workflow)} type="button"><Trash2 size={14} /> 删除</button></div>
               <button className="run-workflow" disabled={!workflow.document} onClick={() => onRunWorkflow(workflow.id)} type="button"><Play size={15} fill="currentColor" /> 运行工作流</button>
             </article>)}
           </div>
-        ) : <ResourceEmptyState disabled={!currentCanvas} hasQuery={Boolean(normalizedQuery)} kind="工作流" onCreate={createResource} />
+        ) : <ResourceEmptyState canCreate={WORKFLOW_SAVING_ENABLED} disabled={!currentCanvas} hasQuery={Boolean(normalizedQuery)} kind="工作流" onCreate={createResource} />
       )}
 
       {promptDraft && (
@@ -168,7 +177,7 @@ export function ResourcesPage({
         </div>
       )}
 
-      {workflowDraft && (
+      {WORKFLOW_SAVING_ENABLED && workflowDraft && (
         <div className="modal-backdrop" onMouseDown={() => setWorkflowDraft(null)} role="presentation">
           <form className="resource-editor-modal" onMouseDown={(event) => event.stopPropagation()} onSubmit={(event) => void submitWorkflow(event)}>
             <button aria-label="关闭" className="modal-close" onClick={() => setWorkflowDraft(null)} type="button"><X size={18} /></button>
@@ -184,8 +193,15 @@ export function ResourcesPage({
   )
 }
 
-function ResourceEmptyState({ disabled = false, hasQuery, kind, onCreate }: Readonly<{ disabled?: boolean; hasQuery: boolean; kind: '提示词' | '工作流'; onCreate: () => void }>) {
-  return <div className="empty-state resource-empty"><Workflow size={31} /><h3>{hasQuery ? `没有匹配的${kind}` : `还没有${kind}`}</h3><p>{hasQuery ? '请更换搜索词后重试。' : kind === '提示词' ? '创建后可以一键复用到无限画布。' : '把当前画布的节点和连线保存为可重复使用的工作流。'}</p>{!hasQuery && <button className="primary-button compact" disabled={disabled} onClick={onCreate} type="button"><Plus size={15} /> {kind === '提示词' ? '新建提示词' : '保存当前画布'}</button>}</div>
+function ResourceEmptyState({ canCreate = true, disabled = false, hasQuery, kind, onCreate }: Readonly<{ canCreate?: boolean; disabled?: boolean; hasQuery: boolean; kind: '提示词' | '工作流'; onCreate: () => void }>) {
+  const description = hasQuery
+    ? '请更换搜索词后重试。'
+    : kind === '提示词'
+      ? '创建后可以一键复用到无限画布。'
+      : canCreate
+        ? '把当前画布的节点和连线保存为可重复使用的工作流。'
+        : '工作流保存功能暂未开放，已有工作流仍可继续使用。'
+  return <div className="empty-state resource-empty"><Workflow size={31} /><h3>{hasQuery ? `没有匹配的${kind}` : `还没有${kind}`}</h3><p>{description}</p>{!hasQuery && canCreate && <button className="primary-button compact" disabled={disabled} onClick={onCreate} type="button"><Plus size={15} /> {kind === '提示词' ? '新建提示词' : '保存当前画布'}</button>}</div>
 }
 
 async function copyPrompt(body: string, notify: (message: string) => void): Promise<void> {

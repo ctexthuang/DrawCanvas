@@ -17,6 +17,7 @@ import {
 import { shell } from 'electron'
 import type {
   CanvasDocument,
+  CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
   DeleteRecentCanvasProjectRequest,
   DesktopErrorCode,
@@ -55,6 +56,7 @@ import {
   HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
+  UPDATE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
 import { isCanvasDocument } from '../shared/domain/canvas-document'
 import { isImageGenerationSize } from '../shared/domain/models'
@@ -82,7 +84,13 @@ import {
   TextGenerationServiceError,
   type TextGenerationServiceErrorCode,
 } from './application/text-generation-service'
+import {
+  UpdateCheckService,
+  UpdateCheckServiceError,
+  type UpdateCheckServiceErrorCode,
+} from './application/update-check-service'
 import { AppDataMigrationError } from './infrastructure/app-data-layout'
+import { DRAW_CANVAS_RELEASES_URL } from './infrastructure/github-release-client'
 import { ProviderRequestError, testOpenAiCompatibleProvider } from './infrastructure/provider-client'
 
 const appState = new AppState()
@@ -91,8 +99,18 @@ const promptOptimizationService = new PromptOptimizationService(appState)
 const textGenerationService = new TextGenerationService(appState)
 const videoGenerationService = new VideoGenerationService(appState)
 const audioGenerationService = new AudioGenerationService(appState)
+const updateCheckService = new UpdateCheckService()
 let mainWindow: BrowserWindow | null = null
 const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1'
+const DEVELOPMENT_APP_ICON_PATH = join(__dirname, '../../assets/icons/app-icon.png')
+const SQUIRREL_STARTUP_ARGUMENTS = new Set([
+  '--squirrel-install',
+  '--squirrel-updated',
+  '--squirrel-uninstall',
+  '--squirrel-obsolete',
+])
+const isSquirrelStartup = process.platform === 'win32' &&
+  process.argv.some((argument) => SQUIRREL_STARTUP_ARGUMENTS.has(argument))
 const PROVIDER_IDS = new Set([
   // 'apimart',
   'volcengine',
@@ -111,6 +129,10 @@ protocol.registerSchemesAsPrivileged([{
     stream: true,
   },
 }])
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.squirrel.DrawCanvas.DrawCanvas')
+}
 
 function success<T>(value: T): DesktopResult<T> {
   return { ok: true, value }
@@ -162,6 +184,16 @@ function promptOptimizationDesktopErrorCode(
 
 function textGenerationDesktopErrorCode(code: TextGenerationServiceErrorCode): DesktopErrorCode {
   return promptOptimizationDesktopErrorCode(code)
+}
+
+function updateCheckDesktopErrorCode(code: UpdateCheckServiceErrorCode): DesktopErrorCode {
+  switch (code) {
+    case 'NETWORK': return 'UPDATE_NETWORK'
+    case 'TIMEOUT': return 'UPDATE_TIMEOUT'
+    case 'RATE_LIMIT': return 'UPDATE_RATE_LIMIT'
+    case 'REMOTE': return 'UPDATE_REMOTE'
+    case 'INVALID_RESPONSE': return 'UPDATE_INVALID_RESPONSE'
+  }
 }
 
 function isTrustedFrameUrl(frameUrl: string): boolean {
@@ -443,12 +475,46 @@ function isSaveWorkflowRequest(value: unknown): value is SaveWorkflowRequest {
   )
 }
 
+function isCheckForUpdatesRequest(value: unknown): value is CheckForUpdatesRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<CheckForUpdatesRequest>
+  return typeof request.force === 'boolean' && Object.keys(request).length === 1
+}
+
 function safeExportFileName(value: string): string {
   const normalized = value.replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 160)
   return normalized || 'Draw Canvas 生成视频'
 }
 
 function registerIpc(): void {
+  ipcMain.handle(
+    UPDATE_IPC_CHANNELS.check,
+    trustedHandler(async (request: CheckForUpdatesRequest) => {
+      if (!isCheckForUpdatesRequest(request)) {
+        return failure('INVALID_INPUT', '更新检查参数无效')
+      }
+      try {
+        return success(await updateCheckService.check(app.getVersion(), request.force))
+      } catch (error) {
+        return error instanceof UpdateCheckServiceError
+          ? failure(updateCheckDesktopErrorCode(error.code), error.message)
+          : failure('UPDATE_NETWORK', '检查更新失败，请稍后重试')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    UPDATE_IPC_CHANNELS.openLatestRelease,
+    trustedHandler(async () => {
+      try {
+        await shell.openExternal(DRAW_CANVAS_RELEASES_URL)
+        return success(null)
+      } catch {
+        return failure('IO_ERROR', '无法打开 GitHub Release 页面')
+      }
+    }),
+  )
+
   ipcMain.handle(
     'settings:load',
     trustedHandler(async () => {
@@ -1238,6 +1304,7 @@ function createWindow(): void {
     show: false,
     title: 'Draw Canvas',
     backgroundColor: windowBackground,
+    ...(!app.isPackaged ? { icon: DEVELOPMENT_APP_ICON_PATH } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
@@ -1298,7 +1365,13 @@ async function registerMediaProtocol(): Promise<void> {
   })
 }
 
+if (isSquirrelStartup) app.quit()
+
 app.whenReady().then(async () => {
+  if (isSquirrelStartup) return
+  if (!app.isPackaged && process.platform === 'darwin' && app.dock) {
+    app.dock.setIcon(DEVELOPMENT_APP_ICON_PATH)
+  }
   try {
     applyNativeTheme((await appState.loadSettings()).theme)
   } catch {

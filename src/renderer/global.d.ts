@@ -9,6 +9,8 @@ type RendererDesktopApi = DesktopApi & Readonly<{
 }>
 
 declare global {
+  const __APP_VERSION__: string
+
   interface Window {
     desktop?: RendererDesktopApi
   }

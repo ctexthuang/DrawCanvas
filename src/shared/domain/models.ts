@@ -61,6 +61,7 @@ export type ProviderModelDefinition = Readonly<{
   kind: ModelKind
   description: string
   badge?: string
+  supportsAutomaticImageSize?: boolean
   imageSizeMappings?: ReadonlyArray<ImageGenerationSizeMapping>
 }>
 
@@ -88,13 +89,13 @@ const OPENAI_MODEL_CATALOG: ReadonlyArray<OpenAiModelCatalogEntry> = [
     kind: 'image',
     description: '默认图像生成模型',
     badge: '推荐',
+    supportsAutomaticImageSize: true,
     imageSizeMappings: [
       imageSizeMapping('1024x1024', '1:1', 'standard'),
       imageSizeMapping('1536x1024', '3:2', 'standard'),
       imageSizeMapping('1024x1536', '2:3', 'standard'),
       imageSizeMapping('2048x2048', '1:1', '2k'),
       imageSizeMapping('2048x1152', '16:9', '2k'),
-      imageSizeMapping('1152x2048', '9:16', '2k'),
       imageSizeMapping('3840x2160', '16:9', '4k'),
       imageSizeMapping('2160x3840', '9:16', '4k'),
     ],
@@ -421,10 +422,13 @@ export function imageGenerationSizeOptionsForModel(modelKey: string): ReadonlyAr
   const mappings = model?.kind === 'image' && model.imageSizeMappings?.length
     ? model.imageSizeMappings
     : [imageSizeMapping('1024x1024', '1:1', 'standard')]
-  return mappings.map((mapping) => ({
+  const mappedOptions = mappings.map((mapping) => ({
     value: mapping.value,
     label: imageGenerationSizeLabel(mapping),
   }))
+  return model?.kind === 'image' && model.supportsAutomaticImageSize
+    ? [{ value: 'auto', label: '自动 · auto' }, ...mappedOptions]
+    : mappedOptions
 }
 
 export function defaultImageGenerationSizeForModel(modelKey: string): ImageGenerationSize {
@@ -436,7 +440,9 @@ export function defaultImageGenerationSizeForModel(modelKey: string): ImageGener
 
 export function isImageGenerationSizeSupported(modelKey: string, size: ImageGenerationSize): boolean {
   const model = findBuiltinModelByKey(modelKey)
-  return Boolean(model?.kind === 'image' && model.imageSizeMappings?.some((mapping) => mapping.value === size))
+  if (model?.kind !== 'image') return false
+  if (size === 'auto') return model.supportsAutomaticImageSize === true
+  return Boolean(model.imageSizeMappings?.some((mapping) => mapping.value === size))
 }
 
 export function normalizeImageGenerationSize(

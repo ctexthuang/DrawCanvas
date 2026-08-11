@@ -2,6 +2,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   CanvasDocument,
+  CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
   DeleteRecentCanvasProjectRequest,
   DesktopApi,
@@ -36,6 +37,7 @@ import {
   HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
+  UPDATE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
 
 type FileDropDesktopApi = DesktopApi & Readonly<{
@@ -47,6 +49,10 @@ type FileDropDesktopApi = DesktopApi & Readonly<{
 }>
 
 const desktopApi: FileDropDesktopApi = {
+  updates: {
+    check: (request: CheckForUpdatesRequest) => ipcRenderer.invoke(UPDATE_IPC_CHANNELS.check, request),
+    openLatestRelease: () => ipcRenderer.invoke(UPDATE_IPC_CHANNELS.openLatestRelease),
+  },
   settings: {
     load: () => ipcRenderer.invoke('settings:load'),
     update: (request: UpdateSettingsRequest) => ipcRenderer.invoke('settings:update', request),

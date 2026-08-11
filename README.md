@@ -27,6 +27,44 @@ pnpm build
 pnpm preview
 ```
 
+生成当前系统的安装包：
+
+```bash
+pnpm make
+```
+
+打包使用 Electron Forge，产物写入 `dist/`。本地命令只负责当前操作系统；正式的多平台产物由 GitHub Actions 分别在对应系统 runner 上构建。
+
+## Tag 自动发布
+
+推送 `v0.0.1` 形式的语义化 tag 后，`.github/workflows/release.yml` 会自动执行：
+
+1. 在 `macos-15` Apple Silicon runner 构建 arm64 DMG/ZIP。
+2. 在 `macos-15-intel` runner 构建 x64 DMG/ZIP。
+3. 在 `windows-2022` runner 构建 x64 Squirrel 安装程序。
+4. 查找当前 tag 可达的上一个语义化 tag，收集该 tag 之后到当前 tag 的全部 commit。
+5. 严格验证 macOS `.app` 的 ad-hoc 签名，并为全部安装包生成 `SHA256SUMS.txt`。
+6. 创建或更新同名 GitHub Release，写入增量提交记录并上传全部安装包与校验文件。
+
+首次发布示例：
+
+```bash
+git tag -a v0.0.1 -m "Draw Canvas v0.0.1"
+git push origin v0.0.1
+```
+
+后续推送 `v0.0.2` 时，Release 会包含 `v0.0.1..v0.0.2` 的全部提交。tag 中的版本会在 runner 内同步到 `package.json`，因此安装包元数据、左下角版本号和系统设置版本号保持一致。
+
+发布说明默认保留 commit 原文。若希望自动生成简体中文翻译，在仓库 `Settings → Secrets and variables → Actions` 中添加 Repository secret `OPENAI_API_KEY`；可选添加 Repository variable `OPENAI_RELEASE_NOTES_MODEL`，默认使用 `gpt-4o-mini`。翻译调用失败或没有配置密钥时不会中断打包和发布。
+
+当前 macOS 安装包使用免费的 ad-hoc 签名，Action 会在发布前执行 `codesign --verify --deep --strict`；所有平台的发布文件都会写入 `SHA256SUMS.txt`。当前没有配置 Apple Developer ID、公证或 Windows 代码签名证书，因此下载后仍可能出现 Gatekeeper 或 SmartScreen 提示。
+
+macOS 用户首次双击若被 Gatekeeper 拦截，可在尝试启动后的约一小时内进入“系统设置 → 隐私与安全性”，在“安全性”区域选择“仍要打开”。只应对从本仓库 Release 下载且 SHA-256 与 `SHA256SUMS.txt` 一致的文件执行此操作；默认不要求运行 `xattr`。
+
+### Windows 兼容性
+
+当前项目使用 Electron 43，只支持 Windows 10 及以上版本，无法生成兼容 Windows 7/8/8.1 的安全受支持安装包。Electron 官方说明 [Electron 22 是最后一个支持 Windows 7～8.1 的版本](https://www.electronjs.org/blog/windows-7-to-8-1-deprecation-notice)，且 Electron 22 已停止维护。若业务必须支持 Windows 7，应单独维护锁定 Electron 22 的 legacy 分支，不与当前主线安装包混发。
+
 ## 功能
 
 - 文件首页：新建无限画布、打开本地项目、最近项目

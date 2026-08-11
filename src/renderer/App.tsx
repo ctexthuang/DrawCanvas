@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import type {
   AppSettings,
+  AppUpdateCheck,
   CanvasDocument,
   GenerateAudioRequest,
   GenerateChatReplyRequest,
@@ -49,6 +50,7 @@ import { HomePage } from './features/home/HomePage'
 import { ResourcesPage } from './features/resources/ResourcesPage'
 import { ModelSettingsPage } from './features/settings/ModelSettingsPage'
 import { SystemSettingsPage } from './features/settings/SystemSettingsPage'
+import { UpdateDialog } from './features/settings/UpdateDialog'
 import { artworks as seedArtworks, prompts as seedPrompts, workflows as seedWorkflows } from './domain/catalog'
 
 const fallbackProviders: ReadonlyArray<ProviderConfig> = [
@@ -128,6 +130,10 @@ export function App() {
   const [libraryCatalog, setLibraryCatalog] = useState<ReadonlyArray<GeneratedArtwork>>(seedArtworks)
   const [resourceCatalog, setResourceCatalog] = useState<ResourceCatalog>(fallbackResources)
   const [storageChanging, setStorageChanging] = useState(false)
+  const [updateCheck, setUpdateCheck] = useState<AppUpdateCheck | null>(null)
+  const [updateChecking, setUpdateChecking] = useState(false)
+  const [updateError, setUpdateError] = useState<string | null>(null)
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const rootStyle = useMemo(() => ({ '--accent': settings.accentColor } as CSSProperties), [settings.accentColor])
   const effectiveTheme = settings.theme === 'system' ? systemTheme : settings.theme
@@ -190,6 +196,32 @@ export function App() {
       if (resourcesResult.ok) setResourceCatalog(resourcesResult.value)
     }
     void loadDesktopState()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function checkOnStartup(): Promise<void> {
+      if (!window.desktop) return
+      let result = await window.desktop.updates.check({ force: false })
+      if (
+        !result.ok &&
+        (result.error.code === 'UPDATE_NETWORK' || result.error.code === 'UPDATE_TIMEOUT')
+      ) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_500))
+        if (cancelled) return
+        result = await window.desktop.updates.check({ force: true })
+      }
+      if (cancelled) return
+      if (!result.ok) {
+        setUpdateError(result.error.message)
+        return
+      }
+      setUpdateError(null)
+      setUpdateCheck(result.value)
+      if (result.value.status === 'available') setUpdateDialogOpen(true)
+    }
+    void checkOnStartup()
     return () => { cancelled = true }
   }, [])
 
@@ -850,6 +882,46 @@ export function App() {
     if (!result.ok) notify(result.error.message)
   }
 
+  async function checkForUpdates(): Promise<void> {
+    if (!window.desktop) {
+      notify('请在 Electron 桌面端检查更新')
+      return
+    }
+    setUpdateChecking(true)
+    setUpdateError(null)
+    try {
+      const result = await window.desktop.updates.check({ force: true })
+      if (!result.ok) {
+        setUpdateError(result.error.message)
+        notify(result.error.message)
+        return
+      }
+      setUpdateCheck(result.value)
+      if (result.value.status === 'available') {
+        setUpdateDialogOpen(true)
+      } else if (result.value.status === 'up-to-date') {
+        notify(`当前 v${result.value.currentVersion} 已是最新版本`)
+      } else {
+        notify('GitHub 暂无正式 Release')
+      }
+    } finally {
+      setUpdateChecking(false)
+    }
+  }
+
+  async function openLatestRelease(): Promise<void> {
+    if (!window.desktop) {
+      notify('请在 Electron 桌面端打开 GitHub Release')
+      return
+    }
+    const result = await window.desktop.updates.openLatestRelease()
+    if (!result.ok) {
+      notify(result.error.message)
+      return
+    }
+    setUpdateDialogOpen(false)
+  }
+
   function renderPage() {
     switch (page) {
       case 'home':
@@ -863,7 +935,7 @@ export function App() {
       case 'models':
         return <ModelSettingsPage defaultModelKeys={settings.defaultModelKeys} enabledModelKeys={settings.enabledModelKeys} onClearProviderApiKey={clearProviderApiKey} onModelConfigChange={(enabledModelKeys, defaultModelKeys) => void updateSettings({ enabledModelKeys, defaultModelKeys })} onSaveProvider={saveProvider} onSetProviderEnabled={setProviderEnabled} onTestProvider={testProvider} providers={settings.providers} />
       case 'settings':
-        return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} />
+        return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onCheckForUpdates={() => void checkForUpdates()} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onOpenLatestRelease={() => void openLatestRelease()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} updateCheck={updateCheck} updateChecking={updateChecking} updateError={updateError} />
       case 'canvas':
         return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={settings.defaultModelKeys.audio ?? audioModels[0]?.key ?? ''} defaultChatModelKey={settings.defaultModelKeys.chat ?? chatModels[0]?.key ?? ''} defaultImageModelKey={settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY} defaultVideoModelKey={settings.defaultModelKeys.video ?? videoModels[0]?.key ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
     }
@@ -872,6 +944,9 @@ export function App() {
   return (
     <div className={`app-root theme-${effectiveTheme}`} style={rootStyle}>
       <AppShell activePage={page} generationHistoryCount={generatedArtworks.length + generatedVideos.length + generatedAudios.length} onNavigate={setPage} onNewCanvas={() => void newCanvas()}>{renderPage()}</AppShell>
+      {updateDialogOpen && updateCheck?.status === 'available' && (
+        <UpdateDialog onClose={() => setUpdateDialogOpen(false)} onOpenRelease={() => void openLatestRelease()} update={updateCheck}/>
+      )}
       {toast && <div className="toast" role="status"><span />{toast}</div>}
     </div>
   )

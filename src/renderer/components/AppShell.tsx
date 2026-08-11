@@ -97,7 +97,7 @@ export function AppShell({ activePage, children, generationHistoryCount, onNavig
             <span><Clock3 size={12} /> 已开启自动保存</span>
           </div>
         </div>
-        <div className="sidebar-version">Draw Canvas · v1.0.0</div>
+        <div className="sidebar-version">Draw Canvas · v{__APP_VERSION__}</div>
       </aside>
       <main className="main-surface">{children}</main>
     </div>

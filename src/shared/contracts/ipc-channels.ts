@@ -41,3 +41,8 @@ export const RESOURCE_IPC_CHANNELS = {
   saveWorkflow: 'resources:save-workflow',
   removeWorkflow: 'resources:remove-workflow',
 } as const
+
+export const UPDATE_IPC_CHANNELS = {
+  check: 'updates:check',
+  openLatestRelease: 'updates:open-latest-release',
+} as const

@@ -43,6 +43,7 @@ import {
   useState,
   type CSSProperties,
   type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent,
@@ -189,6 +190,18 @@ type ConnectedVideoPrompt = Readonly<{
   id: string
   label: string
   prompt: string
+}>
+
+type ConnectedReferenceImage = Readonly<{
+  key: string
+  fileName: string
+  sourceNodeId: string
+}>
+
+type ReferenceMentionRange = Readonly<{
+  start: number
+  end: number
+  query: string
 }>
 
 const HISTORY_LIMIT = 30
@@ -385,9 +398,12 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     setDragState(next)
   }
 
-  function emitDocument(next: CanvasDocument): void {
-    documentRef.current = next
-    onChange(next)
+  function emitDocument(next: CanvasDocument, reconcileReferences = true): void {
+    const reconciled = reconcileReferences
+      ? reconcileReferenceMentions(documentRef.current, next)
+      : next
+    documentRef.current = reconciled
+    onChange(reconciled)
   }
 
   function updateViewport(viewport: CanvasViewport): void {
@@ -414,7 +430,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     if (!snapshot) return
     undoStackRef.current = undoStackRef.current.slice(0, -1)
     redoStackRef.current = [...redoStackRef.current, snapshotGraph(documentRef.current)].slice(-HISTORY_LIMIT)
-    emitDocument(restoreGraph(documentRef.current, snapshot))
+    emitDocument(restoreGraph(documentRef.current, snapshot), false)
     clearSelection()
     setHistoryRevision((revision) => revision + 1)
   }
@@ -424,7 +440,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     if (!snapshot) return
     redoStackRef.current = redoStackRef.current.slice(0, -1)
     undoStackRef.current = [...undoStackRef.current, snapshotGraph(documentRef.current)].slice(-HISTORY_LIMIT)
-    emitDocument(restoreGraph(documentRef.current, snapshot))
+    emitDocument(restoreGraph(documentRef.current, snapshot), false)
     clearSelection()
     setHistoryRevision((revision) => revision + 1)
   }
@@ -658,6 +674,9 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
 
   function onWheel(event: WheelEvent<HTMLDivElement>): void {
     if (!canvasRef.current) return
+    if (event.target instanceof Element && event.target.closest('.canvas-node, .add-node-menu, .canvas-context-menu')) {
+      return
+    }
     event.preventDefault()
     const current = documentRef.current
     const rect = canvasRef.current.getBoundingClientRect()
@@ -745,6 +764,35 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       updatedAt: new Date().toISOString(),
     })
     setSelectedConnectionId(null)
+  }
+
+  function removeReferenceImage(targetNodeId: string, reference: ConnectedReferenceImage): void {
+    const current = documentRef.current
+    const source = current.nodes.find((node) => node.id === reference.sourceNodeId)
+    if (!source || (source.type !== 'image' && source.type !== 'reference-folder')) return
+    pushUndo()
+    if (source.type === 'image') {
+      emitDocument({
+        ...current,
+        connections: current.connections.filter((connection) =>
+          !(connection.from === source.id && connection.to === targetNodeId)),
+        updatedAt: new Date().toISOString(),
+      })
+    } else {
+      const nestedImageIds = new Set(current.nodes.flatMap((node) =>
+        node.type === 'image' && node.imageFileName === reference.fileName ? [node.id] : [],
+      ))
+      emitDocument({
+        ...current,
+        nodes: current.nodes.map((node) => node.id === source.id
+          ? { ...node, imageFileNames: (node.imageFileNames ?? []).filter((fileName) => fileName !== reference.fileName) }
+          : node),
+        connections: current.connections.filter((connection) =>
+          !(connection.to === source.id && nestedImageIds.has(connection.from))),
+        updatedAt: new Date().toISOString(),
+      })
+    }
+    notify('已移除参考图并更新提示词编号')
   }
 
   function deleteSelectionOrConnection(): void {
@@ -836,18 +884,24 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const current = documentRef.current
     const latestSource = current.nodes.find((node) => node.id === source.id)
     if (!latestSource) return false
-    const connectedPrompts = findPromptTextsForSource(current, latestSource)
-    const compositionPrompt = latestSource.type === 'compositor'
-      ? latestSource.subtitle?.trim()
-      : undefined
-    const prompts = compositionPrompt ? [compositionPrompt] : connectedPrompts
+    const referenceImageFileNames = findReferenceImageFileNames(current, latestSource)
+    let prompts: ReadonlyArray<string>
+    if (latestSource.type === 'compositor') {
+      if (referenceImageFileNames.length < 2) {
+        notify('图片合成至少需要连接 2 个已有图片节点')
+        return false
+      }
+      const compositionPrompt = latestSource.subtitle?.trim()
+      if (!compositionPrompt) {
+        notify('请先填写图片合成要求')
+        return false
+      }
+      prompts = [compositionPrompt]
+    } else {
+      prompts = findPromptTextsForSource(current, latestSource)
+    }
     if (prompts.length === 0) {
       notify('请先在提示词节点中输入图片描述')
-      return false
-    }
-    const referenceImageFileNames = findReferenceImageFileNames(current, latestSource)
-    if (latestSource.type === 'compositor' && referenceImageFileNames.length < 2) {
-      notify('图片合成至少需要连接 2 个已有图片节点')
       return false
     }
     const modelKey = latestSource.type === 'generator' || latestSource.type === 'compositor'
@@ -1724,7 +1778,9 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
                 onResizePointerDown={(event) => onResizePointerDown(event, node)}
                 onUpdate={(patch) => updateNode(node.id, patch)}
                 onSendChat={(content) => void sendChatMessage(node, content)}
-                referenceImageCount={findReferenceImageFileNames(document, node).length}
+                onRemoveReference={(reference) => removeReferenceImage(node.id, reference)}
+                mentionReferenceImages={findMentionReferenceImages(document, node)}
+                referenceImages={findConnectedReferenceImages(document, node)}
                 selected={selectedIds.has(node.id)}
                 videoPromptOptions={findVideoPromptOptions(document, node)}
                 videoModels={videoModels}
@@ -1869,7 +1925,8 @@ type CanvasNodeProps = Readonly<{
   videoModels: ReadonlyArray<CanvasImageModelOption>
   node: CanvasNodeData
   dropTarget: boolean
-  referenceImageCount: number
+  mentionReferenceImages: ReadonlyArray<ConnectedReferenceImage>
+  referenceImages: ReadonlyArray<ConnectedReferenceImage>
   selected: boolean
   onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void
   onPortPointerDown: (event: ReactPointerEvent<HTMLElement>, side: 'input' | 'output') => void
@@ -1881,14 +1938,16 @@ type CanvasNodeProps = Readonly<{
   onGenerateVideo: () => void
   onImportImages: () => void
   onLoadImage: (fileName: string) => Promise<string | null>
+  onRemoveReference: (reference: ConnectedReferenceImage) => void
   onOptimizePrompt: () => void
   onCreatePrompt: (content: string, title?: string) => void
   onSendChat: (content: string) => void
   onDelete: () => void
 }>
 
-function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, imageModels, videoModels, videoPromptOptions, node, dropTarget, isChatting, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, referenceImageCount, selected, onPointerDown, onPortPointerDown, onResizePointerDown, onUpdate, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onSendChat, onDelete }: CanvasNodeProps) {
+function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, imageModels, videoModels, videoPromptOptions, node, dropTarget, isChatting, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, mentionReferenceImages, referenceImages, selected, onPointerDown, onPortPointerDown, onResizePointerDown, onUpdate, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onRemoveReference, onSendChat, onDelete }: CanvasNodeProps) {
   const [storyboardHelpOpen, setStoryboardHelpOpen] = useState(false)
+  const renderedHeight = nodeDimensions(node).height
 
   useEffect(() => {
     if (!storyboardHelpOpen) return
@@ -1915,7 +1974,7 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
       className={`canvas-node node-${node.type}${selected ? ' is-selected' : ''}${dropTarget ? ' is-drop-target' : ''}${node.generationStatus ? ` is-${node.generationStatus}` : ''}${node.collapsed ? ' is-collapsed' : ''}${storyboardHelpOpen ? ' is-help-open' : ''}`}
       data-node-id={node.id}
       onPointerDown={onPointerDown}
-      style={{ left: node.x, top: node.y, width: node.width, height: node.type === 'prompt' || node.type === 'storyboard' || node.type === 'shot-list' ? node.height : undefined, minHeight: node.height, '--node-color': node.color ?? '#aaff00' } as CSSProperties}
+      style={{ left: node.x, top: node.y, width: node.width, height: renderedHeight, minHeight: renderedHeight, '--node-color': node.color ?? '#aaff00' } as CSSProperties}
     >
       <span className="node-input-port" data-node-id={node.id} data-port="input" onPointerDown={(event) => onPortPointerDown(event, 'input')} title={node.type === 'storyboard' ? '输入：连接创意提示词或 AI 对话节点' : node.type === 'shot-list' ? '输入：分镜生成结果' : '输入端口'} />
       <span className="node-output-port" data-node-id={node.id} data-port="output" onPointerDown={(event) => onPortPointerDown(event, 'output')} title={node.type === 'shot-list' ? '输出：将分镜提示词传给视频等下游节点' : '输出端口'} />
@@ -1932,7 +1991,13 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
       {node.type === 'prompt' && (
         <div className="prompt-node-body">
           <div className="prompt-editor">
-            <textarea aria-label="提示词" onChange={(event) => onUpdate({ subtitle: event.target.value })} value={node.subtitle ?? ''}/>
+            <ReferenceMentionTextarea
+              ariaLabel="提示词"
+              onChange={(value) => onUpdate({ subtitle: value })}
+              onLoadImage={onLoadImage}
+              references={mentionReferenceImages}
+              value={node.subtitle ?? ''}
+            />
             <button className="prompt-optimize-button" disabled={isOptimizingPrompt || !node.subtitle?.trim()} onClick={onOptimizePrompt} title="使用默认对话模型优化" type="button">
               {isOptimizingPrompt ? <LoaderCircle className="is-spinning" size={12}/> : <WandSparkles size={12}/>} {isOptimizingPrompt ? '优化中' : '一键优化'}
             </button>
@@ -1951,7 +2016,7 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
           onUpdate={onUpdate}
         />
       )}
-      {node.type === 'shot-list' && <ShotListNode node={node} onUpdate={onUpdate}/>}
+      {node.type === 'shot-list' && <ShotListNode node={node} onLoadImage={onLoadImage} onUpdate={onUpdate} references={mentionReferenceImages}/>}
       {(node.type === 'generator' || node.type === 'compositor') && (
         <ImageGenerationNodeControls
           activeGenerationCount={activeGenerationCount}
@@ -1960,8 +2025,10 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
           isCompositor={node.type === 'compositor'}
           node={node}
           onGenerate={onGenerateImage}
+          onLoadImage={onLoadImage}
+          onRemoveReference={onRemoveReference}
           onUpdate={onUpdate}
-          referenceImageCount={referenceImageCount}
+          referenceImages={referenceImages}
         />
       )}
       {node.type === 'image' && <CanvasImageNode generationNow={generationNow} node={node} onImportImages={onImportImages} onLoadImage={onLoadImage}/>}
@@ -1984,8 +2051,10 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
           generationNow={generationNow}
           node={node}
           onGenerate={onGenerateVideo}
+          onLoadImage={onLoadImage}
+          onRemoveReference={onRemoveReference}
           onUpdate={onUpdate}
-          referenceImageCount={referenceImageCount}
+          referenceImages={referenceImages}
           videoPromptOptions={videoPromptOptions}
           videoModels={videoModels}
         />
@@ -2103,9 +2172,11 @@ function StoryboardNode({ chatModels, defaultChatModelKey, generating, inputAvai
   )
 }
 
-function ShotListNode({ node, onUpdate }: Readonly<{
+function ShotListNode({ node, onLoadImage, onUpdate, references }: Readonly<{
   node: CanvasNodeData
+  onLoadImage: (fileName: string) => Promise<string | null>
   onUpdate: (patch: Partial<CanvasNodeData>) => void
+  references: ReadonlyArray<ConnectedReferenceImage>
 }>) {
   const shots = node.storyboardShots ?? []
 
@@ -2144,7 +2215,15 @@ function ShotListNode({ node, onUpdate }: Readonly<{
             {shots.map((shot) => (
               <section key={shot.id}>
                 <div className="shot-list-item-header"><b>{shot.index}</b><input aria-label={`镜头 ${shot.index} 标题`} onChange={(event) => updateShot(shot.id, { title: event.target.value })} value={shot.title}/><label><input aria-label={`镜头 ${shot.index} 时长`} max={60} min={1} onChange={(event) => updateShot(shot.id, { durationSeconds: Math.max(1, Math.min(60, Number(event.target.value) || 1)) })} type="number" value={shot.durationSeconds}/>秒</label><button aria-label={`删除镜头 ${shot.index}`} className="shot-list-delete-button" onClick={() => removeShot(shot.id)} title="删除这个镜头" type="button"><Trash2 size={12}/></button></div>
-                <textarea aria-label={`镜头 ${shot.index} 提示词`} onChange={(event) => updateShot(shot.id, { prompt: event.target.value })} placeholder="描述这一镜的画面、动作、镜头与光线…" value={shot.prompt}/>
+                <ReferenceMentionTextarea
+                  ariaLabel={`镜头 ${shot.index} 提示词`}
+                  className="shot-reference-mention-editor"
+                  onChange={(value) => updateShot(shot.id, { prompt: value })}
+                  onLoadImage={onLoadImage}
+                  placeholder="描述这一镜的画面、动作、镜头与光线…"
+                  references={references}
+                  value={shot.prompt}
+                />
               </section>
             ))}
           </div>}
@@ -2152,15 +2231,189 @@ function ShotListNode({ node, onUpdate }: Readonly<{
   )
 }
 
-function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelKey, imageModels, isCompositor, node, onGenerate, onUpdate, referenceImageCount }: Readonly<{
+function ReferenceMentionTextarea({ ariaLabel, className, onChange, onLoadImage, placeholder, references, value }: Readonly<{
+  ariaLabel: string
+  className?: string
+  onChange: (value: string) => void
+  onLoadImage: (fileName: string) => Promise<string | null>
+  placeholder?: string
+  references: ReadonlyArray<ConnectedReferenceImage>
+  value: string
+}>) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const [mentionRange, setMentionRange] = useState<ReferenceMentionRange | null>(null)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const imageUrls = useReferenceImageUrls(references, onLoadImage)
+  const filteredReferences = useMemo(() => {
+    if (!mentionRange) return []
+    const query = mentionRange.query.toLocaleLowerCase()
+    return references.flatMap((reference, index) => {
+      const label = `参考图${index + 1}`
+      return !query || label.toLocaleLowerCase().includes(query)
+        ? [{ reference, index, label }]
+        : []
+    })
+  }, [mentionRange, references])
+
+  useEffect(() => {
+    setActiveIndex(0)
+  }, [mentionRange?.query, references])
+
+  function insertReference(referenceIndex: number): void {
+    if (!mentionRange) return
+    const token = `@参考图${referenceIndex + 1}`
+    const suffix = value.slice(mentionRange.end)
+    const separator = suffix.length === 0 || !/^[\s，。！？、；：,.!?;:)]/.test(suffix) ? ' ' : ''
+    const nextValue = `${value.slice(0, mentionRange.start)}${token}${separator}${suffix}`
+    const nextCaret = mentionRange.start + token.length + separator.length
+    onChange(nextValue)
+    setMentionRange(null)
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus()
+      textareaRef.current?.setSelectionRange(nextCaret, nextCaret)
+    })
+  }
+
+  function onKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>): void {
+    if (!mentionRange || filteredReferences.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setActiveIndex((index) => (index + 1) % filteredReferences.length)
+      return
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setActiveIndex((index) => (index - 1 + filteredReferences.length) % filteredReferences.length)
+      return
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault()
+      const selected = filteredReferences[activeIndex] ?? filteredReferences[0]
+      if (selected) insertReference(selected.index)
+      return
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setMentionRange(null)
+    }
+  }
+
+  const isOpen = mentionRange !== null && filteredReferences.length > 0
+  return (
+    <div className={`reference-mention-editor${isOpen ? ' is-open' : ''}${className ? ` ${className}` : ''}`}>
+      <textarea
+        aria-autocomplete="list"
+        aria-expanded={isOpen}
+        aria-label={ariaLabel}
+        onBlur={() => setMentionRange(null)}
+        onChange={(event) => {
+          const nextValue = event.currentTarget.value
+          const caret = event.currentTarget.selectionStart ?? nextValue.length
+          onChange(nextValue)
+          setMentionRange(references.length > 0 ? findReferenceMentionRange(nextValue, caret) : null)
+        }}
+        onKeyDown={onKeyDown}
+        placeholder={placeholder}
+        ref={textareaRef}
+        role="combobox"
+        value={value}
+      />
+      {isOpen && (
+        <div aria-label="可用参考图" className="reference-mention-menu" role="listbox">
+          {filteredReferences.map(({ reference, index, label }, optionIndex) => (
+            <button
+              aria-selected={optionIndex === activeIndex}
+              className={optionIndex === activeIndex ? 'is-active' : ''}
+              key={reference.key}
+              onPointerDown={(event) => {
+                event.preventDefault()
+                insertReference(index)
+              }}
+              role="option"
+              type="button"
+            >
+              {imageUrls[reference.fileName]
+                ? <img alt="" draggable={false} src={imageUrls[reference.fileName]}/>
+                : <span><ImageIcon size={14}/></span>}
+              <span><b>@{label}</b><small>{reference.fileName}</small></span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function useReferenceImageUrls(
+  references: ReadonlyArray<ConnectedReferenceImage>,
+  onLoadImage: (fileName: string) => Promise<string | null>,
+): Readonly<Record<string, string>> {
+  const fileNames = references.map((reference) => reference.fileName)
+  const fileNameSignature = fileNames.join('\u0000')
+  const [imageUrls, setImageUrls] = useState<Readonly<Record<string, string>>>({})
+
+  useEffect(() => {
+    let cancelled = false
+    void Promise.all(fileNames.map(async (fileName) => ({
+      fileName,
+      imageUrl: await onLoadImage(fileName),
+    }))).then((items) => {
+      if (cancelled) return
+      setImageUrls(Object.fromEntries(items.flatMap((item) =>
+        item.imageUrl ? [[item.fileName, item.imageUrl]] : [],
+      )))
+    }).catch(() => {
+      if (!cancelled) setImageUrls({})
+    })
+    return () => { cancelled = true }
+  }, [fileNameSignature, onLoadImage])
+
+  return imageUrls
+}
+
+function ConnectedReferenceStrip({ emptyLabel, mentionHint, note, onLoadImage, onRemove, references }: Readonly<{
+  emptyLabel: string
+  mentionHint: string
+  note?: string
+  onLoadImage: (fileName: string) => Promise<string | null>
+  onRemove: (reference: ConnectedReferenceImage) => void
+  references: ReadonlyArray<ConnectedReferenceImage>
+}>) {
+  const imageUrls = useReferenceImageUrls(references, onLoadImage)
+
+  if (references.length === 0) {
+    return <div className="reference-count"><Images size={13}/><span>{emptyLabel}</span></div>
+  }
+
+  return (
+    <div className="connected-reference-strip">
+      <div className="connected-reference-heading"><Images size={13}/><span>{references.length} 张参考图</span><small>{mentionHint}{note ? ` · ${note}` : ''}</small></div>
+      <div className="connected-reference-list">
+        {references.map((reference, index) => (
+          <div className="connected-reference-item" key={reference.key} title={`在提示词中使用 @参考图${index + 1}`}>
+            {imageUrls[reference.fileName]
+              ? <img alt={`@参考图${index + 1}`} draggable={false} src={imageUrls[reference.fileName]}/>
+              : <span><ImageIcon size={14}/></span>}
+            <b>@参考图{index + 1}</b>
+            <button aria-label={`移除参考图 ${index + 1}`} onClick={() => onRemove(reference)} title="移除参考图" type="button"><X size={11}/></button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelKey, imageModels, isCompositor, node, onGenerate, onLoadImage, onRemoveReference, onUpdate, referenceImages }: Readonly<{
   activeGenerationCount: number
   defaultImageModelKey: string
   imageModels: ReadonlyArray<CanvasImageModelOption>
   isCompositor: boolean
   node: CanvasNodeData
   onGenerate: () => void
+  onLoadImage: (fileName: string) => Promise<string | null>
+  onRemoveReference: (reference: ConnectedReferenceImage) => void
   onUpdate: (patch: Partial<CanvasNodeData>) => void
-  referenceImageCount: number
+  referenceImages: ReadonlyArray<ConnectedReferenceImage>
 }>) {
   const selectedModelKey = node.modelKey ?? defaultImageModelKey
   const selectedModel = imageModels.find((model) => model.key === selectedModelKey)
@@ -2169,15 +2422,25 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
   return (
     <div className="generator-node-body">
       {isCompositor && (
-        <label className="composition-prompt">
-          合成要求
-          <textarea onChange={(event) => onUpdate({ subtitle: event.target.value })} placeholder="例如：保留人物，使用第二张图的场景和光线" value={node.subtitle ?? ''}/>
-        </label>
+        <div className="composition-prompt">
+          <span>合成要求</span>
+          <ReferenceMentionTextarea
+            ariaLabel="图片合成要求"
+            onChange={(value) => onUpdate({ subtitle: value })}
+            onLoadImage={onLoadImage}
+            placeholder="例如：保留 @参考图1 的人物，使用 @参考图2 的场景和光线"
+            references={referenceImages}
+            value={node.subtitle ?? ''}
+          />
+        </div>
       )}
-      <div className={referenceImageCount > 0 ? 'reference-count has-references' : 'reference-count'}>
-        <Images size={13}/>
-        <span>{referenceImageCount > 0 ? `已连接 ${referenceImageCount} 张参考图` : isCompositor ? '请连接至少 2 张图片' : '未连接参考图，将执行文生图'}</span>
-      </div>
+      <ConnectedReferenceStrip
+        emptyLabel={isCompositor ? '请连接至少 2 张图片' : '未连接参考图，将执行文生图'}
+        mentionHint={isCompositor ? '在合成要求中输入 @ 可选择' : '在已连接的提示词中输入 @ 可选择'}
+        onLoadImage={onLoadImage}
+        onRemove={onRemoveReference}
+        references={referenceImages}
+      />
       <label>
         模型
         <select
@@ -2211,20 +2474,22 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
         </label>
         <label>数量<select onChange={(event) => onUpdate({ generationCount: Number(event.target.value) as ImageGenerationCount })} value={node.generationCount ?? 1}><option value="1">1 张</option><option value="2">2 张</option><option value="3">3 张</option><option value="4">4 张</option></select></label>
       </div>
-      <button className="generate-button" disabled={imageModels.length === 0 || (isCompositor && referenceImageCount < 2)} onClick={onGenerate} type="button">
-        {activeGenerationCount > 0 ? <LoaderCircle className="is-spinning" size={14}/> : <Play fill="currentColor" size={14}/>} {activeGenerationCount > 0 ? `继续生成 · ${activeGenerationCount} 进行中` : isCompositor ? '合成图片' : referenceImageCount > 0 ? '参考图生成' : '生成图片'}
+      <button className="generate-button" disabled={imageModels.length === 0 || (isCompositor && (referenceImages.length < 2 || !node.subtitle?.trim()))} onClick={onGenerate} type="button">
+        {activeGenerationCount > 0 ? <LoaderCircle className="is-spinning" size={14}/> : <Play fill="currentColor" size={14}/>} {activeGenerationCount > 0 ? `继续生成 · ${activeGenerationCount} 进行中` : isCompositor ? '合成图片' : referenceImages.length > 0 ? '参考图生成' : '生成图片'}
       </button>
     </div>
   )
 }
 
-function CanvasVideoNode({ defaultVideoModelKey, generationNow, node, onGenerate, onUpdate, referenceImageCount, videoModels, videoPromptOptions }: Readonly<{
+function CanvasVideoNode({ defaultVideoModelKey, generationNow, node, onGenerate, onLoadImage, onRemoveReference, onUpdate, referenceImages, videoModels, videoPromptOptions }: Readonly<{
   defaultVideoModelKey: string
   generationNow: number
   node: CanvasNodeData
   onGenerate: () => void
+  onLoadImage: (fileName: string) => Promise<string | null>
+  onRemoveReference: (reference: ConnectedReferenceImage) => void
   onUpdate: (patch: Partial<CanvasNodeData>) => void
-  referenceImageCount: number
+  referenceImages: ReadonlyArray<ConnectedReferenceImage>
   videoModels: ReadonlyArray<CanvasImageModelOption>
   videoPromptOptions: ReadonlyArray<ConnectedVideoPrompt>
 }>) {
@@ -2262,7 +2527,14 @@ function CanvasVideoNode({ defaultVideoModelKey, generationNow, node, onGenerate
         </select>
       </label>
       {selectedPrompt && <div className="video-prompt-preview">{selectedPrompt.prompt}</div>}
-      <div className={referenceImageCount > 0 ? 'reference-count has-references' : 'reference-count'}><Images size={13}/><span>{referenceImageCount > 0 ? usesOnlyFirstReference && referenceImageCount > 1 ? `${referenceImageCount} 张已连接；Hailuo 使用首张作为首帧` : `${referenceImageCount} 张参考图（生成图或导入图）` : '未连接参考图 · 可连接生成图、导入图或参考图文件夹'}</span></div>
+      <ConnectedReferenceStrip
+        emptyLabel="未连接参考图 · 可连接生成图、导入图或参考图文件夹"
+        mentionHint="在已连接的提示词或分镜中输入 @ 可选择"
+        note={usesOnlyFirstReference && referenceImages.length > 1 ? 'Hailuo 仅使用 @参考图1 作为首帧' : undefined}
+        onLoadImage={onLoadImage}
+        onRemove={onRemoveReference}
+        references={referenceImages}
+      />
       <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value })} value={modelKey}>{!selectedModel && modelKey && <option value={modelKey}>当前视频模型</option>}{videoModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
       <div className="video-fields">
         <label>时长<select onChange={(event) => onUpdate({ videoDuration: Number(event.target.value) })} value={node.videoDuration ?? 5}><option value="5">5 秒</option><option value="6">6 秒</option><option value="10">10 秒</option></select></label>
@@ -2707,16 +2979,61 @@ function findVideoPromptOptions(
   })
 }
 
+function findReferenceMentionRange(value: string, caret: number): ReferenceMentionRange | null {
+  const safeCaret = clamp(caret, 0, value.length)
+  if (safeCaret === 0) return null
+  const start = value.lastIndexOf('@', safeCaret - 1)
+  if (start < 0) return null
+  const query = value.slice(start + 1, safeCaret)
+  if (/\s|@/.test(query)) return null
+  return { start, end: safeCaret, query }
+}
+
+function findMentionReferenceImages(
+  document: CanvasDocument,
+  source: CanvasNodeData,
+): ReadonlyArray<ConnectedReferenceImage> {
+  if (source.type === 'compositor') return findConnectedReferenceImages(document, source)
+  if (source.type !== 'prompt' && source.type !== 'shot-list') return []
+
+  const downstreamIds = new Set(document.connections
+    .filter((connection) => connection.from === source.id)
+    .map((connection) => connection.to))
+  const referenceSets = document.nodes.flatMap((node): ReadonlyArray<ReadonlyArray<ConnectedReferenceImage>> => {
+    if (!downstreamIds.has(node.id) || (node.type !== 'generator' && node.type !== 'video')) return []
+    const references = findConnectedReferenceImages(document, node)
+    return references.length > 0 ? [references] : []
+  })
+  const primaryReferences = referenceSets[0]
+  if (!primaryReferences) return []
+  const primaryFileNames = primaryReferences.map((reference) => reference.fileName)
+  const hasConflictingOrder = referenceSets.slice(1).some((references) =>
+    !sameStringSequence(primaryFileNames, references.map((reference) => reference.fileName)),
+  )
+  return hasConflictingOrder ? [] : primaryReferences
+}
+
 function findReferenceImageFileNames(
   document: CanvasDocument,
   source: CanvasNodeData,
 ): ReadonlyArray<string> {
+  return findConnectedReferenceImages(document, source).map((reference) => reference.fileName)
+}
+
+function findConnectedReferenceImages(
+  document: CanvasDocument,
+  source: CanvasNodeData,
+): ReadonlyArray<ConnectedReferenceImage> {
   const connectedImageIds = new Set(document.connections
     .filter((connection) => connection.to === source.id)
     .map((connection) => connection.from))
-  const referenceFileNames = document.nodes.flatMap((node): ReadonlyArray<string> => {
+  const references = document.nodes.flatMap((node): ReadonlyArray<ConnectedReferenceImage> => {
     if (!connectedImageIds.has(node.id)) return []
-    if (node.type === 'image') return node.imageFileName ? [node.imageFileName] : []
+    if (node.type === 'image') {
+      return node.imageFileName
+        ? [{ key: `${node.id}:${node.imageFileName}`, fileName: node.imageFileName, sourceNodeId: node.id }]
+        : []
+    }
     if (node.type !== 'reference-folder') return []
     const connectedFolderImageIds = new Set(document.connections
       .filter((connection) => connection.to === node.id)
@@ -2726,10 +3043,87 @@ function findReferenceImageFileNames(
         ? [candidate.imageFileName]
         : [],
     )
-    return [...(node.imageFileNames ?? []), ...connectedFileNames]
+    return [...(node.imageFileNames ?? []), ...connectedFileNames].map((fileName) => ({
+      key: `${node.id}:${fileName}`,
+      fileName,
+      sourceNodeId: node.id,
+    }))
   })
-  return [...new Set(referenceFileNames)]
-    .slice(0, 16)
+  const uniqueReferences = new Map<string, ConnectedReferenceImage>()
+  for (const reference of references) {
+    if (!uniqueReferences.has(reference.fileName)) uniqueReferences.set(reference.fileName, reference)
+  }
+  return [...uniqueReferences.values()].slice(0, 16)
+}
+
+function reconcileReferenceMentions(
+  previous: CanvasDocument,
+  next: CanvasDocument,
+): CanvasDocument {
+  let nodes = next.nodes
+  let changed = false
+  for (const target of next.nodes) {
+    if (target.type !== 'generator' && target.type !== 'compositor' && target.type !== 'video') continue
+    const previousTarget = previous.nodes.find((node) => node.id === target.id)
+    const previousFileNames = previousTarget
+      ? findReferenceImageFileNames(previous, previousTarget)
+      : []
+    const nextFileNames = findReferenceImageFileNames(next, target)
+    if (sameStringSequence(previousFileNames, nextFileNames)) continue
+
+    const promptSourceIds = new Set(next.connections
+      .filter((connection) => connection.to === target.id)
+      .map((connection) => connection.from))
+    nodes = nodes.map((node) => {
+      if (node.id === target.id && node.type === 'compositor') {
+        const subtitle = remapReferenceMentions(node.subtitle ?? '', previousFileNames, nextFileNames)
+        if (subtitle !== (node.subtitle ?? '')) {
+          changed = true
+          return { ...node, subtitle }
+        }
+      }
+      if (!promptSourceIds.has(node.id)) return node
+      if (node.type === 'prompt') {
+        const subtitle = remapReferenceMentions(node.subtitle ?? '', previousFileNames, nextFileNames)
+        if (subtitle !== (node.subtitle ?? '')) {
+          changed = true
+          return { ...node, subtitle }
+        }
+      }
+      if (node.type === 'shot-list') {
+        const storyboardShots = (node.storyboardShots ?? []).map((shot) => ({
+          ...shot,
+          prompt: remapReferenceMentions(shot.prompt, previousFileNames, nextFileNames),
+        }))
+        if (storyboardShots.some((shot, index) => shot.prompt !== node.storyboardShots?.[index]?.prompt)) {
+          changed = true
+          return { ...node, storyboardShots }
+        }
+      }
+      return node
+    })
+  }
+  return changed ? { ...next, nodes } : next
+}
+
+function remapReferenceMentions(
+  prompt: string,
+  previousFileNames: ReadonlyArray<string>,
+  nextFileNames: ReadonlyArray<string>,
+): string {
+  return prompt.replace(/@参考图\s*(\d+)/g, (mention, rawIndex: string) => {
+    const previousFileName = previousFileNames[Number(rawIndex) - 1]
+    if (!previousFileName) return mention
+    const nextIndex = nextFileNames.indexOf(previousFileName)
+    return nextIndex >= 0 ? `@参考图${nextIndex + 1}` : ''
+  }).replace(/[ \t]{2,}/g, ' ')
+}
+
+function sameStringSequence(
+  left: ReadonlyArray<string>,
+  right: ReadonlyArray<string>,
+): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function isQueuedGenerationTask(document: CanvasDocument, task: PendingGenerationTask): boolean {

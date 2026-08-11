@@ -1,4 +1,5 @@
 import {
+  AlertCircle,
   Check,
   Database,
   ExternalLink,
@@ -8,10 +9,12 @@ import {
   Monitor,
   Moon,
   Palette,
+  RefreshCw,
   Sun,
 } from 'lucide-react'
 import type {
   AppSettings,
+  AppUpdateCheck,
   StorageCategory,
   StorageStats,
   ThemeMode,
@@ -21,10 +24,15 @@ type SystemSettingsPageProps = Readonly<{
   settings: AppSettings
   stats: StorageStats
   changingDirectory: boolean
+  updateCheck: AppUpdateCheck | null
+  updateChecking: boolean
+  updateError: string | null
   onAccentChange: (color: string) => void
   onThemeChange: (theme: ThemeMode) => void
   onChooseDirectory: () => void
   onOpenDirectory: () => void
+  onCheckForUpdates: () => void
+  onOpenLatestRelease: () => void
 }>
 
 const accentColors = ['#7c5cff', '#ff5f77', '#ff9f1c', '#23c8ff', '#aaff00']
@@ -44,7 +52,20 @@ const storageCategories: ReadonlyArray<Readonly<{
   { id: 'other', label: '其他', color: '#d5d8db' },
 ]
 
-export function SystemSettingsPage({ settings, stats, changingDirectory, onAccentChange, onThemeChange, onChooseDirectory, onOpenDirectory }: SystemSettingsPageProps) {
+export function SystemSettingsPage({
+  settings,
+  stats,
+  changingDirectory,
+  updateCheck,
+  updateChecking,
+  updateError,
+  onAccentChange,
+  onThemeChange,
+  onChooseDirectory,
+  onOpenDirectory,
+  onCheckForUpdates,
+  onOpenLatestRelease,
+}: SystemSettingsPageProps) {
   const total = Math.max(stats.totalBytes, 1)
   const projectPercent = Math.min(100, (stats.categories.projects.bytes / total) * 100)
   const libraryPercent = Math.min(100 - projectPercent, (stats.categories.library.bytes / total) * 100)
@@ -77,13 +98,41 @@ export function SystemSettingsPage({ settings, stats, changingDirectory, onAccen
         </section>
 
         <section className="settings-panel about-panel">
-          <div className="about-logo">DC</div><div className="about-copy"><h2>Draw Canvas</h2><p>Version 1.0.0 · Electron Desktop</p></div><span className="up-to-date"><Check size={13}/> 已是最新版本</span>
+          <div className="about-logo">DC</div>
+          <div className="about-copy"><h2>Draw Canvas</h2><p>Version {__APP_VERSION__} · Electron Desktop</p></div>
+          <div className="update-settings-actions">
+            <UpdateStatus error={updateError} update={updateCheck}/>
+            {updateCheck?.status === 'available' && (
+              <button className="update-release-button" onClick={onOpenLatestRelease} type="button">
+                查看 {updateCheck.latestTag} <ExternalLink size={12}/>
+              </button>
+            )}
+            <button className="update-check-button" disabled={updateChecking} onClick={onCheckForUpdates} type="button">
+              <RefreshCw className={updateChecking ? 'spin' : undefined} size={12}/>
+              {updateChecking ? '检查中…' : '检查更新'}
+            </button>
+          </div>
           <div className="about-links"><button type="button">使用文档 <ExternalLink size={13}/></button><button type="button">隐私政策 <ExternalLink size={13}/></button><button type="button">开源许可 <ExternalLink size={13}/></button></div>
           <div className="about-footnote"><Info size={14}/> 所有项目数据默认保存在本机，你可以随时更改数据目录。</div>
         </section>
       </div>
     </div>
   )
+}
+
+function UpdateStatus({
+  error,
+  update,
+}: Readonly<{ error: string | null; update: AppUpdateCheck | null }>) {
+  if (error) return <span className="update-status is-error" title={error}><AlertCircle size={13}/> 检查失败</span>
+  if (!update) return <span className="update-status">尚未检查</span>
+  if (update.status === 'available') {
+    return <span className="update-status is-available">发现 {update.latestTag}</span>
+  }
+  if (update.status === 'not-published') {
+    return <span className="update-status">GitHub 暂无正式版</span>
+  }
+  return <span className="update-status is-current"><Check size={13}/> 已是最新版本</span>
 }
 
 function formatBytes(bytes: number): string {

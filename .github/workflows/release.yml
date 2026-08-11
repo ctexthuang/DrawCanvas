@@ -1,0 +1,193 @@
+name: Release desktop installers
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.blockExoticSubdeps=false
+
+      - name: Sync package version from tag
+        run: node .github/scripts/set-release-version.mjs "${{ github.ref_name }}"
+
+      - name: Build application
+        run: pnpm build
+
+      - name: Make macOS installer
+        run: pnpm exec electron-forge make --arch=${{ matrix.arch }}
+
+      - name: Verify macOS application and distributables
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="dist/Draw Canvas-darwin-${{ matrix.arch }}/Draw Canvas.app"
+          dmg_path="$(find dist/make -type f -name '*.dmg' -print -quit)"
+          zip_path="$(find dist/make -type f -name '*.zip' -print -quit)"
+
+          if [[ -z "$dmg_path" || -z "$zip_path" ]]; then
+            echo '没有找到待验证的 macOS DMG 或 ZIP' >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign --display --verbose=4 "$app_path"
+          hdiutil verify "$dmg_path"
+
+          extracted_directory="$(mktemp -d "${RUNNER_TEMP}/drawcanvas-zip.XXXXXX")"
+          trap 'rm -rf "$extracted_directory"' EXIT
+          ditto -x -k "$zip_path" "$extracted_directory"
+          extracted_app="$(find "$extracted_directory" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$extracted_app" ]]; then
+            echo 'ZIP 中没有找到 macOS 应用' >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$extracted_app"
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-macos-${{ matrix.arch }}
+          path: |
+            dist/make/**/*.dmg
+            dist/make/**/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2022
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.blockExoticSubdeps=false
+
+      - name: Sync package version from tag
+        run: node .github/scripts/set-release-version.mjs "${{ github.ref_name }}"
+
+      - name: Build application
+        run: pnpm build
+
+      - name: Make Windows installer
+        run: pnpm exec electron-forge make --arch=x64
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-windows-x64
+          path: |
+            dist/make/**/*.exe
+            dist/make/**/*.nupkg
+            dist/make/**/RELEASES
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tag and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: node .github/scripts/generate-release-checksums.mjs release-assets
+
+      - name: Generate incremental release notes
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_RELEASE_NOTES_MODEL: ${{ vars.OPENAI_RELEASE_NOTES_MODEL }}
+        run: node .github/scripts/generate-release-notes.mjs
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.nupkg' -o -name 'RELEASES' -o -name 'SHA256SUMS.txt' \) -print0)
+          if (( ${#assets[@]} == 0 )); then
+            echo '没有找到可发布的安装包' >&2
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" --title "Draw Canvas $TAG_NAME" --notes-file release-notes.md
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          else
+            prerelease=()
+            if [[ "$TAG_NAME" == *-* ]]; then
+              prerelease+=(--prerelease)
+            fi
+            gh release create "$TAG_NAME" "${assets[@]}" --verify-tag --title "Draw Canvas $TAG_NAME" --notes-file release-notes.md "${prerelease[@]}"
+          fi

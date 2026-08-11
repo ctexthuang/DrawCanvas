@@ -24,6 +24,11 @@ export type DesktopErrorCode =
   | 'PROVIDER_RATE_LIMIT'
   | 'PROVIDER_REMOTE'
   | 'PROVIDER_INVALID_RESPONSE'
+  | 'UPDATE_NETWORK'
+  | 'UPDATE_TIMEOUT'
+  | 'UPDATE_RATE_LIMIT'
+  | 'UPDATE_REMOTE'
+  | 'UPDATE_INVALID_RESPONSE'
   | 'UNSUPPORTED_PROVIDER'
 
 export type DesktopError = Readonly<{
@@ -64,6 +69,28 @@ export type UpdateSettingsRequest = Readonly<{
   enabledModelKeys?: ReadonlyArray<string>
   defaultModelKeys?: Readonly<Partial<Record<ModelKind, string>>>
 }>
+
+export type CheckForUpdatesRequest = Readonly<{
+  force: boolean
+}>
+
+type AppUpdateRelease = Readonly<{
+  currentVersion: string
+  latestVersion: string
+  latestTag: string
+  releaseName: string
+  publishedAt?: string
+  checkedAt: string
+}>
+
+export type AppUpdateCheck =
+  | Readonly<AppUpdateRelease & { status: 'available' }>
+  | Readonly<AppUpdateRelease & { status: 'up-to-date' }>
+  | Readonly<{
+      status: 'not-published'
+      currentVersion: string
+      checkedAt: string
+    }>
 
 export type SaveProviderRequest = Readonly<{
   id: string
@@ -445,6 +472,10 @@ export type DesktopApi = Readonly<{
   settings: Readonly<{
     load: () => Promise<DesktopResult<AppSettings>>
     update: (request: UpdateSettingsRequest) => Promise<DesktopResult<AppSettings>>
+  }>
+  updates: Readonly<{
+    check: (request: CheckForUpdatesRequest) => Promise<DesktopResult<AppUpdateCheck>>
+    openLatestRelease: () => Promise<DesktopResult<null>>
   }>
   models: Readonly<{
     saveProvider: (request: SaveProviderRequest) => Promise<DesktopResult<ProviderConfig>>
