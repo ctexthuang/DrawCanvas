@@ -1,4 +1,4 @@
 interface:
   display_name: "drawCanvas Electron 规范"
-  short_description: "drawCanvas 项目专属的 Electron 架构、分层与编码规范"
-  default_prompt: "使用 $drawcanvas-electron-standards 按本项目规范实现或审查这项 Electron 代码变更。"
+  short_description: "drawCanvas 的 Electron 架构、编码与依赖版本安全规范"
+  default_prompt: "使用 $drawcanvas-electron-standards 按本项目的架构、编码和安全版本规范实现或审查这项 Electron 代码变更。"
