@@ -79,17 +79,6 @@ const config = {
       platforms: ['darwin'],
     },
     {
-      name: '@electron-forge/maker-squirrel',
-      platforms: ['win32'],
-      config: {
-        name: 'DrawCanvas',
-        authors: packageMetadata.author,
-        description: packageMetadata.description,
-        setupIcon: `${appIconPath}.ico`,
-        setupExe: `Draw-Canvas-${packageMetadata.version}-x64-Setup.exe`,
-      },
-    },
-    {
       name: '@electron-forge/maker-wix',
       platforms: ['win32'],
       config: {

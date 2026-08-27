@@ -112,14 +112,6 @@ const updateCheckService = new UpdateCheckService()
 let mainWindow: BrowserWindow | null = null
 const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1'
 const DEVELOPMENT_APP_ICON_PATH = join(__dirname, '../../assets/icons/app-icon.png')
-const SQUIRREL_STARTUP_ARGUMENTS = new Set([
-  '--squirrel-install',
-  '--squirrel-updated',
-  '--squirrel-uninstall',
-  '--squirrel-obsolete',
-])
-const isSquirrelStartup = process.platform === 'win32' &&
-  process.argv.some((argument) => SQUIRREL_STARTUP_ARGUMENTS.has(argument))
 protocol.registerSchemesAsPrivileged([{
   scheme: 'drawcanvas-media',
   privileges: {
@@ -131,7 +123,7 @@ protocol.registerSchemesAsPrivileged([{
 }])
 
 if (process.platform === 'win32') {
-  app.setAppUserModelId('com.squirrel.DrawCanvas.DrawCanvas')
+  app.setAppUserModelId('com.ctexthuang.drawcanvas')
 }
 
 function success<T>(value: T): DesktopResult<T> {
@@ -1470,10 +1462,7 @@ async function registerMediaProtocol(): Promise<void> {
   })
 }
 
-if (isSquirrelStartup) app.quit()
-
 app.whenReady().then(async () => {
-  if (isSquirrelStartup) return
   if (!app.isPackaged && process.platform === 'darwin' && app.dock) {
     app.dock.setIcon(DEVELOPMENT_APP_ICON_PATH)
   }

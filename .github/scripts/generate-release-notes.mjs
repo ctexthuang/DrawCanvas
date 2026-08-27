@@ -201,7 +201,7 @@ lines.push(
   '',
   '- macOS Apple Silicon（M 系列，arm64）：DMG / ZIP',
   '- macOS Intel（x64）：DMG / ZIP',
-  '- Windows（x64）：Squirrel 安装程序',
+  '- Windows（x64）：可选择安装目录的 NSIS EXE，以及适合企业部署的 WiX MSI',
   '- `SHA256SUMS.txt`：全部发布文件的 SHA-256 校验值',
   '',
   '> macOS 应用使用经过构建验证的 ad-hoc 签名，但尚未配置 Apple Developer ID 与公证；Windows 安装包也尚未配置代码签名证书，因此系统可能显示安全提醒。',

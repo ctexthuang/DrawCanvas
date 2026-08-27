@@ -140,23 +140,37 @@ jobs:
       - name: Build application
         run: pnpm build
 
-      - name: Make Windows installer
+      - name: Make Windows MSI
         run: pnpm exec electron-forge make --arch=x64
+
+      - name: Make Windows NSIS EXE
+        run: pnpm exec electron-builder --win nsis --x64
 
       - name: Verify Windows installers
         shell: pwsh
         run: |
-          $setup = Get-ChildItem -Path dist/make -Recurse -File -Filter '*-Setup.exe' | Select-Object -First 1
+          $package = Get-Content -Path package.json -Raw | ConvertFrom-Json
+          if ($package.build.nsis.oneClick -ne $false) {
+            throw 'NSIS 必须使用可交互的辅助安装模式'
+          }
+          if ($package.build.nsis.allowToChangeInstallationDirectory -ne $true) {
+            throw 'NSIS 未启用安装目录选择'
+          }
+          if (-not (Test-Path -LiteralPath $package.build.nsis.include -PathType Leaf)) {
+            throw '没有找到 NSIS 数据目录保护脚本'
+          }
+
+          $setup = Get-ChildItem -Path dist/make/nsis -File -Filter '*-Setup.exe' | Select-Object -First 1
           $msi = Get-ChildItem -Path dist/make -Recurse -File -Filter '*.msi' | Select-Object -First 1
 
           if ($null -eq $setup) {
-            throw '没有找到 Squirrel EXE 安装程序'
+            throw '没有找到可选择安装目录的 NSIS EXE 安装程序'
           }
           if ($null -eq $msi) {
             throw '没有找到可选择安装目录的 WiX MSI 安装程序'
           }
 
-          Write-Host "Squirrel installer: $($setup.FullName)"
+          Write-Host "NSIS installer: $($setup.FullName)"
           Write-Host "WiX installer: $($msi.FullName)"
 
       - name: Upload Windows package
@@ -164,10 +178,8 @@ jobs:
         with:
           name: package-windows-x64
           path: |
-            dist/make/**/*.exe
+            dist/make/nsis/*-Setup.exe
             dist/make/**/*.msi
-            dist/make/**/*.nupkg
-            dist/make/**/RELEASES
           if-no-files-found: error
           retention-days: 7
 
@@ -213,7 +225,7 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
-          mapfile -d '' assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' -o -name '*.nupkg' -o -name 'RELEASES' -o -name 'SHA256SUMS.txt' \) -print0)
+          mapfile -d '' assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' -o -name 'SHA256SUMS.txt' \) -print0)
           if (( ${#assets[@]} == 0 )); then
             echo '没有找到可发布的安装包' >&2
             exit 1
