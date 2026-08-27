@@ -14,7 +14,6 @@ import type {
   GeneratedAudioAsset,
   GeneratedVideoAsset,
   OptimizePromptRequest,
-  ProviderConfig,
   ProviderConnectionTestResult,
   RecentCanvasProject,
   ResourceCatalog,
@@ -31,15 +30,10 @@ import {
   recoverInterruptedGenerationTasks,
 } from '../shared/domain/canvas-document'
 import {
-  BUILTIN_PROVIDER_MODELS,
-  createConfiguredModel,
   createProviderModelKey,
-  DEFAULT_CHAT_MODEL_KEY,
-  DEFAULT_IMAGE_MODEL_KEY,
   primaryModelKey,
   type ModelKind,
   type ModelRoutes,
-  type ProviderAdapterId,
 } from '../shared/domain/models'
 import { AppShell, type AppPage } from './components/AppShell'
 import {
@@ -61,44 +55,14 @@ import { SystemSettingsPage } from './features/settings/SystemSettingsPage'
 import { UpdateDialog } from './features/settings/UpdateDialog'
 import { artworks as seedArtworks, prompts as seedPrompts, workflows as seedWorkflows } from './domain/catalog'
 
-const fallbackProviders: ReadonlyArray<ProviderConfig> = [
-  createFallbackProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
-  createFallbackProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
-  createFallbackProvider('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', true),
-  createFallbackProvider('openai-sub2api', 'OpenAI 中转', 'openai-sub2api', 'https://relay.example.com/v1', false),
-]
-
-function createFallbackProvider(id: string, name: string, adapterId: ProviderAdapterId, baseUrl: string, enabled: boolean): ProviderConfig {
-  return {
-    id,
-    name,
-    adapterId,
-    baseUrl,
-    enabled,
-    hasApiKey: false,
-    connectionStatus: 'untested',
-    modelCount: BUILTIN_PROVIDER_MODELS.filter((model) => model.providerId === id).length,
-  }
-}
-
-const fallbackModels = BUILTIN_PROVIDER_MODELS
-  .filter((model) => fallbackProviders.some((provider) => provider.id === model.providerId))
-  .map((model) => ({
-    ...createConfiguredModel(model),
-    enabled: model.key === DEFAULT_IMAGE_MODEL_KEY || model.key === DEFAULT_CHAT_MODEL_KEY,
-  }))
-
 const fallbackSettings: AppSettings = {
   theme: 'light',
   accentColor: '#ff5f77',
   storageDirectory: 'Draw Canvas Data',
   favoriteImageIds: [],
-  models: fallbackModels,
-  modelRoutes: {
-    image: { modelKeys: [DEFAULT_IMAGE_MODEL_KEY] },
-    chat: { modelKeys: [DEFAULT_CHAT_MODEL_KEY] },
-  },
-  providers: fallbackProviders,
+  models: [],
+  modelRoutes: {},
+  providers: [],
 }
 
 const fallbackStats: StorageStats = {

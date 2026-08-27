@@ -39,8 +39,6 @@ import {
   BUILTIN_PROVIDER_MODELS,
   createConfiguredModel,
   createProviderModelKey,
-  DEFAULT_CHAT_MODEL_KEY,
-  DEFAULT_IMAGE_MODEL_KEY,
   findBuiltinModelByKey,
   findBuiltinModelsByRemoteId,
   inferModelKind,
@@ -159,7 +157,7 @@ type StoredModelConfigDocument = Readonly<{
 }>
 
 type ModelConfigDocument = Readonly<{
-  schemaVersion: 6
+  schemaVersion: 7
   providers: ReadonlyArray<StoredProvider>
   models: ReadonlyArray<ConfiguredProviderModel>
   modelRoutes: ModelRoutes
@@ -176,23 +174,16 @@ type StoredRecentProjectsDocument = Readonly<{
 }>
 
 const DEFAULT_ACCENT = '#ff5f77'
-const LEGACY_DEFAULT_MODELS = [
-  'doubao-seedream-5-0-pro',
-  'gemini-2.5-flash-image-preview-official',
-  'gemini-3-pro-image-preview-official',
-  'gpt-image-2',
+const LEGACY_PROVIDER_DEFAULTS: ReadonlyArray<StoredProvider> = [
+  createLegacyProvider('apimart', 'APIMart', 'openai-sub2api', 'https://api.apimart.ai/v1', false),
+  createLegacyProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
+  createLegacyProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
+  createLegacyProvider('comfly', 'Comfly', 'openai-sub2api', 'https://api.comfly.chat/v1', false),
+  createLegacyProvider('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', true),
+  createLegacyProvider('openai-sub2api', 'OpenAI 中转', 'openai-sub2api', '', false),
 ]
 
-function defaultProviders(): ReadonlyArray<StoredProvider> {
-  return [
-    createDefaultProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
-    createDefaultProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
-    createDefaultProvider('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', true),
-    createDefaultProvider('openai-sub2api', 'OpenAI 中转', 'openai-sub2api', '', false),
-  ]
-}
-
-function createDefaultProvider(
+function createLegacyProvider(
   id: string,
   name: string,
   adapterId: ProviderAdapterId,
@@ -1341,9 +1332,11 @@ export class AppState {
     const preferences = this.normalizePreferences(importedPreferences)
     const modelConfig = this.normalizeModelConfig(
       storedModelConfig ?? legacyModelConfig ?? {
-        schemaVersion: 1,
-        selectedModelIds: importedPreferences?.selectedModelIds ?? LEGACY_DEFAULT_MODELS,
-        providers: importedPreferences?.providers ?? defaultProviders(),
+        schemaVersion: importedPreferences?.providers ? 0 : 7,
+        selectedModelIds: importedPreferences?.selectedModelIds ?? [],
+        providers: importedPreferences?.providers ?? [],
+        models: [],
+        modelRoutes: {},
       },
     )
 
@@ -1526,11 +1519,26 @@ export class AppState {
     const storedProviders = Array.isArray(value?.providers) ? value.providers : []
     const legacyOpenAiProvider = storedProviders.find((provider) => provider?.id === 'openai-relay')
     const legacyOpenAiTarget = getLegacyOpenAiTarget(legacyOpenAiProvider)
-    if ((value?.schemaVersion ?? 0) >= 6) {
+    if ((value?.schemaVersion ?? 0) >= 7) {
       const providers = normalizeStoredProviders(storedProviders)
       const models = normalizeConfiguredModels(value?.models, providers)
       return {
-        schemaVersion: 6,
+        schemaVersion: 7,
+        providers,
+        models,
+        modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
+      }
+    }
+
+    if ((value?.schemaVersion ?? 0) === 6) {
+      const normalizedProviders = normalizeStoredProviders(storedProviders)
+      const retainedModels = migrateVersion6Models(value?.models, normalizedProviders)
+      const providers = normalizedProviders.filter((provider) =>
+        shouldRetainSeededProvider(provider, retainedModels))
+      const providerIds = new Set(providers.map((provider) => provider.id))
+      const models = retainedModels.filter((model) => providerIds.has(model.providerId))
+      return {
+        schemaVersion: 7,
         providers,
         models,
         modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
@@ -1540,38 +1548,21 @@ export class AppState {
     const providers = migrateLegacyProviders(storedProviders, legacyOpenAiProvider, legacyOpenAiTarget)
     const storedEnabledModelKeys = (value?.schemaVersion ?? 0) >= 2
       ? validModelKeys(value?.enabledModelKeys ?? [], legacyOpenAiTarget)
-      : migrateLegacyModelIds(value?.selectedModelIds ?? LEGACY_DEFAULT_MODELS, legacyOpenAiTarget)
-    const migratedDefaultChatKey = migrateModelKey('openai-relay:gpt-5.6-sol', legacyOpenAiTarget) ?? DEFAULT_CHAT_MODEL_KEY
-    const migratedDefaultImageKey = migrateModelKey('openai-relay:gpt-image-2', legacyOpenAiTarget) ?? DEFAULT_IMAGE_MODEL_KEY
-    const enabledModelKeys = (value?.schemaVersion ?? 0) < 3 && !storedEnabledModelKeys.includes(migratedDefaultChatKey)
-      ? [...storedEnabledModelKeys, migratedDefaultChatKey]
-      : storedEnabledModelKeys
+      : migrateLegacyModelIds(value?.selectedModelIds ?? [], legacyOpenAiTarget)
+    const enabledModelKeys = storedEnabledModelKeys
     const storedDefaultModelKeys = (value?.schemaVersion ?? 0) >= 2
       ? value?.defaultModelKeys
-      : { image: migratedDefaultImageKey }
+      : undefined
     const defaultModelKeys = normalizeDefaultModelKeys(
-      (value?.schemaVersion ?? 0) < 3
-        ? { ...storedDefaultModelKeys, chat: migratedDefaultChatKey }
-        : storedDefaultModelKeys,
+      storedDefaultModelKeys,
       enabledModelKeys,
       legacyOpenAiTarget,
     )
-    const providerIds = new Set(providers.map((provider) => provider.id))
-    const builtinModels = BUILTIN_PROVIDER_MODELS
-      .filter((model) => providerIds.has(model.providerId))
-      .map((model): ConfiguredProviderModel => ({
-        ...createConfiguredModel(model),
-        enabled: enabledModelKeys.includes(model.key),
-      }))
-    const builtinKeys = new Set(builtinModels.map((model) => model.key))
-    const discoveredModels = providers.flatMap((provider) =>
+    const models = providers.flatMap((provider) =>
       uniqueStrings(provider.availableModelIds ?? [], 500).flatMap((remoteModelId) => {
         const key = createProviderModelKey(provider.id, remoteModelId)
-        return builtinKeys.has(key)
-          ? []
-          : [{ ...createDiscoveredModel(provider, remoteModelId), enabled: enabledModelKeys.includes(key) }]
+        return [{ ...createDiscoveredModel(provider, remoteModelId), enabled: enabledModelKeys.includes(key) }]
       }))
-    const models = [...builtinModels, ...discoveredModels]
     const legacyRoutes: ModelRoutes = Object.fromEntries(
       (['image', 'video', 'chat', 'audio'] as const).flatMap((kind) => {
         const key = defaultModelKeys[kind]
@@ -1579,7 +1570,7 @@ export class AppState {
       }),
     )
     return {
-      schemaVersion: 6,
+      schemaVersion: 7,
       providers: providers.map(({ availableModelIds: _availableModelIds, ...provider }) => provider),
       models,
       modelRoutes: normalizeModelRoutes(legacyRoutes, models),
@@ -1832,58 +1823,96 @@ function migrateLegacyProviders(
   legacyOpenAiProvider: StoredProvider | undefined,
   legacyOpenAiTarget: 'openai' | 'openai-sub2api',
 ): ReadonlyArray<StoredProvider> {
-  const migratedDefaults = defaultProviders().map((fallback) => {
-    const stored = storedProviders.find((provider) => provider?.id === fallback.id) ?? (
-      fallback.id === legacyOpenAiTarget ? legacyOpenAiProvider : undefined
-    )
-    if (!stored) return fallback
-    const shouldMigrateMiniMaxGlobalEndpoint =
-      fallback.id === 'minimax' &&
-      stored.baseUrl === 'https://api.minimax.io/v1' &&
-      !stored.encryptedApiKey
-    return {
-      id: fallback.id,
-      name: fallback.name ?? legacyProviderName(fallback.id),
-      adapterId: fallback.adapterId ?? legacyProviderAdapter(fallback.id),
-      baseUrl: fallback.id === 'openai'
-        ? fallback.baseUrl
-        : typeof stored.baseUrl === 'string' && stored.baseUrl && !shouldMigrateMiniMaxGlobalEndpoint
+  const migrated = new Map<string, StoredProvider>()
+  for (const stored of storedProviders.filter((provider) => provider?.id !== 'openai-relay')) {
+    const provider = migrateLegacyProvider(stored, stored.id)
+    if (provider) migrated.set(provider.id, provider)
+  }
+  if (legacyOpenAiProvider && !migrated.has(legacyOpenAiTarget)) {
+    const provider = migrateLegacyProvider(legacyOpenAiProvider, legacyOpenAiTarget)
+    if (provider) migrated.set(provider.id, provider)
+  }
+  return [...migrated.values()].slice(0, 50)
+}
+
+function migrateLegacyProvider(stored: StoredProvider, targetId: string): StoredProvider | null {
+  if (!isBoundedString(stored?.id, 128) || !isBoundedString(targetId, 128)) return null
+  const fallback = legacyProviderDefault(targetId)
+  if (!shouldRetainLegacyProvider(stored, fallback)) return null
+  const shouldMigrateMiniMaxGlobalEndpoint =
+    targetId === 'minimax' &&
+    stored.baseUrl === 'https://api.minimax.io/v1' &&
+    !stored.encryptedApiKey
+  return {
+    id: targetId,
+    name: fallback?.name ?? legacyProviderName(targetId),
+    adapterId: fallback?.adapterId ?? legacyProviderAdapter(targetId),
+    baseUrl: targetId === 'openai'
+      ? 'https://api.openai.com/v1'
+      : shouldMigrateMiniMaxGlobalEndpoint
+        ? 'https://api.minimaxi.com/v1'
+        : typeof stored.baseUrl === 'string' && stored.baseUrl.length <= 2_000
           ? stored.baseUrl
-          : fallback.baseUrl,
-      enabled: typeof stored.enabled === 'boolean' ? stored.enabled : fallback.enabled,
-      ...(typeof stored.encryptedApiKey === 'string' && stored.encryptedApiKey
-        ? { encryptedApiKey: stored.encryptedApiKey }
-        : {}),
-      connectionStatus: isConnectionStatus(stored.connectionStatus) ? stored.connectionStatus : 'untested',
-      ...(typeof stored.lastTestedAt === 'string' && stored.lastTestedAt
-        ? { lastTestedAt: stored.lastTestedAt }
-        : {}),
-      availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
-    }
+          : fallback?.baseUrl ?? '',
+    enabled: stored.enabled === true,
+    ...(isBoundedString(stored.encryptedApiKey, 20_000) ? { encryptedApiKey: stored.encryptedApiKey } : {}),
+    connectionStatus: isConnectionStatus(stored.connectionStatus) ? stored.connectionStatus : 'untested',
+    ...(isBoundedString(stored.lastTestedAt, 100) ? { lastTestedAt: stored.lastTestedAt } : {}),
+    availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
+  }
+}
+
+function shouldRetainLegacyProvider(
+  provider: StoredProvider,
+  fallback: StoredProvider | undefined,
+): boolean {
+  if (!fallback) return true
+  return Boolean(
+    provider.encryptedApiKey ||
+    provider.lastTestedAt ||
+    provider.lastSyncedAt ||
+    provider.connectionStatus === 'connected' ||
+    provider.connectionStatus === 'failed' ||
+    provider.availableModelIds?.length ||
+    (provider.baseUrl && provider.baseUrl !== fallback.baseUrl),
+  )
+}
+
+function shouldRetainSeededProvider(
+  provider: StoredProvider,
+  models: ReadonlyArray<ConfiguredProviderModel>,
+): boolean {
+  const fallback = legacyProviderDefault(provider.id)
+  if (!fallback) return true
+  return Boolean(
+    provider.encryptedApiKey ||
+    provider.lastTestedAt ||
+    provider.lastSyncedAt ||
+    provider.connectionStatus === 'connected' ||
+    provider.connectionStatus === 'failed' ||
+    models.some((model) => model.providerId === provider.id) ||
+    provider.name !== fallback.name ||
+    provider.adapterId !== fallback.adapterId ||
+    (provider.baseUrl && provider.baseUrl !== fallback.baseUrl),
+  )
+}
+
+function migrateVersion6Models(
+  value: ReadonlyArray<ConfiguredProviderModel> | undefined,
+  providers: ReadonlyArray<StoredProvider>,
+): ReadonlyArray<ConfiguredProviderModel> {
+  const syncedProviderIds = new Set(
+    providers.filter((provider) => provider.lastSyncedAt).map((provider) => provider.id),
+  )
+  return normalizeConfiguredModels(value, providers).flatMap((model) => {
+    if (model.source !== 'builtin') return [model]
+    if (!model.available || !syncedProviderIds.has(model.providerId)) return []
+    return [{ ...model, source: 'discovered' as const }]
   })
-  const defaultIds = new Set(migratedDefaults.map((provider) => provider.id))
-  const migratedLegacyServices = storedProviders.flatMap((stored): ReadonlyArray<StoredProvider> => {
-    if (
-      !isBoundedString(stored?.id, 128) ||
-      stored.id === 'openai-relay' ||
-      defaultIds.has(stored.id) ||
-      typeof stored.baseUrl !== 'string' ||
-      !stored.baseUrl ||
-      stored.baseUrl.length > 2_000
-    ) return []
-    return [{
-      id: stored.id,
-      name: legacyProviderName(stored.id),
-      adapterId: legacyProviderAdapter(stored.id),
-      baseUrl: stored.baseUrl,
-      enabled: stored.enabled === true,
-      ...(isBoundedString(stored.encryptedApiKey, 20_000) ? { encryptedApiKey: stored.encryptedApiKey } : {}),
-      connectionStatus: isConnectionStatus(stored.connectionStatus) ? stored.connectionStatus : 'untested',
-      ...(isBoundedString(stored.lastTestedAt, 100) ? { lastTestedAt: stored.lastTestedAt } : {}),
-      availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
-    }]
-  })
-  return [...migratedDefaults, ...migratedLegacyServices].slice(0, 50)
+}
+
+function legacyProviderDefault(id: string): StoredProvider | undefined {
+  return LEGACY_PROVIDER_DEFAULTS.find((provider) => provider.id === id)
 }
 
 function normalizeConfiguredModels(
@@ -2003,17 +2032,17 @@ function migrateLegacyModelIds(
 ): ReadonlyArray<string> {
   const normalizedIds = uniqueStrings(modelIds, 500)
   const isUntouchedLegacyDefault =
-    normalizedIds.length === LEGACY_DEFAULT_MODELS.length &&
-    LEGACY_DEFAULT_MODELS.every((id) => normalizedIds.includes(id))
-  const fallbackImageKey = `${openAiTarget}:gpt-image-2`
-  if (isUntouchedLegacyDefault) return [fallbackImageKey]
+    normalizedIds.length === 4 &&
+    ['doubao-seedream-5-0-pro', 'gemini-2.5-flash-image-preview-official', 'gemini-3-pro-image-preview-official', 'gpt-image-2']
+      .every((id) => normalizedIds.includes(id))
+  if (isUntouchedLegacyDefault) return []
 
   const keys = normalizedIds.flatMap((modelId) =>
     findBuiltinModelsByRemoteId(modelId)
       .filter((model) => model.providerId === openAiTarget)
       .map((model) => model.key),
   )
-  return keys.length ? validModelKeys(keys, openAiTarget) : [fallbackImageKey]
+  return keys.length ? validModelKeys(keys, openAiTarget) : []
 }
 
 function normalizeDefaultModelKeys(

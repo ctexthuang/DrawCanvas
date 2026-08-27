@@ -308,7 +308,7 @@ function ModelCatalogView({ models, onAdd, onRemove, onSetEnabled, onUpdate, pro
 
   return (
     <div className="model-settings-view">
-      <header className="model-settings-header"><div><h2>模型目录</h2><p>从服务端获取的模型和手动模型都可修改分类、显示名及启用状态。</p></div><button className="primary-button compact" disabled={providers.length === 0} onClick={() => { setAdding(true); setEditingKey(null); setEditKind(kind); setDisplayName('') }} type="button"><Plus size={15}/>添加模型</button></header>
+      <header className="model-settings-header"><div><h2>模型目录</h2><p>API 服务成功获取模型后才会写入目录；也可以补充服务端未返回的模型 ID。</p></div><button className="primary-button compact" disabled={providers.length === 0} onClick={() => { setAdding(true); setEditingKey(null); setEditKind(kind); setDisplayName('') }} type="button"><Plus size={15}/>添加模型</button></header>
       <div className="model-catalog-toolbar">
         <div className="model-type-tabs">{modelKinds.map((entry) => { const Icon = kindMeta[entry].icon; return <button className={entry === kind ? 'is-active' : ''} key={entry} onClick={() => setKind(entry)} type="button"><Icon size={15}/>{kindMeta[entry].label}</button> })}</div>
         <select aria-label="筛选 API 服务" onChange={(event) => setProviderId(event.target.value)} value={providerId}><option value="all">全部 API 服务</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select>
@@ -334,7 +334,7 @@ function ModelCatalogView({ models, onAdd, onRemove, onSetEnabled, onUpdate, pro
             <button aria-checked={model.enabled} aria-label={`${model.enabled ? '停用' : '启用'} ${model.displayName}`} className={model.enabled ? 'provider-toggle standalone is-enabled' : 'provider-toggle standalone'} disabled={busyKey === model.key} onClick={async () => { setBusyKey(model.key); await onSetEnabled(model.key, !model.enabled); setBusyKey(null) }} role="switch" type="button"><span/>{model.enabled && <Check className="visually-hidden" size={1}/>}</button>
           </div>
         })}
-        {visibleModels.length === 0 && <div className="model-empty"><Database size={22}/><strong>没有符合条件的模型</strong><p>可在 API 服务中获取模型，或手动添加模型 ID。</p></div>}
+        {visibleModels.length === 0 && <div className="model-empty"><Database size={22}/><strong>模型目录为空</strong><p>请先在 API 服务中保存配置并点击“获取模型”。</p></div>}
       </div>
     </div>
   )
