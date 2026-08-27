@@ -33,6 +33,7 @@ export class AudioGenerationRequestError extends Error {
   constructor(
     readonly code: AudioGenerationRequestErrorCode,
     message: string,
+    readonly httpStatus?: number,
   ) {
     super(message)
     this.name = 'AudioGenerationRequestError'
@@ -86,7 +87,11 @@ export async function generateMiniMaxAudio(
       throw new AudioGenerationRequestError('RATE_LIMIT', remoteMessage || 'MiniMax 语音请求过于频繁或额度不足')
     }
     if (!response.ok) {
-      throw new AudioGenerationRequestError('REMOTE', remoteMessage || `MiniMax 语音请求失败（HTTP ${response.status}）`)
+      throw new AudioGenerationRequestError(
+        'REMOTE',
+        remoteMessage || `MiniMax 语音请求失败（HTTP ${response.status}）`,
+        response.status,
+      )
     }
     if (!isRecord(payload)) {
       throw new AudioGenerationRequestError('INVALID_RESPONSE', 'MiniMax 语音响应不是有效 JSON')

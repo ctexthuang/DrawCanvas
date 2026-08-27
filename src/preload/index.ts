@@ -1,11 +1,14 @@
 // Sandboxed preload scripts run as bundled CommonJS and use Electron's preload-safe polyfill.
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
+  AddProviderModelRequest,
   CanvasDocument,
   CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
+  CreateProviderRequest,
   DeleteRecentCanvasProjectRequest,
   DesktopApi,
+  DiscoverProviderModelsRequest,
   ExportGeneratedAudioRequest,
   ExportGeneratedVideoRequest,
   ExportHistoryBatchRequest,
@@ -23,12 +26,16 @@ import type {
   RemoveGeneratedAudioRequest,
   RemoveHistoryArtworkRequest,
   RemoveLibraryImageRequest,
+  RemoveProviderModelRequest,
+  RemoveProviderRequest,
   RemoveResourceRequest,
   SavePromptRequest,
-  SaveProviderRequest,
   SaveWorkflowRequest,
+  SetProviderModelEnabledRequest,
   SetProviderEnabledRequest,
   TestProviderRequest,
+  UpdateProviderModelRequest,
+  UpdateProviderRequest,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
 import {
@@ -36,6 +43,7 @@ import {
   GENERATION_IPC_CHANNELS,
   HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
+  MODEL_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
   UPDATE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
@@ -58,10 +66,28 @@ const desktopApi: FileDropDesktopApi = {
     update: (request: UpdateSettingsRequest) => ipcRenderer.invoke('settings:update', request),
   },
   models: {
-    saveProvider: (request: SaveProviderRequest) => ipcRenderer.invoke('models:save-provider', request),
-    testProvider: (request: TestProviderRequest) => ipcRenderer.invoke('models:test-provider', request),
-    clearApiKey: (request: ClearProviderApiKeyRequest) => ipcRenderer.invoke('models:clear-api-key', request),
-    setProviderEnabled: (request: SetProviderEnabledRequest) => ipcRenderer.invoke('models:set-provider-enabled', request),
+    createProvider: (request: CreateProviderRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.createProvider, request),
+    updateProvider: (request: UpdateProviderRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.updateProvider, request),
+    removeProvider: (request: RemoveProviderRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.removeProvider, request),
+    testProvider: (request: TestProviderRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.testProvider, request),
+    discoverProviderModels: (request: DiscoverProviderModelsRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.discoverProviderModels, request),
+    clearApiKey: (request: ClearProviderApiKeyRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.clearApiKey, request),
+    setProviderEnabled: (request: SetProviderEnabledRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.setProviderEnabled, request),
+    addModel: (request: AddProviderModelRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.addModel, request),
+    updateModel: (request: UpdateProviderModelRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.updateModel, request),
+    removeModel: (request: RemoveProviderModelRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.removeModel, request),
+    setModelEnabled: (request: SetProviderModelEnabledRequest) =>
+      ipcRenderer.invoke(MODEL_IPC_CHANNELS.setModelEnabled, request),
   },
   history: {
     load: () => ipcRenderer.invoke(HISTORY_IPC_CHANNELS.load),

@@ -41,6 +41,7 @@ export class ImageGenerationRequestError extends Error {
     readonly code: ImageGenerationRequestErrorCode,
     message: string,
     options?: ErrorOptions,
+    readonly httpStatus?: number,
   ) {
     super(message, options)
     this.name = 'ImageGenerationRequestError'
@@ -117,6 +118,8 @@ export async function generateOpenAiCompatibleImage(
             : response.status >= 500
               ? `图片服务暂时不可用（HTTP ${response.status}）`
               : `图片生成请求被服务商拒绝（HTTP ${response.status}）`,
+          undefined,
+          response.status,
         )
       }
       if (payload === null) {
@@ -179,7 +182,12 @@ export async function generateVolcengineImage(
       throw new ImageGenerationRequestError('RATE_LIMIT', remoteMessage || '请求过于频繁或账户额度不足，请稍后重试')
     }
     if (!response.ok) {
-      throw new ImageGenerationRequestError('REMOTE', remoteMessage || `图片生成请求被服务商拒绝（HTTP ${response.status}）`)
+      throw new ImageGenerationRequestError(
+        'REMOTE',
+        remoteMessage || `图片生成请求被服务商拒绝（HTTP ${response.status}）`,
+        undefined,
+        response.status,
+      )
     }
     if (payload === null) {
       throw new ImageGenerationRequestError('INVALID_RESPONSE', '图片服务未返回有效的 JSON 数据')
@@ -246,7 +254,12 @@ export async function generateMiniMaxImage(
       throw new ImageGenerationRequestError('RATE_LIMIT', remoteMessage || '请求过于频繁或账户额度不足，请稍后重试')
     }
     if (!response.ok) {
-      throw new ImageGenerationRequestError('REMOTE', remoteMessage || `图片生成请求被服务商拒绝（HTTP ${response.status}）`)
+      throw new ImageGenerationRequestError(
+        'REMOTE',
+        remoteMessage || `图片生成请求被服务商拒绝（HTTP ${response.status}）`,
+        undefined,
+        response.status,
+      )
     }
     return await extractMiniMaxImage(payload, controller.signal)
   } catch (error) {
@@ -501,7 +514,12 @@ async function downloadGeneratedImage(
       continue
     }
     if (!response.ok) {
-      throw new ImageGenerationRequestError('REMOTE', `生成图片下载失败（HTTP ${response.status}）`)
+      throw new ImageGenerationRequestError(
+        'REMOTE',
+        `生成图片下载失败（HTTP ${response.status}）`,
+        undefined,
+        response.status,
+      )
     }
     const bytes = await readLimitedBody(response, MAX_IMAGE_BYTES, '生成图片文件过大')
     if (!bytes.byteLength) {

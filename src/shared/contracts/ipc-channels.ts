@@ -46,3 +46,17 @@ export const UPDATE_IPC_CHANNELS = {
   check: 'updates:check',
   openLatestRelease: 'updates:open-latest-release',
 } as const
+
+export const MODEL_IPC_CHANNELS = {
+  createProvider: 'models:create-provider',
+  updateProvider: 'models:update-provider',
+  removeProvider: 'models:remove-provider',
+  testProvider: 'models:test-provider',
+  discoverProviderModels: 'models:discover-provider-models',
+  clearApiKey: 'models:clear-api-key',
+  setProviderEnabled: 'models:set-provider-enabled',
+  addModel: 'models:add-model',
+  updateModel: 'models:update-model',
+  removeModel: 'models:remove-model',
+  setModelEnabled: 'models:set-model-enabled',
+} as const

@@ -1,5 +1,9 @@
 export type ModelKind = 'image' | 'video' | 'chat' | 'audio'
 
+export type ProviderAdapterId = 'openai' | 'openai-sub2api' | 'volcengine' | 'minimax'
+
+export type ProviderModelSource = 'builtin' | 'discovered' | 'manual'
+
 export const IMAGE_GENERATION_SIZES = [
   'auto',
   '720x1280',
@@ -65,8 +69,39 @@ export type ProviderModelDefinition = Readonly<{
   imageSizeMappings?: ReadonlyArray<ImageGenerationSizeMapping>
 }>
 
+export type ConfiguredProviderModel = Readonly<ProviderModelDefinition & {
+  enabled: boolean
+  available: boolean
+  source: ProviderModelSource
+}>
+
+export type ModelRoute = Readonly<{
+  modelKeys: ReadonlyArray<string>
+}>
+
+export type ModelRoutes = Readonly<Partial<Record<ModelKind, ModelRoute>>>
+
 export function createProviderModelKey(providerId: string, remoteModelId: string): string {
   return `${providerId}:${remoteModelId}`
+}
+
+export function inferModelKind(remoteModelId: string): ModelKind {
+  const value = remoteModelId.toLowerCase()
+  if (/(speech|audio|voice|tts|music)/.test(value)) return 'audio'
+  if (/(video|veo|sora|seedance|kling|wan.*video)/.test(value)) return 'video'
+  if (/(image|seedream|flux|dall|midjourney|recraft|ideogram)/.test(value)) return 'image'
+  return 'chat'
+}
+
+export function createConfiguredModel(
+  model: ProviderModelDefinition,
+  source: ProviderModelSource = 'builtin',
+): ConfiguredProviderModel {
+  return { ...model, enabled: true, available: true, source }
+}
+
+export function primaryModelKey(routes: ModelRoutes, kind: ModelKind): string | undefined {
+  return routes[kind]?.modelKeys[0]
 }
 
 export const DEFAULT_IMAGE_MODEL_KEY = createProviderModelKey('openai', 'gpt-image-2')
@@ -440,7 +475,8 @@ export function defaultImageGenerationSizeForModel(modelKey: string): ImageGener
 
 export function isImageGenerationSizeSupported(modelKey: string, size: ImageGenerationSize): boolean {
   const model = findBuiltinModelByKey(modelKey)
-  if (model?.kind !== 'image') return false
+  if (!model) return size === '1024x1024'
+  if (model.kind !== 'image') return false
   if (size === 'auto') return model.supportsAutomaticImageSize === true
   return Boolean(model.imageSizeMappings?.some((mapping) => mapping.value === size))
 }

@@ -40,6 +40,7 @@ export class VideoGenerationRequestError extends Error {
   constructor(
     readonly code: VideoGenerationRequestErrorCode,
     message: string,
+    readonly httpStatus?: number,
   ) {
     super(message)
     this.name = 'VideoGenerationRequestError'
@@ -227,7 +228,11 @@ async function requestJson(
       throw new VideoGenerationRequestError('RATE_LIMIT', message || '请求过于频繁或账户额度不足，请稍后重试')
     }
     if (!response.ok) {
-      throw new VideoGenerationRequestError('REMOTE', message || `视频服务请求失败（HTTP ${response.status}）`)
+      throw new VideoGenerationRequestError(
+        'REMOTE',
+        message || `视频服务请求失败（HTTP ${response.status}）`,
+        response.status,
+      )
     }
     if (!payload) {
       throw new VideoGenerationRequestError('INVALID_RESPONSE', '视频服务未返回有效 JSON 数据')
@@ -264,7 +269,11 @@ async function downloadVideo(initialUrl: string): Promise<VideoGenerationClientR
         continue
       }
       if (!response.ok) {
-        throw new VideoGenerationRequestError('REMOTE', `生成视频下载失败（HTTP ${response.status}）`)
+        throw new VideoGenerationRequestError(
+          'REMOTE',
+          `生成视频下载失败（HTTP ${response.status}）`,
+          response.status,
+        )
       }
       const bytes = await readLimitedBody(response, VIDEO_RESPONSE_LIMIT, '生成视频文件过大')
       return { bytes, mediaType: detectVideoMediaType(bytes) }

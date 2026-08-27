@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import type {
+  AddProviderModelRequest,
   AppSettings,
   AppUpdateCheck,
   CanvasDocument,
+  CreateProviderRequest,
   GenerateAudioRequest,
   GenerateChatReplyRequest,
   GenerateImageRequest,
@@ -17,11 +19,11 @@ import type {
   RecentCanvasProject,
   ResourceCatalog,
   SavePromptRequest,
-  SaveProviderRequest,
   SaveWorkflowRequest,
   StorageStats,
-  TestProviderRequest,
   ThemeMode,
+  UpdateProviderModelRequest,
+  UpdateProviderRequest,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
 import {
@@ -30,8 +32,14 @@ import {
 } from '../shared/domain/canvas-document'
 import {
   BUILTIN_PROVIDER_MODELS,
+  createConfiguredModel,
+  createProviderModelKey,
   DEFAULT_CHAT_MODEL_KEY,
   DEFAULT_IMAGE_MODEL_KEY,
+  primaryModelKey,
+  type ModelKind,
+  type ModelRoutes,
+  type ProviderAdapterId,
 } from '../shared/domain/models'
 import { AppShell, type AppPage } from './components/AppShell'
 import {
@@ -54,32 +62,42 @@ import { UpdateDialog } from './features/settings/UpdateDialog'
 import { artworks as seedArtworks, prompts as seedPrompts, workflows as seedWorkflows } from './domain/catalog'
 
 const fallbackProviders: ReadonlyArray<ProviderConfig> = [
-  createFallbackProvider('apimart', 'https://api.apimart.ai/v1', false),
-  createFallbackProvider('volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
-  createFallbackProvider('minimax', 'https://api.minimaxi.com/v1', true),
-  createFallbackProvider('comfly', 'https://api.comfly.chat/v1', false),
-  createFallbackProvider('openai', 'https://api.openai.com/v1', true),
-  createFallbackProvider('openai-sub2api', '', false),
+  createFallbackProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
+  createFallbackProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
+  createFallbackProvider('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', true),
+  createFallbackProvider('openai-sub2api', 'OpenAI 中转', 'openai-sub2api', 'https://relay.example.com/v1', false),
 ]
 
-function createFallbackProvider(id: string, baseUrl: string, enabled: boolean): ProviderConfig {
+function createFallbackProvider(id: string, name: string, adapterId: ProviderAdapterId, baseUrl: string, enabled: boolean): ProviderConfig {
   return {
     id,
+    name,
+    adapterId,
     baseUrl,
     enabled,
     hasApiKey: false,
     connectionStatus: 'untested',
-    availableModelIds: [],
+    modelCount: BUILTIN_PROVIDER_MODELS.filter((model) => model.providerId === id).length,
   }
 }
+
+const fallbackModels = BUILTIN_PROVIDER_MODELS
+  .filter((model) => fallbackProviders.some((provider) => provider.id === model.providerId))
+  .map((model) => ({
+    ...createConfiguredModel(model),
+    enabled: model.key === DEFAULT_IMAGE_MODEL_KEY || model.key === DEFAULT_CHAT_MODEL_KEY,
+  }))
 
 const fallbackSettings: AppSettings = {
   theme: 'light',
   accentColor: '#ff5f77',
   storageDirectory: 'Draw Canvas Data',
   favoriteImageIds: [],
-  enabledModelKeys: [DEFAULT_IMAGE_MODEL_KEY, DEFAULT_CHAT_MODEL_KEY],
-  defaultModelKeys: { image: DEFAULT_IMAGE_MODEL_KEY, chat: DEFAULT_CHAT_MODEL_KEY },
+  models: fallbackModels,
+  modelRoutes: {
+    image: { modelKeys: [DEFAULT_IMAGE_MODEL_KEY] },
+    chat: { modelKeys: [DEFAULT_CHAT_MODEL_KEY] },
+  },
   providers: fallbackProviders,
 }
 
@@ -141,20 +159,20 @@ export function App() {
     () => [...generatedArtworks, ...libraryCatalog.filter((artwork) => !generatedArtworks.some((generated) => generated.id === artwork.id))],
     [generatedArtworks, libraryCatalog],
   )
-  const imageModels = useMemo(() => BUILTIN_PROVIDER_MODELS
-    .filter((model) => model.kind === 'image' && settings.enabledModelKeys.includes(model.key))
+  const imageModels = useMemo(() => settings.models
+    .filter((model) => model.kind === 'image' && model.enabled && model.available)
     .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
     .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const videoModels = useMemo(() => BUILTIN_PROVIDER_MODELS
-    .filter((model) => model.kind === 'video' && settings.enabledModelKeys.includes(model.key))
+  const videoModels = useMemo(() => settings.models
+    .filter((model) => model.kind === 'video' && model.enabled && model.available)
     .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
     .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const chatModels = useMemo(() => BUILTIN_PROVIDER_MODELS
-    .filter((model) => model.kind === 'chat' && settings.enabledModelKeys.includes(model.key))
+  const chatModels = useMemo(() => settings.models
+    .filter((model) => model.kind === 'chat' && model.enabled && model.available)
     .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
     .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const audioModels = useMemo(() => BUILTIN_PROVIDER_MODELS
-    .filter((model) => model.kind === 'audio' && settings.enabledModelKeys.includes(model.key))
+  const audioModels = useMemo(() => settings.models
+    .filter((model) => model.kind === 'audio' && model.enabled && model.available)
     .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
     .map((model) => ({ key: model.key, label: model.displayName })), [settings])
 
@@ -283,8 +301,8 @@ export function App() {
       localStorage.setItem('draw-canvas-autosave', JSON.stringify(canvasDocument))
     }
 
-    const defaultImageModelKey = settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY
-    const defaultImageModelName = BUILTIN_PROVIDER_MODELS.find(
+    const defaultImageModelKey = primaryModelKey(settings.modelRoutes, 'image') ?? ''
+    const defaultImageModelName = settings.models.find(
       (model) => model.key === defaultImageModelKey,
     )?.displayName ?? '默认图片模型'
     setCanvasDocument(createInitialCanvas(
@@ -741,64 +759,113 @@ export function App() {
     return result.ok ? result.value.dataUrl : null
   }, [])
 
-  async function saveProvider(request: SaveProviderRequest): Promise<boolean> {
+  async function createProvider(request: CreateProviderRequest): Promise<boolean> {
     if (!window.desktop) {
       setSettings((current) => ({
         ...current,
-        providers: current.providers.map((provider) => provider.id === request.id
-          ? {
-              ...provider,
-              baseUrl: request.baseUrl,
-              hasApiKey: Boolean(request.apiKey || provider.hasApiKey),
-              connectionStatus: 'untested',
-              availableModelIds: [],
-            }
-          : provider),
+        providers: [...current.providers, {
+          id: crypto.randomUUID(),
+          name: request.name,
+          adapterId: request.adapterId,
+          baseUrl: request.baseUrl,
+          enabled: true,
+          hasApiKey: Boolean(request.apiKey),
+          connectionStatus: 'untested',
+          modelCount: 0,
+        }],
       }))
-      notify('服务商配置已保存（浏览器预览）')
+      notify('API 服务已新增（浏览器预览）')
       return true
     }
-    const result = await window.desktop.models.saveProvider(request)
+    const result = await window.desktop.models.createProvider(request)
     if (!result.ok) {
       notify(result.error.message)
       return false
     }
-    setSettings((current) => ({ ...current, providers: current.providers.map((provider) => provider.id === result.value.id ? result.value : provider) }))
-    notify('服务商配置已安全保存')
+    setSettings(result.value)
+    notify('API 服务已新增')
     return true
   }
 
-  async function testProvider(request: TestProviderRequest): Promise<ProviderConnectionTestResult | null> {
+  async function updateProvider(request: UpdateProviderRequest): Promise<boolean> {
     if (!window.desktop) {
-      const provider = settings.providers.find((item) => item.id === request.id)
+      setSettings((current) => ({
+        ...current,
+        providers: current.providers.map((provider) => provider.id === request.id
+          ? { ...provider, name: request.name, adapterId: request.adapterId, baseUrl: request.baseUrl, hasApiKey: Boolean(request.apiKey || provider.hasApiKey), connectionStatus: 'untested' }
+          : provider),
+      }))
+      notify('API 服务已修改（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.updateProvider(request)
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify('API 服务已修改')
+    return true
+  }
+
+  async function removeProvider(id: string): Promise<boolean> {
+    if (!window.desktop) {
+      setSettings((current) => {
+        const removedKeys = new Set(current.models.filter((model) => model.providerId === id).map((model) => model.key))
+        return {
+          ...current,
+          providers: current.providers.filter((provider) => provider.id !== id),
+          models: current.models.filter((model) => model.providerId !== id),
+          modelRoutes: removeModelKeysFromRoutes(current.modelRoutes, removedKeys),
+        }
+      })
+      notify('API 服务已删除（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.removeProvider({ id })
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify('API 服务及其模型已删除')
+    return true
+  }
+
+  async function testProvider(id: string): Promise<ProviderConnectionTestResult | null> {
+    if (!window.desktop) {
+      const provider = settings.providers.find((item) => item.id === id)
       if (!provider) return null
       const result: ProviderConnectionTestResult = {
         connected: false,
-        provider: { ...provider, baseUrl: request.baseUrl, connectionStatus: 'failed' },
+        provider: { ...provider, connectionStatus: 'failed' },
         error: { code: 'NETWORK', message: '连接测试需要在 Electron 桌面端运行' },
       }
       setSettings((current) => ({
         ...current,
-        providers: current.providers.map((item) => item.id === request.id ? result.provider : item),
+        providers: current.providers.map((item) => item.id === id ? result.provider : item),
       }))
       notify(result.error.message)
       return result
     }
-    const response = await window.desktop.models.testProvider(request)
+    const response = await window.desktop.models.testProvider({ id })
     if (!response.ok) {
       notify(response.error.message)
       return null
     }
-    const savedProvider = settings.providers.find((provider) => provider.id === request.id)
-    if (request.apiKey === undefined && savedProvider?.baseUrl === request.baseUrl) {
-      setSettings((current) => ({
-        ...current,
-        providers: current.providers.map((provider) =>
-          provider.id === response.value.provider.id ? response.value.provider : provider),
-      }))
-    }
+    setSettings((current) => ({
+      ...current,
+      providers: current.providers.map((provider) => provider.id === id ? response.value.provider : provider),
+    }))
     notify(response.value.connected ? response.value.message : response.value.error.message)
     return response.value
+  }
+
+  async function discoverProviderModels(id: string): Promise<boolean> {
+    if (!window.desktop) { notify('获取模型需要在 Electron 桌面端运行'); return false }
+    const response = await window.desktop.models.discoverProviderModels({ id })
+    if (!response.ok) { notify(response.error.message); return false }
+    setSettings((current) => ({
+      ...current,
+      providers: current.providers.map((provider) => provider.id === id ? response.value.provider : provider),
+      models: [...current.models.filter((model) => model.providerId !== id), ...response.value.models],
+    }))
+    notify(response.value.message)
+    return true
   }
 
   async function clearProviderApiKey(id: string): Promise<boolean> {
@@ -806,7 +873,7 @@ export function App() {
       setSettings((current) => ({
         ...current,
         providers: current.providers.map((provider) => provider.id === id
-          ? { ...provider, hasApiKey: false, connectionStatus: 'untested', availableModelIds: [] }
+          ? { ...provider, hasApiKey: false, connectionStatus: 'untested' }
           : provider),
       }))
       notify('API Key 已清除（浏览器预览）')
@@ -846,6 +913,75 @@ export function App() {
       providers: current.providers.map((provider) => provider.id === id ? response.value : provider),
     }))
     notify(enabled ? '服务商已启用' : '服务商已停用')
+    return true
+  }
+
+  async function addModel(request: AddProviderModelRequest): Promise<boolean> {
+    if (!window.desktop) {
+      const key = createProviderModelKey(request.providerId, request.remoteModelId)
+      setSettings((current) => current.models.some((model) => model.key === key) ? current : ({
+        ...current,
+        models: [...current.models, { ...request, key, description: '手动添加的模型', source: 'manual', enabled: true, available: true }],
+        providers: current.providers.map((provider) => provider.id === request.providerId ? { ...provider, modelCount: provider.modelCount + 1 } : provider),
+      }))
+      notify('模型已添加（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.addModel(request)
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify('模型已添加')
+    return true
+  }
+
+  async function updateModel(request: UpdateProviderModelRequest): Promise<boolean> {
+    if (!window.desktop) {
+      setSettings((current) => ({ ...current, models: current.models.map((model) => model.key === request.key ? { ...model, displayName: request.displayName, kind: request.kind } : model) }))
+      notify('模型已修改（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.updateModel(request)
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify('模型已修改')
+    return true
+  }
+
+  async function removeModel(key: string): Promise<boolean> {
+    if (!window.desktop) {
+      setSettings((current) => {
+        const model = current.models.find((item) => item.key === key)
+        return {
+          ...current,
+          models: current.models.filter((item) => item.key !== key),
+          modelRoutes: removeModelKeysFromRoutes(current.modelRoutes, new Set([key])),
+          providers: current.providers.map((provider) => provider.id === model?.providerId ? { ...provider, modelCount: Math.max(0, provider.modelCount - 1) } : provider),
+        }
+      })
+      notify('模型已删除（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.removeModel({ key })
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify('模型已删除')
+    return true
+  }
+
+  async function setModelEnabled(key: string, enabled: boolean): Promise<boolean> {
+    if (!window.desktop) {
+      setSettings((current) => ({
+        ...current,
+        models: current.models.map((model) => model.key === key ? { ...model, enabled } : model),
+        modelRoutes: enabled ? current.modelRoutes : removeModelKeysFromRoutes(current.modelRoutes, new Set([key])),
+      }))
+      notify(enabled ? '模型已启用（浏览器预览）' : '模型已停用（浏览器预览）')
+      return true
+    }
+    const result = await window.desktop.models.setModelEnabled({ key, enabled })
+    if (!result.ok) { notify(result.error.message); return false }
+    setSettings(result.value)
+    notify(enabled ? '模型已启用' : '模型已停用')
     return true
   }
 
@@ -933,11 +1069,11 @@ export function App() {
       case 'resources':
         return <ResourcesPage currentCanvas={canvasIsActive ? canvasDocument : null} notify={notify} onDeletePrompt={deletePrompt} onDeleteWorkflow={deleteWorkflow} onRunWorkflow={runWorkflow} onSavePrompt={savePrompt} onSaveWorkflow={saveWorkflow} onUsePrompt={(prompt) => void newCanvas(prompt)} prompts={resourceCatalog.prompts} workflows={resourceCatalog.workflows} />
       case 'models':
-        return <ModelSettingsPage defaultModelKeys={settings.defaultModelKeys} enabledModelKeys={settings.enabledModelKeys} onClearProviderApiKey={clearProviderApiKey} onModelConfigChange={(enabledModelKeys, defaultModelKeys) => void updateSettings({ enabledModelKeys, defaultModelKeys })} onSaveProvider={saveProvider} onSetProviderEnabled={setProviderEnabled} onTestProvider={testProvider} providers={settings.providers} />
+        return <ModelSettingsPage onAddModel={addModel} onClearProviderApiKey={clearProviderApiKey} onCreateProvider={createProvider} onDiscoverProviderModels={discoverProviderModels} onModelRoutesChange={(modelRoutes) => void updateSettings({ modelRoutes })} onRemoveModel={removeModel} onRemoveProvider={removeProvider} onSetModelEnabled={setModelEnabled} onSetProviderEnabled={setProviderEnabled} onTestProvider={testProvider} onUpdateModel={updateModel} onUpdateProvider={updateProvider} settings={settings}/>
       case 'settings':
         return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onCheckForUpdates={() => void checkForUpdates()} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onOpenLatestRelease={() => void openLatestRelease()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} updateCheck={updateCheck} updateChecking={updateChecking} updateError={updateError} />
       case 'canvas':
-        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={settings.defaultModelKeys.audio ?? audioModels[0]?.key ?? ''} defaultChatModelKey={settings.defaultModelKeys.chat ?? chatModels[0]?.key ?? ''} defaultImageModelKey={settings.defaultModelKeys.image ?? DEFAULT_IMAGE_MODEL_KEY} defaultVideoModelKey={settings.defaultModelKeys.video ?? videoModels[0]?.key ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
+        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={primaryModelKey(settings.modelRoutes, 'audio') ?? ''} defaultChatModelKey={primaryModelKey(settings.modelRoutes, 'chat') ?? ''} defaultImageModelKey={primaryModelKey(settings.modelRoutes, 'image') ?? ''} defaultVideoModelKey={primaryModelKey(settings.modelRoutes, 'video') ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
     }
   }
 
@@ -949,6 +1085,15 @@ export function App() {
       )}
       {toast && <div className="toast" role="status"><span />{toast}</div>}
     </div>
+  )
+}
+
+function removeModelKeysFromRoutes(routes: ModelRoutes, removedKeys: ReadonlySet<string>): ModelRoutes {
+  return Object.fromEntries(
+    (['image', 'video', 'chat', 'audio'] as const).flatMap((kind: ModelKind) => {
+      const modelKeys = routes[kind]?.modelKeys.filter((key) => !removedKeys.has(key)) ?? []
+      return modelKeys.length ? [[kind, { modelKeys }]] : []
+    }),
   )
 }
 

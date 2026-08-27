@@ -5,13 +5,14 @@ import type {
   GenerateStoryboardRequest,
   StoryboardShot,
 } from '../../shared/contracts/desktop'
-import { findBuiltinModelByKey } from '../../shared/domain/models'
+import type { ProviderAdapterId } from '../../shared/domain/models'
 import {
   generateTextWithModel,
   PromptOptimizationClientError,
   type PromptOptimizationClientProfile,
 } from '../infrastructure/prompt-optimization-client'
 import type { AppState } from './app-state'
+import { isRetryableRemoteStatus, ModelRoutingError, runWithModelRoute } from './model-routing'
 
 export type TextGenerationServiceErrorCode =
   | 'MODEL_NOT_CONFIGURED'
@@ -36,12 +37,9 @@ export class TextGenerationServiceError extends Error {
 }
 
 type ResolvedChatModel = Readonly<{
-  apiKey: string
-  baseUrl: string
+  content: string
   modelKey: string
   modelName: string
-  profile: PromptOptimizationClientProfile
-  remoteModelId: string
 }>
 
 const CHAT_INSTRUCTIONS = [
@@ -55,17 +53,15 @@ export class TextGenerationService {
   constructor(private readonly appState: AppState) {}
 
   async chat(request: GenerateChatReplyRequest): Promise<GeneratedChatReply> {
-    const model = await this.resolveModel(request.modelKey)
-    const content = await this.callModel(
-      model,
+    const result = await this.callModelRoute(
+      request.modelKey,
       request.messages.map((message) => ({ role: message.role, content: message.content })),
       CHAT_INSTRUCTIONS,
     )
-    return { content, modelKey: model.modelKey, modelName: model.modelName }
+    return result
   }
 
   async storyboard(request: GenerateStoryboardRequest): Promise<GeneratedStoryboard> {
-    const model = await this.resolveModel(request.modelKey)
     const instructions = [
       '你是 Draw Canvas 的专业分镜设计师。',
       `必须根据用户主题生成恰好 ${request.shotCount} 个连续镜头。`,
@@ -73,77 +69,46 @@ export class TextGenerationService {
       '每项必须包含 title、prompt、durationSeconds；prompt 要能直接用于图像或视频生成，写清主体、动作、景别、机位、光线、环境和风格，并保持人物与场景连续性。',
       'durationSeconds 使用 1 到 60 的整数。',
     ].join('')
-    const raw = await this.callModel(
-      model,
+    const result = await this.callModelRoute(
+      request.modelKey,
       [{ role: 'user', content: request.theme }],
       instructions,
     )
-    const shots = parseStoryboard(raw, request.shotCount)
-    return { shots, modelKey: model.modelKey, modelName: model.modelName }
+    const shots = parseStoryboard(result.content, request.shotCount)
+    return { shots, modelKey: result.modelKey, modelName: result.modelName }
   }
 
-  private async resolveModel(requestedModelKey?: string): Promise<ResolvedChatModel> {
-    const settings = await this.appState.loadSettings()
-    const modelKey = requestedModelKey ?? settings.defaultModelKeys.chat
-    if (!modelKey || !settings.enabledModelKeys.includes(modelKey)) {
-      throw new TextGenerationServiceError(
-        'MODEL_NOT_CONFIGURED',
-        '当前没有可用的对话模型，请先在模型设置中启用并设为默认',
-      )
-    }
-    const model = findBuiltinModelByKey(modelKey)
-    if (!model || model.kind !== 'chat') {
-      throw new TextGenerationServiceError('MODEL_NOT_CONFIGURED', '选择的模型不是可用的对话模型')
-    }
-    const provider = settings.providers.find((item) => item.id === model.providerId)
-    if (!provider?.enabled || !provider.hasApiKey) {
-      throw new TextGenerationServiceError(
-        'PROVIDER_NOT_CONFIGURED',
-        '请先启用对话模型所属服务商并保存 API Key',
-      )
-    }
-    const profile = providerProfile(provider.id)
-    if (!profile) {
-      throw new TextGenerationServiceError('UNSUPPORTED_PROVIDER', '当前服务商尚未接入对话能力')
-    }
-    let apiKey: string | null
-    try {
-      apiKey = await this.appState.loadProviderApiKey(provider.id)
-    } catch (error) {
-      throw new TextGenerationServiceError(
-        'PROVIDER_NOT_CONFIGURED',
-        '无法解密对话模型服务商的 API Key，请重新保存后再试',
-        { cause: error },
-      )
-    }
-    if (!apiKey) {
-      throw new TextGenerationServiceError('PROVIDER_NOT_CONFIGURED', '无法读取对话模型服务商的 API Key')
-    }
-    return {
-      apiKey,
-      baseUrl: provider.baseUrl,
-      modelKey,
-      modelName: model.displayName,
-      profile,
-      remoteModelId: model.remoteModelId,
-    }
-  }
-
-  private async callModel(
-    model: ResolvedChatModel,
+  private async callModelRoute(
+    requestedModelKey: string | undefined,
     messages: Parameters<typeof generateTextWithModel>[3],
     instructions: string,
-  ): Promise<string> {
+  ): Promise<ResolvedChatModel> {
     try {
-      return await generateTextWithModel(
-        model.baseUrl,
-        model.apiKey,
-        model.remoteModelId,
-        messages,
-        model.profile,
-        instructions,
+      return await runWithModelRoute(
+        this.appState,
+        'chat',
+        requestedModelKey,
+        isRetryableTextError,
+        async ({ apiKey, model, provider }) => {
+          const profile = providerProfile(provider.adapterId)
+          if (!profile) {
+            throw new TextGenerationServiceError('UNSUPPORTED_PROVIDER', '该 API 服务尚未接入对话能力')
+          }
+          const content = await generateTextWithModel(
+            provider.baseUrl,
+            apiKey,
+            model.remoteModelId,
+            messages,
+            profile,
+            instructions,
+          )
+          return { content, modelKey: model.key, modelName: model.displayName }
+        },
       )
     } catch (error) {
+      if (error instanceof ModelRoutingError) {
+        throw new TextGenerationServiceError(error.code, error.message, { cause: error })
+      }
       if (error instanceof PromptOptimizationClientError) {
         throw new TextGenerationServiceError(mapProviderErrorCode(error.code), error.message, { cause: error })
       }
@@ -200,8 +165,8 @@ function mapProviderErrorCode(
   }
 }
 
-function providerProfile(providerId: string): PromptOptimizationClientProfile | null {
-  switch (providerId) {
+function providerProfile(adapterId: ProviderAdapterId): PromptOptimizationClientProfile | null {
+  switch (adapterId) {
     case 'openai': return 'openai-responses'
     case 'openai-sub2api': return 'sub2api-compatible'
     case 'volcengine':
@@ -210,6 +175,15 @@ function providerProfile(providerId: string): PromptOptimizationClientProfile | 
     default:
       return null
   }
+}
+
+function isRetryableTextError(error: unknown): boolean {
+  return error instanceof PromptOptimizationClientError && (
+    error.code === 'NETWORK' ||
+    error.code === 'TIMEOUT' ||
+    error.code === 'RATE_LIMIT' ||
+    (error.code === 'REMOTE' && isRetryableRemoteStatus(error.httpStatus))
+  )
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

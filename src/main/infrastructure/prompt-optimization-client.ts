@@ -33,6 +33,7 @@ export class PromptOptimizationClientError extends Error {
   constructor(
     readonly code: PromptOptimizationClientErrorCode,
     message: string,
+    readonly httpStatus?: number,
   ) {
     super(message)
     this.name = 'PromptOptimizationClientError'
@@ -109,7 +110,11 @@ export async function generateTextWithModel(
       }
       if (!response.ok) {
         if (hasNextAttempt) continue
-        throw new PromptOptimizationClientError('REMOTE', message || `对话模型请求失败（HTTP ${response.status}）`)
+        throw new PromptOptimizationClientError(
+          'REMOTE',
+          message || `对话模型请求失败（HTTP ${response.status}）`,
+          response.status,
+        )
       }
       const generatedText = cleanGeneratedText(attempt.kind === 'responses'
         ? extractResponsesText(payload)

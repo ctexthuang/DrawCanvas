@@ -16,9 +16,11 @@ import {
 } from 'electron/main'
 import { shell } from 'electron'
 import type {
+  AddProviderModelRequest,
   CanvasDocument,
   CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
+  CreateProviderRequest,
   DeleteRecentCanvasProjectRequest,
   DesktopErrorCode,
   DesktopResult,
@@ -35,19 +37,25 @@ import type {
   LoadGeneratedImageRequest,
   LoadRecentCanvasProjectRequest,
   OptimizePromptRequest,
+  DiscoverProviderModelsRequest,
   ProviderConfig,
   ProviderConnectionTestResult,
+  ProviderModelDiscoveryResult,
   RemoveGeneratedVideoRequest,
   RemoveGeneratedAudioRequest,
   RemoveHistoryArtworkRequest,
   RemoveLibraryImageRequest,
+  RemoveProviderModelRequest,
+  RemoveProviderRequest,
   RemoveResourceRequest,
   SavePromptRequest,
-  SaveProviderRequest,
   SaveWorkflowRequest,
   SetProviderEnabledRequest,
+  SetProviderModelEnabledRequest,
   TestProviderRequest,
   ThemeMode,
+  UpdateProviderModelRequest,
+  UpdateProviderRequest,
   UpdateSettingsRequest,
 } from '../shared/contracts/desktop'
 import {
@@ -55,11 +63,12 @@ import {
   GENERATION_IPC_CHANNELS,
   HISTORY_IPC_CHANNELS,
   LIBRARY_IPC_CHANNELS,
+  MODEL_IPC_CHANNELS,
   RESOURCE_IPC_CHANNELS,
   UPDATE_IPC_CHANNELS,
 } from '../shared/contracts/ipc-channels'
 import { isCanvasDocument } from '../shared/domain/canvas-document'
-import { isImageGenerationSize } from '../shared/domain/models'
+import { isImageGenerationSize, type ModelRoutes, type ProviderAdapterId } from '../shared/domain/models'
 import { AppState, ProviderSecretUnavailableError } from './application/app-state'
 import {
   ImageGenerationService,
@@ -111,15 +120,6 @@ const SQUIRREL_STARTUP_ARGUMENTS = new Set([
 ])
 const isSquirrelStartup = process.platform === 'win32' &&
   process.argv.some((argument) => SQUIRREL_STARTUP_ARGUMENTS.has(argument))
-const PROVIDER_IDS = new Set([
-  // 'apimart',
-  'volcengine',
-  'minimax',
-  // 'comfly',
-  'openai',
-  'openai-sub2api',
-])
-
 protocol.registerSchemesAsPrivileged([{
   scheme: 'drawcanvas-media',
   privileges: {
@@ -233,11 +233,11 @@ function isHexColor(value: unknown): value is string {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
 }
 
-function normalizeBaseUrl(value: unknown, providerId: string): string | null {
+function normalizeBaseUrl(value: unknown, adapterId: ProviderAdapterId): string | null {
   if (typeof value !== 'string' || value.length > 2048) return null
   try {
     const url = new URL(value.trim())
-    const isLoopbackRelay = providerId === 'openai-sub2api' &&
+    const isLoopbackRelay = adapterId === 'openai-sub2api' &&
       url.protocol === 'http:' &&
       (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')
     if (
@@ -248,7 +248,7 @@ function normalizeBaseUrl(value: unknown, providerId: string): string | null {
       url.hash
     ) return null
     const normalized = url.toString().replace(/\/+$/, '')
-    return providerId !== 'openai' || normalized === OPENAI_OFFICIAL_BASE_URL
+    return adapterId !== 'openai' || normalized === OPENAI_OFFICIAL_BASE_URL
       ? normalized
       : null
   } catch {
@@ -257,7 +257,7 @@ function normalizeBaseUrl(value: unknown, providerId: string): string | null {
 }
 
 function isProviderId(value: unknown): value is string {
-  return typeof value === 'string' && PROVIDER_IDS.has(value)
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,127}$/i.test(value)
 }
 
 function isStringArray(value: unknown, maxItems: number, maxLength: number): value is string[] {
@@ -266,14 +266,34 @@ function isStringArray(value: unknown, maxItems: number, maxLength: number): val
     value.every((item) => typeof item === 'string' && item.length <= maxLength)
 }
 
-function isDefaultModelKeys(value: unknown): boolean {
+function isModelRoutes(value: unknown): value is ModelRoutes {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const entries = Object.entries(value)
-  return entries.length <= 4 && entries.every(([kind, key]) =>
+  return entries.length <= 4 && entries.every(([kind, route]) =>
     (kind === 'image' || kind === 'video' || kind === 'chat' || kind === 'audio') &&
-    typeof key === 'string' &&
-    key.length <= 400,
+    Boolean(route && typeof route === 'object' && !Array.isArray(route)) &&
+    isStringArray((route as Readonly<{ modelKeys?: unknown }>).modelKeys, 3, 400),
   )
+}
+
+function isProviderAdapterId(value: unknown): value is ProviderAdapterId {
+  return value === 'openai' || value === 'openai-sub2api' || value === 'volcengine' || value === 'minimax'
+}
+
+function normalizeProviderName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const name = value.trim()
+  return name && name.length <= 100 ? name : null
+}
+
+function isModelKind(value: unknown): value is AddProviderModelRequest['kind'] {
+  return value === 'image' || value === 'video' || value === 'chat' || value === 'audio'
+}
+
+function normalizeModelText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  return normalized && normalized.length <= maxLength ? normalized : null
 }
 
 function normalizeApiKey(value: unknown): string | undefined | null {
@@ -281,6 +301,16 @@ function normalizeApiKey(value: unknown): string | undefined | null {
   if (typeof value !== 'string') return null
   const key = value.trim()
   return key.length > 0 && key.length <= 8192 ? key : null
+}
+
+function mapProviderTestErrorCode(code: ProviderRequestError['code']): DesktopErrorCode {
+  switch (code) {
+    case 'NETWORK': return 'PROVIDER_NETWORK'
+    case 'TIMEOUT': return 'PROVIDER_TIMEOUT'
+    case 'AUTHENTICATION': return 'PROVIDER_AUTHENTICATION'
+    case 'REMOTE': return 'PROVIDER_REMOTE'
+    case 'INVALID_RESPONSE': return 'PROVIDER_INVALID_RESPONSE'
+  }
 }
 
 function isGeneratedArtwork(value: unknown): value is GeneratedArtwork {
@@ -547,14 +577,9 @@ function registerIpc(): void {
         request.favoriteImageIds !== undefined &&
         !isStringArray(request.favoriteImageIds, 500, 200)
       ) return failure('INVALID_INPUT', '收藏列表无效')
-      if (
-        request.enabledModelKeys !== undefined &&
-        !isStringArray(request.enabledModelKeys, 500, 400)
-      ) return failure('INVALID_INPUT', '模型选择无效')
-      if (
-        request.defaultModelKeys !== undefined &&
-        !isDefaultModelKeys(request.defaultModelKeys)
-      ) return failure('INVALID_INPUT', '默认模型设置无效')
+      if (request.modelRoutes !== undefined && !isModelRoutes(request.modelRoutes)) {
+        return failure('INVALID_INPUT', '默认模型路由无效')
+      }
       try {
         const settings = await appState.updateSettings(request)
         if (request.theme !== undefined) applyNativeTheme(request.theme)
@@ -566,83 +591,89 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'models:save-provider',
-    trustedHandler(async (request: SaveProviderRequest) => {
-      if (!request || !isProviderId(request.id)) {
-        return failure('INVALID_INPUT', '服务商配置无效')
-      }
-      const baseUrl = normalizeBaseUrl(request.baseUrl, request.id)
+    MODEL_IPC_CHANNELS.createProvider,
+    trustedHandler(async (request: CreateProviderRequest) => {
+      const name = normalizeProviderName(request?.name)
+      if (!name || !isProviderAdapterId(request?.adapterId)) return failure('INVALID_INPUT', 'API 服务配置无效')
+      const baseUrl = normalizeBaseUrl(request.baseUrl, request.adapterId)
       if (!baseUrl) return failure('INVALID_INPUT', '接口地址无效；中转站仅允许 HTTPS 或本机 HTTP 地址')
       const apiKey = normalizeApiKey(request.apiKey)
       if (apiKey === null) return failure('INVALID_INPUT', 'API Key 格式无效')
       try {
-        return success(await appState.saveProvider({ id: request.id, baseUrl, ...(apiKey ? { apiKey } : {}) }))
+        return success(await appState.createProvider({ name, adapterId: request.adapterId, baseUrl, ...(apiKey ? { apiKey } : {}) }))
       } catch (error) {
         return error instanceof ProviderSecretUnavailableError
           ? failure('ENCRYPTION_UNAVAILABLE', error.message)
-          : failure('IO_ERROR', '无法保存服务商配置')
+          : failure('IO_ERROR', '无法新增 API 服务')
       }
     }),
   )
 
   ipcMain.handle(
-    'models:test-provider',
-    trustedHandler(async (request: TestProviderRequest) => {
-      if (!request || !isProviderId(request.id)) {
-        return failure('INVALID_INPUT', '服务商配置无效')
+    MODEL_IPC_CHANNELS.updateProvider,
+    trustedHandler(async (request: UpdateProviderRequest) => {
+      const name = normalizeProviderName(request?.name)
+      if (!isProviderId(request?.id) || !name || !isProviderAdapterId(request?.adapterId)) {
+        return failure('INVALID_INPUT', 'API 服务配置无效')
       }
-      const baseUrl = normalizeBaseUrl(request.baseUrl, request.id)
+      const baseUrl = normalizeBaseUrl(request.baseUrl, request.adapterId)
       if (!baseUrl) return failure('INVALID_INPUT', '接口地址无效；中转站仅允许 HTTPS 或本机 HTTP 地址')
-      const draftApiKey = normalizeApiKey(request.apiKey)
-      if (draftApiKey === null) return failure('INVALID_INPUT', 'API Key 格式无效')
+      const apiKey = normalizeApiKey(request.apiKey)
+      if (apiKey === null) return failure('INVALID_INPUT', 'API Key 格式无效')
+      try {
+        return success(await appState.updateProvider({
+          id: request.id,
+          name,
+          adapterId: request.adapterId,
+          baseUrl,
+          ...(apiKey ? { apiKey } : {}),
+        }))
+      } catch (error) {
+        return error instanceof ProviderSecretUnavailableError
+          ? failure('ENCRYPTION_UNAVAILABLE', error.message)
+          : failure('IO_ERROR', '无法修改 API 服务')
+      }
+    }),
+  )
 
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.removeProvider,
+    trustedHandler(async (request: RemoveProviderRequest) => {
+      if (!isProviderId(request?.id)) return failure('INVALID_INPUT', 'API 服务标识无效')
+      try {
+        return success(await appState.removeProvider(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除 API 服务')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.testProvider,
+    trustedHandler(async (request: TestProviderRequest) => {
+      if (!isProviderId(request?.id)) return failure('INVALID_INPUT', 'API 服务标识无效')
       try {
         const savedProvider = await appState.getProvider(request.id)
-        const apiKey = draftApiKey ?? await appState.loadProviderApiKey(request.id)
-        if (!apiKey) return failure('INVALID_INPUT', '请先输入或保存 API Key')
-        const canPersist = draftApiKey === undefined && savedProvider.baseUrl === baseUrl
+        const apiKey = await appState.loadProviderApiKey(request.id)
+        if (!apiKey) return failure('INVALID_INPUT', '请先保存 API Key')
         const testedAt = new Date().toISOString()
         try {
           const result = await testOpenAiCompatibleProvider(
-            baseUrl,
+            savedProvider.baseUrl,
             apiKey,
-            request.id === 'openai-sub2api' ? 'sub2api' : 'openai',
+            savedProvider.adapterId === 'openai-sub2api' ? 'sub2api' : 'openai',
           )
-          const provider = canPersist
-            ? await appState.markProviderTest(
-                request.id,
-                'connected',
-                testedAt,
-                result.availableModelIds,
-              )
-            : createTransientProvider(
-                savedProvider,
-                baseUrl,
-                Boolean(draftApiKey),
-                'connected',
-                testedAt,
-                result.availableModelIds,
-              )
+          const provider = await appState.markProviderTest(request.id, 'connected', testedAt)
           const value: ProviderConnectionTestResult = {
             connected: true,
             provider,
             latencyMs: result.latencyMs,
-            availableModelIds: result.availableModelIds,
-            message: result.message,
+            message: '连接成功',
           }
           return success(value)
         } catch (error) {
           if (!(error instanceof ProviderRequestError)) throw error
-          const provider = canPersist
-            ? await appState.markProviderTest(request.id, 'failed', testedAt, [])
-            : createTransientProvider(
-                savedProvider,
-                baseUrl,
-                Boolean(draftApiKey),
-                'failed',
-                testedAt,
-                [],
-              )
+          const provider = await appState.markProviderTest(request.id, 'failed', testedAt)
           const value: ProviderConnectionTestResult = {
             connected: false,
             provider,
@@ -658,7 +689,42 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'models:clear-api-key',
+    MODEL_IPC_CHANNELS.discoverProviderModels,
+    trustedHandler(async (request: DiscoverProviderModelsRequest) => {
+      if (!isProviderId(request?.id)) return failure('INVALID_INPUT', 'API 服务标识无效')
+      try {
+        const provider = await appState.getProvider(request.id)
+        const apiKey = await appState.loadProviderApiKey(request.id)
+        if (!apiKey) return failure('INVALID_INPUT', '请先保存 API Key')
+        const result = await testOpenAiCompatibleProvider(
+          provider.baseUrl,
+          apiKey,
+          provider.adapterId === 'openai-sub2api' ? 'sub2api' : 'openai',
+        )
+        const settings = await appState.syncProviderModels(request.id, result.availableModelIds, new Date().toISOString())
+        const syncedProvider = settings.providers.find((item) => item.id === request.id)
+        if (!syncedProvider) return failure('IO_ERROR', '模型同步后 API 服务不存在')
+        const models = settings.models.filter((model) => model.providerId === request.id)
+        const value: ProviderModelDiscoveryResult = {
+          provider: syncedProvider,
+          models,
+          discoveredCount: result.availableModelIds.length,
+          message: result.availableModelIds.length
+            ? `已获取 ${result.availableModelIds.length} 个模型`
+            : '接口未返回可识别的模型',
+        }
+        return success(value)
+      } catch (error) {
+        if (error instanceof ProviderRequestError) {
+          return failure(mapProviderTestErrorCode(error.code), error.message)
+        }
+        return failure('IO_ERROR', '无法获取服务商模型')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.clearApiKey,
     trustedHandler(async (request: ClearProviderApiKeyRequest) => {
       if (!request || !isProviderId(request.id)) {
         return failure('INVALID_INPUT', '服务商配置无效')
@@ -672,7 +738,64 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
-    'models:set-provider-enabled',
+    MODEL_IPC_CHANNELS.addModel,
+    trustedHandler(async (request: AddProviderModelRequest) => {
+      const remoteModelId = normalizeModelText(request?.remoteModelId, 200)
+      const displayName = normalizeModelText(request?.displayName, 200)
+      if (!isProviderId(request?.providerId) || !remoteModelId || !displayName || !isModelKind(request?.kind)) {
+        return failure('INVALID_INPUT', '模型配置无效')
+      }
+      try {
+        return success(await appState.addProviderModel({ ...request, remoteModelId, displayName }))
+      } catch {
+        return failure('IO_ERROR', '无法添加模型，模型 ID 可能已经存在')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.updateModel,
+    trustedHandler(async (request: UpdateProviderModelRequest) => {
+      const displayName = normalizeModelText(request?.displayName, 200)
+      if (!normalizeModelText(request?.key, 400) || !displayName || !isModelKind(request?.kind)) {
+        return failure('INVALID_INPUT', '模型配置无效')
+      }
+      try {
+        return success(await appState.updateProviderModel({ ...request, displayName }))
+      } catch {
+        return failure('IO_ERROR', '无法修改模型')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.removeModel,
+    trustedHandler(async (request: RemoveProviderModelRequest) => {
+      if (!normalizeModelText(request?.key, 400)) return failure('INVALID_INPUT', '模型标识无效')
+      try {
+        return success(await appState.removeProviderModel(request))
+      } catch {
+        return failure('IO_ERROR', '无法删除模型')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.setModelEnabled,
+    trustedHandler(async (request: SetProviderModelEnabledRequest) => {
+      if (!normalizeModelText(request?.key, 400) || typeof request.enabled !== 'boolean') {
+        return failure('INVALID_INPUT', '模型开关设置无效')
+      }
+      try {
+        return success(await appState.setProviderModelEnabled(request))
+      } catch {
+        return failure('IO_ERROR', '无法更新模型开关')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    MODEL_IPC_CHANNELS.setProviderEnabled,
     trustedHandler(async (request: SetProviderEnabledRequest) => {
       if (!request || !isProviderId(request.id) || typeof request.enabled !== 'boolean') {
         return failure('INVALID_INPUT', '服务商开关设置无效')
@@ -1274,24 +1397,6 @@ function registerIpc(): void {
       }
     }),
   )
-}
-
-function createTransientProvider(
-  provider: ProviderConfig,
-  baseUrl: string,
-  _hasDraftApiKey: boolean,
-  connectionStatus: ProviderConfig['connectionStatus'],
-  lastTestedAt: string,
-  availableModelIds: ReadonlyArray<string>,
-): ProviderConfig {
-  return {
-    ...provider,
-    baseUrl,
-    hasApiKey: provider.hasApiKey,
-    connectionStatus,
-    lastTestedAt,
-    availableModelIds,
-  }
 }
 
 function createWindow(): void {

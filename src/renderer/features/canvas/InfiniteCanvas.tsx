@@ -252,7 +252,7 @@ export function createInitialCanvas(
     connections: [{ id: 'c1', from: 'prompt-1', to: 'generator-1' }],
     nodes: [
       { id: 'prompt-1', type: 'prompt', title: '创意提示词', subtitle: prompt ?? '未来主义建筑漂浮在云层之上，清晨金色光线，电影感构图', x: 90, y: 135, color: '#aaff00' },
-      { id: 'generator-1', type: 'generator', title: '图像生成', subtitle: `${defaultImageModelName} · ${formatImageSize(defaultImageSize)}`, modelKey: defaultImageModelKey, imageSize: defaultImageSize, generationCount: 1, x: 440, y: 225, color: '#7c5cff' },
+      { id: 'generator-1', type: 'generator', title: '图像生成', subtitle: `跟随默认 · ${defaultImageModelName} · ${formatImageSize(defaultImageSize)}`, imageSize: defaultImageSize, generationCount: 1, x: 440, y: 225, color: '#7c5cff' },
       { id: 'note-1', type: 'note', title: '方向备注', subtitle: '尝试增加云海层次，保留画面中央的视觉焦点。', x: 470, y: 500, color: '#ffdb5c' },
     ],
   }
@@ -904,11 +904,18 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       notify('请先在提示词节点中输入图片描述')
       return false
     }
-    const modelKey = latestSource.type === 'generator' || latestSource.type === 'compositor'
+    const configuredModelKey = latestSource.type === 'generator' || latestSource.type === 'compositor'
+      ? latestSource.modelKey
+      : undefined
+    const effectiveModelKey = latestSource.type === 'generator' || latestSource.type === 'compositor'
       ? latestSource.modelKey ?? defaultImageModelKey
       : defaultImageModelKey
+    if (!effectiveModelKey || imageModels.length === 0) {
+      notify('请先在模型设置中启用并选择默认图片模型')
+      return false
+    }
     const size = normalizeImageGenerationSize(
-      modelKey,
+      effectiveModelKey,
       latestSource.type === 'generator' || latestSource.type === 'compositor'
         ? latestSource.imageSize
         : undefined,
@@ -945,7 +952,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       type: 'image',
       title: reusableResultNodes[index]?.title || `生成结果 ${resultCount + index + 1}`,
       subtitle: taskPrompts[index].slice(0, 80),
-      modelKey,
+      modelKey: configuredModelKey,
       imageSize: size,
       generationStatus: 'queued',
       generationStartedAt: startedAt,
@@ -984,7 +991,12 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       enqueueGenerationTask({
         documentId: current.id,
         nodeId: node.id,
-        request: { prompt: taskPrompts[index], modelKey, size, referenceImageFileNames },
+        request: {
+          prompt: taskPrompts[index],
+          ...(configuredModelKey ? { modelKey: configuredModelKey } : {}),
+          size,
+          referenceImageFileNames,
+        },
         resolve,
       })
     })))
@@ -1042,11 +1054,11 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     }
     const messages = [...(latestSource.chatMessages ?? []).slice(-98), userMessage]
     pushUndo()
-    updateNode(latestSource.id, { chatMessages: messages, modelKey: latestSource.modelKey ?? defaultChatModelKey })
+    updateNode(latestSource.id, { chatMessages: messages })
     setChattingNodeIds((ids) => new Set([...ids, latestSource.id]))
     try {
       const outcome = await onGenerateChatReply({
-        modelKey: latestSource.modelKey ?? defaultChatModelKey,
+        ...(latestSource.modelKey ? { modelKey: latestSource.modelKey } : {}),
         messages: messages.map((message) => ({ role: message.role, content: message.content })),
       })
       if (!outcome.ok) {
@@ -1064,7 +1076,6 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       }
       updateNode(currentNode.id, {
         chatMessages: [...(currentNode.chatMessages ?? []), assistantMessage].slice(-100),
-        modelKey: outcome.value.modelKey,
       })
       return true
     } catch {
@@ -1088,13 +1099,17 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       if (!theme) notify('请填写分镜主题，或从左侧连接创意提示词 / AI 对话节点')
       return false
     }
+    if (!defaultChatModelKey && !latestSource.modelKey) {
+      notify('请先在模型设置中启用并选择默认对话模型')
+      return false
+    }
     const shotCount = latestSource.storyboardShotCount ?? 4
     setStoryboardNodeIds((ids) => new Set([...ids, latestSource.id]))
     try {
       const outcome = await onGenerateStoryboard({
         theme,
         shotCount,
-        modelKey: latestSource.modelKey ?? defaultChatModelKey,
+        ...(latestSource.modelKey ? { modelKey: latestSource.modelKey } : {}),
       })
       if (!outcome.ok) {
         notify(outcome.error)
@@ -1126,7 +1141,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
         ...latestDocument,
         nodes: [
           ...latestDocument.nodes.map((node) => node.id === currentSource.id
-            ? { ...node, modelKey: outcome.value.modelKey, subtitle: ownTheme || theme }
+            ? { ...node, subtitle: ownTheme || theme }
             : node),
           resultNode,
         ],
@@ -1201,8 +1216,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       notify('请先连接一个有内容的提示词节点或分镜节点')
       return false
     }
-    const modelKey = latestSource.modelKey ?? defaultVideoModelKey
-    if (!modelKey || videoModels.length === 0) {
+    const effectiveModelKey = latestSource.modelKey ?? defaultVideoModelKey
+    if (!effectiveModelKey || videoModels.length === 0) {
       notify('请先在模型设置中启用一个视频模型')
       return false
     }
@@ -1210,7 +1225,6 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const startedAt = new Date().toISOString()
     pushUndo()
     updateNode(latestSource.id, {
-      modelKey,
       videoPromptId: selectedPrompt.id,
       generationStatus: 'generating',
       generationStartedAt: startedAt,
@@ -1221,7 +1235,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     try {
       const outcome = await onGenerateVideo({
         prompt: selectedPrompt.prompt,
-        modelKey,
+        ...(latestSource.modelKey ? { modelKey: latestSource.modelKey } : {}),
         duration: latestSource.videoDuration ?? 5,
         resolution: latestSource.videoResolution ?? '768P',
         ratio: latestSource.videoRatio ?? '16:9',
@@ -1277,14 +1291,13 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       notify('单次同步语音合成文本必须少于 10000 字')
       return false
     }
-    const modelKey = latestSource.modelKey ?? defaultAudioModelKey
-    if (!modelKey || audioModels.length === 0) {
+    const effectiveModelKey = latestSource.modelKey ?? defaultAudioModelKey
+    if (!effectiveModelKey || audioModels.length === 0) {
       notify('请先在模型设置中启用一个语音模型')
       return false
     }
     pushUndo()
     updateNode(latestSource.id, {
-      modelKey,
       generationStatus: 'generating',
       generationStartedAt: new Date().toISOString(),
       generationCompletedAt: undefined,
@@ -1294,7 +1307,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     try {
       const outcome = await onGenerateAudio({
         text,
-        modelKey,
+        ...(latestSource.modelKey ? { modelKey: latestSource.modelKey } : {}),
         voiceId: latestSource.audioVoiceId ?? 'female-shaonv',
         speed: latestSource.audioSpeed ?? 1,
         pitch: latestSource.audioPitch ?? 0,
@@ -1311,7 +1324,6 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       }
       updateNode(latestSource.id, {
         audioFileName: outcome.value.audio.audioFileName,
-        modelKey: outcome.value.audio.modelKey,
         generationStatus: 'succeeded',
         generationCompletedAt: new Date().toISOString(),
         generationError: undefined,
@@ -2111,8 +2123,10 @@ function ChatNode({ chatModels, defaultChatModelKey, isChatting, node, onCreateP
     <div className="chat-node-body">
       <div className="chat-model-row">
         <Bot size={14}/>
-        <select aria-label="对话模型" disabled={chatModels.length === 0 || isChatting} onChange={(event) => onUpdate({ modelKey: event.target.value })} value={node.modelKey ?? defaultChatModelKey}>
+        <select aria-label="对话模型" disabled={chatModels.length === 0 || isChatting} onChange={(event) => onUpdate({ modelKey: event.target.value || undefined })} value={node.modelKey ?? ''}>
           {chatModels.length === 0 && <option value="">未配置对话模型</option>}
+          {chatModels.length > 0 && <option value="">跟随默认 · {chatModels.find((model) => model.key === defaultChatModelKey)?.label ?? '对话模型'}</option>}
+          {node.modelKey && !chatModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}
           {chatModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}
         </select>
         {messages.length > 0 && <button onClick={() => onUpdate({ chatMessages: [] })} title="清空对话" type="button"><Trash2 size={12}/></button>}
@@ -2154,8 +2168,10 @@ function StoryboardNode({ chatModels, defaultChatModelKey, generating, inputAvai
     <div className="storyboard-node-body">
       <textarea aria-label="分镜主题" disabled={generating} onChange={(event) => onUpdate({ subtitle: event.target.value })} placeholder="描述故事主题、人物、场景与风格…" value={node.subtitle ?? ''}/>
       <div className="storyboard-controls">
-        <label><span>文本模型</span><select aria-label="分镜对话模型" disabled={generating || chatModels.length === 0} onChange={(event) => onUpdate({ modelKey: event.target.value })} value={node.modelKey ?? defaultChatModelKey}>
+        <label><span>文本模型</span><select aria-label="分镜对话模型" disabled={generating || chatModels.length === 0} onChange={(event) => onUpdate({ modelKey: event.target.value || undefined })} value={node.modelKey ?? ''}>
           {chatModels.length === 0 && <option value="">未配置对话模型</option>}
+          {chatModels.length > 0 && <option value="">跟随默认 · {chatModels.find((model) => model.key === defaultChatModelKey)?.label ?? '对话模型'}</option>}
+          {node.modelKey && !chatModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}
           {chatModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}
         </select></label>
         <label><span>镜头数</span><select aria-label="分镜数量" disabled={generating} onChange={(event) => onUpdate({ storyboardShotCount: Number(event.target.value) })} value={node.storyboardShotCount ?? 4}>
@@ -2415,10 +2431,10 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
   onUpdate: (patch: Partial<CanvasNodeData>) => void
   referenceImages: ReadonlyArray<ConnectedReferenceImage>
 }>) {
-  const selectedModelKey = node.modelKey ?? defaultImageModelKey
-  const selectedModel = imageModels.find((model) => model.key === selectedModelKey)
-  const sizeOptions = imageGenerationSizeOptionsForModel(selectedModelKey)
-  const selectedImageSize = normalizeImageGenerationSize(selectedModelKey, node.imageSize)
+  const effectiveModelKey = node.modelKey ?? defaultImageModelKey
+  const selectedModel = imageModels.find((model) => model.key === effectiveModelKey)
+  const sizeOptions = imageGenerationSizeOptionsForModel(effectiveModelKey)
+  const selectedImageSize = normalizeImageGenerationSize(effectiveModelKey, node.imageSize)
   return (
     <div className="generator-node-body">
       {isCompositor && (
@@ -2445,15 +2461,18 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
         模型
         <select
           onChange={(event) => {
-            const model = imageModels.find((item) => item.key === event.target.value)
-            const imageSize = normalizeImageGenerationSize(event.target.value, node.imageSize)
+            const modelKey = event.target.value || undefined
+            const nextEffectiveModelKey = modelKey ?? defaultImageModelKey
+            const model = imageModels.find((item) => item.key === nextEffectiveModelKey)
+            const imageSize = normalizeImageGenerationSize(nextEffectiveModelKey, node.imageSize)
             onUpdate(isCompositor
-              ? { modelKey: event.target.value, imageSize }
-              : { modelKey: event.target.value, imageSize, subtitle: `${model?.label ?? '图片模型'} · ${formatImageSize(imageSize)}` })
+              ? { modelKey, imageSize }
+              : { modelKey, imageSize, subtitle: `${modelKey ? '' : '跟随默认 · '}${model?.label ?? '图片模型'} · ${formatImageSize(imageSize)}` })
           }}
-          value={selectedModelKey}
+          value={node.modelKey ?? ''}
         >
-          {!selectedModel && <option value={selectedModelKey}>当前默认图片模型</option>}
+          <option value="">跟随默认 · {imageModels.find((model) => model.key === defaultImageModelKey)?.label ?? '图片模型'}</option>
+          {node.modelKey && !imageModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}
           {imageModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}
         </select>
       </label>
@@ -2493,10 +2512,9 @@ function CanvasVideoNode({ defaultVideoModelKey, generationNow, node, onGenerate
   videoModels: ReadonlyArray<CanvasImageModelOption>
   videoPromptOptions: ReadonlyArray<ConnectedVideoPrompt>
 }>) {
-  const modelKey = node.modelKey ?? defaultVideoModelKey
-  const selectedModel = videoModels.find((model) => model.key === modelKey)
+  const effectiveModelKey = node.modelKey ?? defaultVideoModelKey
   const selectedPrompt = videoPromptOptions.find((option) => option.id === node.videoPromptId) ?? videoPromptOptions[0]
-  const usesOnlyFirstReference = modelKey.includes(':MiniMax-Hailuo-')
+  const usesOnlyFirstReference = effectiveModelKey.includes(':MiniMax-Hailuo-')
   const pending = node.generationStatus === 'queued' || node.generationStatus === 'generating'
   const elapsedSeconds = generationElapsedSeconds(
     node.generationStartedAt,
@@ -2535,7 +2553,7 @@ function CanvasVideoNode({ defaultVideoModelKey, generationNow, node, onGenerate
         onRemove={onRemoveReference}
         references={referenceImages}
       />
-      <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value })} value={modelKey}>{!selectedModel && modelKey && <option value={modelKey}>当前视频模型</option>}{videoModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
+      <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value || undefined })} value={node.modelKey ?? ''}><option value="">跟随默认 · {videoModels.find((model) => model.key === defaultVideoModelKey)?.label ?? '视频模型'}</option>{node.modelKey && !videoModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}{videoModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
       <div className="video-fields">
         <label>时长<select onChange={(event) => onUpdate({ videoDuration: Number(event.target.value) })} value={node.videoDuration ?? 5}><option value="5">5 秒</option><option value="6">6 秒</option><option value="10">10 秒</option></select></label>
         <label>清晰度<select onChange={(event) => onUpdate({ videoResolution: event.target.value as VideoGenerationResolution })} value={node.videoResolution ?? '768P'}><option value="768P">768P</option><option value="1080P">1080P</option><option value="2K">2K</option></select></label>
@@ -2554,8 +2572,6 @@ function CanvasAudioNode({ audioModels, defaultAudioModelKey, generationNow, nod
   onGenerate: () => void
   onUpdate: (patch: Partial<CanvasNodeData>) => void
 }>) {
-  const modelKey = node.modelKey ?? defaultAudioModelKey
-  const selectedModel = audioModels.find((model) => model.key === modelKey)
   const pending = node.generationStatus === 'queued' || node.generationStatus === 'generating'
   const elapsedSeconds = generationElapsedSeconds(
     node.generationStartedAt,
@@ -2575,7 +2591,7 @@ function CanvasAudioNode({ audioModels, defaultAudioModelKey, generationNow, nod
         </div>
       )}
       <label className="audio-text">旁白文本<textarea maxLength={9_999} onChange={(event) => onUpdate({ subtitle: event.target.value })} placeholder="也可以连接提示词、AI 对话或分镜节点" value={node.subtitle === '连接提示词或输入旁白文本' ? '' : node.subtitle ?? ''}/></label>
-      <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value })} value={modelKey}>{!selectedModel && modelKey && <option value={modelKey}>当前语音模型</option>}{audioModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
+      <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value || undefined })} value={node.modelKey ?? ''}><option value="">跟随默认 · {audioModels.find((model) => model.key === defaultAudioModelKey)?.label ?? '音频模型'}</option>{node.modelKey && !audioModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}{audioModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
       <div className="audio-fields">
         <label>音色<input list={`audio-voices-${node.id}`} onChange={(event) => onUpdate({ audioVoiceId: event.target.value })} placeholder="系统或克隆音色 ID" value={node.audioVoiceId ?? 'female-shaonv'}/><datalist id={`audio-voices-${node.id}`}>{AUDIO_VOICE_OPTIONS.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}</datalist></label>
         <label>语速<select onChange={(event) => onUpdate({ audioSpeed: Number(event.target.value) })} value={node.audioSpeed ?? 1}>{[0.5, 0.75, 1, 1.25, 1.5, 2].map((speed) => <option key={speed} value={speed}>{speed}×</option>)}</select></label>
@@ -2804,11 +2820,11 @@ function createNodeData(
     id: `${type}-${crypto.randomUUID()}`,
     type,
     title: `${labels[type]} ${count}`,
-    subtitle: type === 'generator' ? `${defaultImageModelName} · ${formatImageSize(defaultImageSize)}` : type === 'video' || type === 'compositor' ? '' : defaultSubtitle(type),
+    subtitle: type === 'generator' ? `跟随默认 · ${defaultImageModelName} · ${formatImageSize(defaultImageSize)}` : type === 'video' || type === 'compositor' ? '' : defaultSubtitle(type),
     ...(type === 'generator' || type === 'compositor'
-      ? { modelKey: defaultImageModelKey, imageSize: defaultImageSize, generationCount: 1 as const }
+      ? { imageSize: defaultImageSize, generationCount: 1 as const }
       : type === 'video'
-        ? { modelKey: defaultVideoModelKey, videoDuration: 5, videoResolution: '768P' as const, videoRatio: '16:9' as const, title: `${labels[type]} ${count} · ${defaultVideoModelName}` }
+        ? { videoDuration: 5, videoResolution: '768P' as const, videoRatio: '16:9' as const, title: `${labels[type]} ${count} · 跟随默认 · ${defaultVideoModelName}` }
       : type === 'storyboard'
         ? { storyboardShotCount: 4 }
       : type === 'shot-list'

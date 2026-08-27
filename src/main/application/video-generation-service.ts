@@ -2,13 +2,13 @@ import type {
   GeneratedVideoResult,
   GenerateVideoRequest,
 } from '../../shared/contracts/desktop'
-import { findBuiltinModelByKey } from '../../shared/domain/models'
 import {
   generateMiniMaxVideo,
   generateVolcengineVideo,
   VideoGenerationRequestError,
 } from '../infrastructure/video-generation-client'
 import type { AppState } from './app-state'
+import { isRetryableRemoteStatus, ModelRoutingError, runWithModelRoute } from './model-routing'
 
 export type VideoGenerationServiceErrorCode =
   | 'MODEL_NOT_CONFIGURED'
@@ -30,69 +30,55 @@ export class VideoGenerationService {
   constructor(private readonly appState: AppState) {}
 
   async generate(request: GenerateVideoRequest): Promise<GeneratedVideoResult> {
-    const settings = await this.appState.loadSettings()
-    const modelKey = request.modelKey ?? settings.defaultModelKeys.video
-    if (!modelKey || !settings.enabledModelKeys.includes(modelKey)) {
-      throw new VideoGenerationServiceError(
-        'MODEL_NOT_CONFIGURED',
-        '当前没有可用的默认视频模型，请先在模型设置中启用并设为默认',
-      )
-    }
-    const model = findBuiltinModelByKey(modelKey)
-    if (!model || model.kind !== 'video') {
-      throw new VideoGenerationServiceError('MODEL_NOT_CONFIGURED', '选择的模型不是可用的视频模型')
-    }
-    const provider = settings.providers.find((item) => item.id === model.providerId)
-    if (!provider?.enabled || !provider.hasApiKey) {
-      throw new VideoGenerationServiceError(
-        'PROVIDER_NOT_CONFIGURED',
-        '请先启用该视频模型所属服务商并保存 API Key',
-      )
-    }
-    if (provider.id !== 'minimax' && provider.id !== 'volcengine') {
-      throw new VideoGenerationServiceError(
-        'UNSUPPORTED_PROVIDER',
-        '当前视频节点支持 MiniMax 和火山方舟视频模型',
-      )
-    }
-    const apiKey = await this.appState.loadProviderApiKey(provider.id)
-    if (!apiKey) {
-      throw new VideoGenerationServiceError('PROVIDER_NOT_CONFIGURED', '无法读取该服务商的 API Key')
-    }
     try {
-      const maximumReferences = model.remoteModelId === 'MiniMax-H3'
-        ? 9
-        : model.remoteModelId.startsWith('MiniMax-Hailuo') ? 1 : 12
-      const referenceFileNames = [...new Set(request.referenceImageFileNames ?? [])].slice(0, maximumReferences)
-      const referenceImages = await this.appState.loadStoredImages(referenceFileNames)
-      const normalizedRequest = normalizeVideoOptions(model.remoteModelId, request)
-      const generated = provider.id === 'minimax'
-        ? await generateMiniMaxVideo({
-            ...normalizedRequest,
-            baseUrl: provider.baseUrl,
-            apiKey,
-            model: model.remoteModelId,
-            referenceImages,
+      return await runWithModelRoute(
+        this.appState,
+        'video',
+        request.modelKey,
+        isRetryableVideoError,
+        async ({ apiKey, model, provider }) => {
+          if (provider.adapterId !== 'minimax' && provider.adapterId !== 'volcengine') {
+            throw new VideoGenerationServiceError('UNSUPPORTED_PROVIDER', '该 API 服务的视频生成协议尚未接入')
+          }
+          const maximumReferences = model.remoteModelId === 'MiniMax-H3'
+            ? 9
+            : model.remoteModelId.startsWith('MiniMax-Hailuo') ? 1 : 12
+          const referenceFileNames = [...new Set(request.referenceImageFileNames ?? [])]
+            .slice(0, maximumReferences)
+          const referenceImages = await this.appState.loadStoredImages(referenceFileNames)
+          const normalizedRequest = normalizeVideoOptions(model.remoteModelId, request)
+          const generated = provider.adapterId === 'minimax'
+            ? await generateMiniMaxVideo({
+                ...normalizedRequest,
+                baseUrl: provider.baseUrl,
+                apiKey,
+                model: model.remoteModelId,
+                referenceImages,
+              })
+            : await generateVolcengineVideo({
+                ...normalizedRequest,
+                baseUrl: provider.baseUrl,
+                apiKey,
+                model: model.remoteModelId,
+                referenceImages,
+              })
+          const video = await this.appState.saveGeneratedVideo({
+            ...generated,
+            prompt: request.prompt,
+            modelKey: model.key,
+            modelName: model.displayName,
+            duration: normalizedRequest.duration,
+            resolution: normalizedRequest.resolution,
+            ratio: normalizedRequest.ratio,
+            referenceImageFileNames: referenceFileNames,
           })
-        : await generateVolcengineVideo({
-            ...normalizedRequest,
-            baseUrl: provider.baseUrl,
-            apiKey,
-            model: model.remoteModelId,
-            referenceImages,
-          })
-      const video = await this.appState.saveGeneratedVideo({
-        ...generated,
-        prompt: request.prompt,
-        modelKey,
-        modelName: model.displayName,
-        duration: normalizedRequest.duration,
-        resolution: normalizedRequest.resolution,
-        ratio: normalizedRequest.ratio,
-        referenceImageFileNames: referenceFileNames,
-      })
-      return { video }
+          return { video }
+        },
+      )
     } catch (error) {
+      if (error instanceof ModelRoutingError) {
+        throw new VideoGenerationServiceError(error.code, error.message)
+      }
       if (error instanceof VideoGenerationRequestError) {
         throw new VideoGenerationServiceError('PROVIDER_REQUEST', error.message)
       }
@@ -107,6 +93,15 @@ export class VideoGenerationService {
       throw error
     }
   }
+}
+
+function isRetryableVideoError(error: unknown): boolean {
+  return error instanceof VideoGenerationRequestError && (
+    error.code === 'NETWORK' ||
+    error.code === 'TIMEOUT' ||
+    error.code === 'RATE_LIMIT' ||
+    (error.code === 'REMOTE' && isRetryableRemoteStatus(error.httpStatus))
+  )
 }
 
 function normalizeVideoOptions(

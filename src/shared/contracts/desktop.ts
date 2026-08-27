@@ -1,4 +1,10 @@
-import type { ImageGenerationSize, ModelKind } from '../domain/models'
+import type {
+  ConfiguredProviderModel,
+  ImageGenerationSize,
+  ModelKind,
+  ModelRoutes,
+  ProviderAdapterId,
+} from '../domain/models'
 
 export type { ImageGenerationSize } from '../domain/models'
 
@@ -44,12 +50,15 @@ export type ProviderConnectionStatus = 'untested' | 'connected' | 'failed'
 
 export type ProviderConfig = Readonly<{
   id: string
+  name: string
+  adapterId: ProviderAdapterId
   baseUrl: string
   enabled: boolean
   hasApiKey: boolean
   connectionStatus: ProviderConnectionStatus
   lastTestedAt?: string
-  availableModelIds: ReadonlyArray<string>
+  lastSyncedAt?: string
+  modelCount: number
 }>
 
 export type AppSettings = Readonly<{
@@ -57,8 +66,8 @@ export type AppSettings = Readonly<{
   accentColor: string
   storageDirectory: string
   favoriteImageIds: ReadonlyArray<string>
-  enabledModelKeys: ReadonlyArray<string>
-  defaultModelKeys: Readonly<Partial<Record<ModelKind, string>>>
+  models: ReadonlyArray<ConfiguredProviderModel>
+  modelRoutes: ModelRoutes
   providers: ReadonlyArray<ProviderConfig>
 }>
 
@@ -66,8 +75,7 @@ export type UpdateSettingsRequest = Readonly<{
   theme?: ThemeMode
   accentColor?: string
   favoriteImageIds?: ReadonlyArray<string>
-  enabledModelKeys?: ReadonlyArray<string>
-  defaultModelKeys?: Readonly<Partial<Record<ModelKind, string>>>
+  modelRoutes?: ModelRoutes
 }>
 
 export type CheckForUpdatesRequest = Readonly<{
@@ -92,17 +100,27 @@ export type AppUpdateCheck =
       checkedAt: string
     }>
 
-export type SaveProviderRequest = Readonly<{
+export type CreateProviderRequest = Readonly<{
+  name: string
+  adapterId: ProviderAdapterId
+  baseUrl: string
+  apiKey?: string
+}>
+
+export type UpdateProviderRequest = Readonly<{
   id: string
+  name: string
+  adapterId: ProviderAdapterId
   baseUrl: string
   apiKey?: string
 }>
 
 export type TestProviderRequest = Readonly<{
   id: string
-  baseUrl: string
-  apiKey?: string
 }>
+
+export type DiscoverProviderModelsRequest = Readonly<{ id: string }>
+export type RemoveProviderRequest = Readonly<{ id: string }>
 
 export type ClearProviderApiKeyRequest = Readonly<{
   id: string
@@ -125,7 +143,6 @@ export type ProviderConnectionTestResult =
       connected: true
       provider: ProviderConfig
       latencyMs: number
-      availableModelIds: ReadonlyArray<string>
       message: string
     }>
   | Readonly<{
@@ -137,6 +154,33 @@ export type ProviderConnectionTestResult =
         message: string
       }>
     }>
+
+export type ProviderModelDiscoveryResult = Readonly<{
+  provider: ProviderConfig
+  models: ReadonlyArray<ConfiguredProviderModel>
+  discoveredCount: number
+  message: string
+}>
+
+export type AddProviderModelRequest = Readonly<{
+  providerId: string
+  remoteModelId: string
+  displayName: string
+  kind: ModelKind
+}>
+
+export type UpdateProviderModelRequest = Readonly<{
+  key: string
+  displayName: string
+  kind: ModelKind
+}>
+
+export type SetProviderModelEnabledRequest = Readonly<{
+  key: string
+  enabled: boolean
+}>
+
+export type RemoveProviderModelRequest = Readonly<{ key: string }>
 
 export type CanvasNodeType = 'prompt' | 'storyboard' | 'shot-list' | 'generator' | 'compositor' | 'image' | 'reference-folder' | 'note' | 'chat' | 'video' | 'audio'
 export type CanvasGenerationStatus = 'queued' | 'generating' | 'succeeded' | 'failed'
@@ -478,10 +522,19 @@ export type DesktopApi = Readonly<{
     openLatestRelease: () => Promise<DesktopResult<null>>
   }>
   models: Readonly<{
-    saveProvider: (request: SaveProviderRequest) => Promise<DesktopResult<ProviderConfig>>
+    createProvider: (request: CreateProviderRequest) => Promise<DesktopResult<AppSettings>>
+    updateProvider: (request: UpdateProviderRequest) => Promise<DesktopResult<AppSettings>>
+    removeProvider: (request: RemoveProviderRequest) => Promise<DesktopResult<AppSettings>>
     testProvider: (request: TestProviderRequest) => Promise<DesktopResult<ProviderConnectionTestResult>>
+    discoverProviderModels: (
+      request: DiscoverProviderModelsRequest,
+    ) => Promise<DesktopResult<ProviderModelDiscoveryResult>>
     clearApiKey: (request: ClearProviderApiKeyRequest) => Promise<DesktopResult<ProviderConfig>>
     setProviderEnabled: (request: SetProviderEnabledRequest) => Promise<DesktopResult<ProviderConfig>>
+    addModel: (request: AddProviderModelRequest) => Promise<DesktopResult<AppSettings>>
+    updateModel: (request: UpdateProviderModelRequest) => Promise<DesktopResult<AppSettings>>
+    removeModel: (request: RemoveProviderModelRequest) => Promise<DesktopResult<AppSettings>>
+    setModelEnabled: (request: SetProviderModelEnabledRequest) => Promise<DesktopResult<AppSettings>>
   }>
   history: Readonly<{
     load: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>

@@ -3,8 +3,10 @@ import { copyFile, readFile, readdir, stat, unlink, writeFile } from 'node:fs/pr
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { app, safeStorage } from 'electron/main'
 import type {
+  AddProviderModelRequest,
   AppSettings,
   CanvasDocument,
+  CreateProviderRequest,
   ExportHistoryBatchRequest,
   GeneratedAudioAsset,
   GeneratedArtwork,
@@ -19,22 +21,33 @@ import type {
   RemoveResourceRequest,
   ResourceCatalog,
   SavePromptRequest,
-  SaveProviderRequest,
+  RemoveProviderModelRequest,
+  RemoveProviderRequest,
   SaveWorkflowRequest,
   StorageMigrationResult,
   StorageStats,
+  SetProviderModelEnabledRequest,
   ThemeMode,
+  UpdateProviderModelRequest,
+  UpdateProviderRequest,
   UpdateSettingsRequest,
   VideoGenerationRatio,
   VideoGenerationResolution,
 } from '../../shared/contracts/desktop'
 import { createRecentCanvasProject, isCanvasDocument } from '../../shared/domain/canvas-document'
 import {
+  BUILTIN_PROVIDER_MODELS,
+  createConfiguredModel,
+  createProviderModelKey,
   DEFAULT_CHAT_MODEL_KEY,
   DEFAULT_IMAGE_MODEL_KEY,
   findBuiltinModelByKey,
   findBuiltinModelsByRemoteId,
+  inferModelKind,
+  type ConfiguredProviderModel,
   type ModelKind,
+  type ModelRoutes,
+  type ProviderAdapterId,
 } from '../../shared/domain/models'
 import {
   legacySeedArtworks,
@@ -104,11 +117,14 @@ export type SaveGeneratedAudioRequest = Readonly<{
 
 type StoredProvider = Readonly<{
   id: string
+  name?: string
+  adapterId?: ProviderAdapterId
   baseUrl: string
   enabled?: boolean
   encryptedApiKey?: string
   connectionStatus?: ProviderConnectionStatus
   lastTestedAt?: string
+  lastSyncedAt?: string
   availableModelIds?: ReadonlyArray<string>
   connected?: boolean
 }>
@@ -138,13 +154,15 @@ type StoredModelConfigDocument = Readonly<{
   enabledModelKeys?: ReadonlyArray<string>
   defaultModelKeys?: Readonly<Partial<Record<ModelKind, string>>>
   providers?: ReadonlyArray<StoredProvider>
+  models?: ReadonlyArray<ConfiguredProviderModel>
+  modelRoutes?: ModelRoutes
 }>
 
 type ModelConfigDocument = Readonly<{
-  schemaVersion: 5
-  enabledModelKeys: ReadonlyArray<string>
-  defaultModelKeys: Readonly<Partial<Record<ModelKind, string>>>
+  schemaVersion: 6
   providers: ReadonlyArray<StoredProvider>
+  models: ReadonlyArray<ConfiguredProviderModel>
+  modelRoutes: ModelRoutes
 }>
 
 type StoredRecentCanvasProject = Readonly<Omit<RecentCanvasProject, 'location'> & {
@@ -167,22 +185,27 @@ const LEGACY_DEFAULT_MODELS = [
 
 function defaultProviders(): ReadonlyArray<StoredProvider> {
   return [
-    createDefaultProvider('apimart', 'https://api.apimart.ai/v1', false),
-    createDefaultProvider('volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
-    createDefaultProvider('minimax', 'https://api.minimaxi.com/v1', true),
-    createDefaultProvider('comfly', 'https://api.comfly.chat/v1', false),
-    createDefaultProvider('openai', 'https://api.openai.com/v1', true),
-    createDefaultProvider('openai-sub2api', '', false),
+    createDefaultProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
+    createDefaultProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
+    createDefaultProvider('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', true),
+    createDefaultProvider('openai-sub2api', 'OpenAI 中转', 'openai-sub2api', '', false),
   ]
 }
 
-function createDefaultProvider(id: string, baseUrl: string, enabled: boolean): StoredProvider {
+function createDefaultProvider(
+  id: string,
+  name: string,
+  adapterId: ProviderAdapterId,
+  baseUrl: string,
+  enabled: boolean,
+): StoredProvider {
   return {
     id,
+    name,
+    adapterId,
     baseUrl,
     enabled,
     connectionStatus: 'untested',
-    availableModelIds: [],
   }
 }
 
@@ -260,20 +283,12 @@ export class AppState {
         })
       }
 
-      if (request.enabledModelKeys !== undefined || request.defaultModelKeys !== undefined) {
+      if (request.modelRoutes !== undefined) {
         await this.modelConfigStore.update((value) => {
           const current = this.normalizeModelConfig(value)
-          const enabledModelKeys = request.enabledModelKeys !== undefined
-            ? validModelKeys(request.enabledModelKeys)
-            : current.enabledModelKeys
-          const requestedDefaults = request.defaultModelKeys !== undefined
-            ? normalizeDefaultModelKeys(request.defaultModelKeys, enabledModelKeys)
-            : current.defaultModelKeys
-          const defaults = normalizeDefaultModelKeys(requestedDefaults, enabledModelKeys)
           return {
             ...current,
-            enabledModelKeys,
-            defaultModelKeys: defaults,
+            modelRoutes: normalizeModelRoutes(request.modelRoutes, current.models),
           }
         })
       }
@@ -282,43 +297,85 @@ export class AppState {
     })
   }
 
-  async saveProvider(request: SaveProviderRequest): Promise<ProviderConfig> {
+  async createProvider(request: CreateProviderRequest): Promise<AppSettings> {
     return this.withStorageOperation(async () => {
-      let encryptedApiKey: string | undefined
-      if (request.apiKey !== undefined) {
-        if (!(await safeStorage.isAsyncEncryptionAvailable())) {
-          throw new ProviderSecretUnavailableError()
-        }
-        encryptedApiKey = (await safeStorage.encryptStringAsync(request.apiKey)).toString('base64')
-      }
-
-      const storedModelConfig = await this.modelConfigStore.update((value) => {
+      const encryptedApiKey = request.apiKey === undefined
+        ? undefined
+        : await encryptProviderApiKey(request.apiKey)
+      const id = randomUUID()
+      await this.modelConfigStore.update((value) => {
         const current = this.normalizeModelConfig(value)
-        const existing = current.providers.find((provider) => provider.id === request.id)
+        const provider: StoredProvider = {
+          id,
+          name: request.name,
+          adapterId: request.adapterId,
+          baseUrl: request.baseUrl,
+          enabled: true,
+          ...(encryptedApiKey ? { encryptedApiKey } : {}),
+          connectionStatus: 'untested',
+        }
+        return { ...current, providers: [...current.providers, provider] }
+      })
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async updateProvider(request: UpdateProviderRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      const encryptedApiKey = request.apiKey === undefined
+        ? undefined
+        : await encryptProviderApiKey(request.apiKey)
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        const existing = findProvider(current, request.id)
         const credentialsChanged = request.apiKey !== undefined
-        const endpointChanged = existing?.baseUrl !== request.baseUrl
+        const endpointChanged = existing.baseUrl !== request.baseUrl || existing.adapterId !== request.adapterId
         const provider: StoredProvider = {
           id: request.id,
+          name: request.name,
+          adapterId: request.adapterId,
           baseUrl: request.baseUrl,
-          enabled: existing?.enabled ?? true,
-          ...(encryptedApiKey || existing?.encryptedApiKey
-            ? { encryptedApiKey: encryptedApiKey ?? existing?.encryptedApiKey }
+          enabled: existing.enabled ?? true,
+          ...(encryptedApiKey || existing.encryptedApiKey
+            ? { encryptedApiKey: encryptedApiKey ?? existing.encryptedApiKey }
             : {}),
           connectionStatus:
-            credentialsChanged || endpointChanged ? 'untested' : existing?.connectionStatus ?? 'untested',
-          ...(!credentialsChanged && !endpointChanged && existing?.lastTestedAt
+            credentialsChanged || endpointChanged ? 'untested' : existing.connectionStatus ?? 'untested',
+          ...(!credentialsChanged && !endpointChanged && existing.lastTestedAt
             ? { lastTestedAt: existing.lastTestedAt }
             : {}),
-          availableModelIds:
-            credentialsChanged || endpointChanged ? [] : existing?.availableModelIds ?? [],
+          ...(!endpointChanged && existing.lastSyncedAt ? { lastSyncedAt: existing.lastSyncedAt } : {}),
         }
         return {
           ...current,
           providers: replaceProvider(current.providers, provider),
+          models: endpointChanged
+            ? current.models.map((model) => model.providerId === request.id
+              ? { ...model, available: model.source === 'manual' }
+              : model)
+            : current.models,
         }
       })
-      const modelConfig = this.normalizeModelConfig(storedModelConfig)
-      return this.toPublicProvider(findProvider(modelConfig, request.id))
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async removeProvider(request: RemoveProviderRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        findProvider(current, request.id)
+        const removedModelKeys = new Set(current.models
+          .filter((model) => model.providerId === request.id)
+          .map((model) => model.key))
+        return {
+          ...current,
+          providers: current.providers.filter((provider) => provider.id !== request.id),
+          models: current.models.filter((model) => model.providerId !== request.id),
+          modelRoutes: removeModelKeysFromRoutes(current.modelRoutes, removedModelKeys),
+        }
+      })
+      return this.loadSettingsUnsafe()
     })
   }
 
@@ -328,16 +385,15 @@ export class AppState {
         const current = this.normalizeModelConfig(value)
         const existing = findProvider(current, id)
         const provider: StoredProvider = {
-          id: existing.id,
-          baseUrl: existing.baseUrl,
-          enabled: existing.enabled ?? true,
+          ...existing,
+          encryptedApiKey: undefined,
           connectionStatus: 'untested',
-          availableModelIds: [],
+          lastTestedAt: undefined,
         }
         return { ...current, providers: replaceProvider(current.providers, provider) }
       })
       const modelConfig = this.normalizeModelConfig(storedModelConfig)
-      return this.toPublicProvider(findProvider(modelConfig, id))
+      return this.toPublicProvider(findProvider(modelConfig, id), modelConfig.models)
     })
   }
 
@@ -352,7 +408,7 @@ export class AppState {
         }
       })
       const modelConfig = this.normalizeModelConfig(storedModelConfig)
-      return this.toPublicProvider(findProvider(modelConfig, id))
+      return this.toPublicProvider(findProvider(modelConfig, id), modelConfig.models)
     })
   }
 
@@ -379,15 +435,16 @@ export class AppState {
   }
 
   async getProvider(id: string): Promise<ProviderConfig> {
-    return this.withStorageOperation(async () =>
-      this.toPublicProvider(findProvider(this.normalizeModelConfig(await this.modelConfigStore.read()), id)))
+    return this.withStorageOperation(async () => {
+      const config = this.normalizeModelConfig(await this.modelConfigStore.read())
+      return this.toPublicProvider(findProvider(config, id), config.models)
+    })
   }
 
   async markProviderTest(
     id: string,
     connectionStatus: Extract<ProviderConnectionStatus, 'connected' | 'failed'>,
     testedAt: string,
-    availableModelIds: ReadonlyArray<string>,
   ): Promise<ProviderConfig> {
     return this.withStorageOperation(async () => {
       const storedModelConfig = await this.modelConfigStore.update((value) => {
@@ -397,12 +454,119 @@ export class AppState {
           ...existing,
           connectionStatus,
           lastTestedAt: testedAt,
-          availableModelIds: connectionStatus === 'connected' ? uniqueStrings(availableModelIds, 500) : [],
         }
         return { ...current, providers: replaceProvider(current.providers, provider) }
       })
       const modelConfig = this.normalizeModelConfig(storedModelConfig)
-      return this.toPublicProvider(findProvider(modelConfig, id))
+      return this.toPublicProvider(findProvider(modelConfig, id), modelConfig.models)
+    })
+  }
+
+  async syncProviderModels(
+    id: string,
+    remoteModelIds: ReadonlyArray<string>,
+    syncedAt: string,
+  ): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        const provider = findProvider(current, id)
+        const discoveredIds = uniqueStrings(remoteModelIds, 500)
+        const discoveredSet = new Set(discoveredIds)
+        const existingByRemoteId = new Map(current.models
+          .filter((model) => model.providerId === id)
+          .map((model) => [model.remoteModelId, model]))
+        const retained = current.models
+          .filter((model) => model.providerId !== id)
+        const providerModels = current.models
+          .filter((model) => model.providerId === id)
+          .filter((model) => !discoveredSet.has(model.remoteModelId))
+          .map((model) => model.source === 'manual' ? model : { ...model, available: false })
+        const discovered = discoveredIds.map((remoteModelId) => {
+          const existing = existingByRemoteId.get(remoteModelId)
+          if (existing) return { ...existing, available: true }
+          return createDiscoveredModel(provider, remoteModelId)
+        })
+        return {
+          ...current,
+          providers: replaceProvider(current.providers, { ...provider, lastSyncedAt: syncedAt }),
+          models: [...retained, ...providerModels, ...discovered],
+        }
+      })
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async addProviderModel(request: AddProviderModelRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        findProvider(current, request.providerId)
+        const key = createProviderModelKey(request.providerId, request.remoteModelId)
+        if (current.models.some((model) => model.key === key)) throw new Error('Model already exists')
+        const model: ConfiguredProviderModel = {
+          key,
+          providerId: request.providerId,
+          remoteModelId: request.remoteModelId,
+          displayName: request.displayName,
+          kind: request.kind,
+          description: '手动添加的模型',
+          source: 'manual',
+          enabled: true,
+          available: true,
+        }
+        return { ...current, models: [...current.models, model] }
+      })
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async updateProviderModel(request: UpdateProviderModelRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        if (!current.models.some((model) => model.key === request.key)) throw new Error('Model not found')
+        const models = current.models.map((model) => model.key === request.key
+          ? { ...model, displayName: request.displayName, kind: request.kind }
+          : model)
+        return { ...current, models, modelRoutes: normalizeModelRoutes(current.modelRoutes, models) }
+      })
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async setProviderModelEnabled(request: SetProviderModelEnabledRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        if (!current.models.some((model) => model.key === request.key)) throw new Error('Model not found')
+        const models = current.models.map((model) => model.key === request.key
+          ? { ...model, enabled: request.enabled }
+          : model)
+        return {
+          ...current,
+          models,
+          modelRoutes: request.enabled
+            ? current.modelRoutes
+            : removeModelKeysFromRoutes(current.modelRoutes, new Set([request.key])),
+        }
+      })
+      return this.loadSettingsUnsafe()
+    })
+  }
+
+  async removeProviderModel(request: RemoveProviderModelRequest): Promise<AppSettings> {
+    return this.withStorageOperation(async () => {
+      await this.modelConfigStore.update((value) => {
+        const current = this.normalizeModelConfig(value)
+        if (!current.models.some((model) => model.key === request.key)) throw new Error('Model not found')
+        return {
+          ...current,
+          models: current.models.filter((model) => model.key !== request.key),
+          modelRoutes: removeModelKeysFromRoutes(current.modelRoutes, new Set([request.key])),
+        }
+      })
+      return this.loadSettingsUnsafe()
     })
   }
 
@@ -1362,36 +1526,18 @@ export class AppState {
     const storedProviders = Array.isArray(value?.providers) ? value.providers : []
     const legacyOpenAiProvider = storedProviders.find((provider) => provider?.id === 'openai-relay')
     const legacyOpenAiTarget = getLegacyOpenAiTarget(legacyOpenAiProvider)
-    const providers = defaultProviders().map((fallback) => {
-      const stored = storedProviders.find((provider) => provider?.id === fallback.id) ?? (
-        fallback.id === legacyOpenAiTarget ? legacyOpenAiProvider : undefined
-      )
-      if (!stored) return fallback
-      const connectionStatus = isConnectionStatus(stored.connectionStatus)
-        ? stored.connectionStatus
-        : 'untested'
-      const shouldMigrateMiniMaxGlobalEndpoint =
-        fallback.id === 'minimax' &&
-        stored.baseUrl === 'https://api.minimax.io/v1' &&
-        !stored.encryptedApiKey
+    if ((value?.schemaVersion ?? 0) >= 6) {
+      const providers = normalizeStoredProviders(storedProviders)
+      const models = normalizeConfiguredModels(value?.models, providers)
       return {
-        id: fallback.id,
-        baseUrl: fallback.id === 'openai'
-          ? fallback.baseUrl
-          : typeof stored.baseUrl === 'string' && stored.baseUrl && !shouldMigrateMiniMaxGlobalEndpoint
-          ? stored.baseUrl
-          : fallback.baseUrl,
-        enabled: typeof stored.enabled === 'boolean' ? stored.enabled : fallback.enabled,
-        ...(typeof stored.encryptedApiKey === 'string' && stored.encryptedApiKey
-          ? { encryptedApiKey: stored.encryptedApiKey }
-          : {}),
-        connectionStatus,
-        ...(typeof stored.lastTestedAt === 'string' && stored.lastTestedAt
-          ? { lastTestedAt: stored.lastTestedAt }
-          : {}),
-        availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
+        schemaVersion: 6,
+        providers,
+        models,
+        modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
       }
-    })
+    }
+
+    const providers = migrateLegacyProviders(storedProviders, legacyOpenAiProvider, legacyOpenAiTarget)
     const storedEnabledModelKeys = (value?.schemaVersion ?? 0) >= 2
       ? validModelKeys(value?.enabledModelKeys ?? [], legacyOpenAiTarget)
       : migrateLegacyModelIds(value?.selectedModelIds ?? LEGACY_DEFAULT_MODELS, legacyOpenAiTarget)
@@ -1410,11 +1556,33 @@ export class AppState {
       enabledModelKeys,
       legacyOpenAiTarget,
     )
+    const providerIds = new Set(providers.map((provider) => provider.id))
+    const builtinModels = BUILTIN_PROVIDER_MODELS
+      .filter((model) => providerIds.has(model.providerId))
+      .map((model): ConfiguredProviderModel => ({
+        ...createConfiguredModel(model),
+        enabled: enabledModelKeys.includes(model.key),
+      }))
+    const builtinKeys = new Set(builtinModels.map((model) => model.key))
+    const discoveredModels = providers.flatMap((provider) =>
+      uniqueStrings(provider.availableModelIds ?? [], 500).flatMap((remoteModelId) => {
+        const key = createProviderModelKey(provider.id, remoteModelId)
+        return builtinKeys.has(key)
+          ? []
+          : [{ ...createDiscoveredModel(provider, remoteModelId), enabled: enabledModelKeys.includes(key) }]
+      }))
+    const models = [...builtinModels, ...discoveredModels]
+    const legacyRoutes: ModelRoutes = Object.fromEntries(
+      (['image', 'video', 'chat', 'audio'] as const).flatMap((kind) => {
+        const key = defaultModelKeys[kind]
+        return key ? [[kind, { modelKeys: [key] }]] : []
+      }),
+    )
     return {
-      schemaVersion: 5,
-      enabledModelKeys,
-      defaultModelKeys,
-      providers,
+      schemaVersion: 6,
+      providers: providers.map(({ availableModelIds: _availableModelIds, ...provider }) => provider),
+      models,
+      modelRoutes: normalizeModelRoutes(legacyRoutes, models),
     }
   }
 
@@ -1427,15 +1595,20 @@ export class AppState {
       accentColor: preferences.accentColor,
       storageDirectory: preferences.storageDirectory,
       favoriteImageIds: preferences.favoriteImageIds,
-      enabledModelKeys: modelConfig.enabledModelKeys,
-      defaultModelKeys: modelConfig.defaultModelKeys,
-      providers: modelConfig.providers.map((provider) => this.toPublicProvider(provider)),
+      models: modelConfig.models,
+      modelRoutes: modelConfig.modelRoutes,
+      providers: modelConfig.providers.map((provider) => this.toPublicProvider(provider, modelConfig.models)),
     }
   }
 
-  private toPublicProvider(provider: StoredProvider): ProviderConfig {
+  private toPublicProvider(
+    provider: StoredProvider,
+    models: ReadonlyArray<ConfiguredProviderModel>,
+  ): ProviderConfig {
     return {
       id: provider.id,
+      name: provider.name ?? provider.id,
+      adapterId: provider.adapterId ?? legacyProviderAdapter(provider.id),
       baseUrl: provider.baseUrl,
       enabled: provider.enabled === true,
       hasApiKey: Boolean(provider.encryptedApiKey),
@@ -1443,7 +1616,8 @@ export class AppState {
         ? provider.connectionStatus
         : 'untested',
       ...(provider.lastTestedAt ? { lastTestedAt: provider.lastTestedAt } : {}),
-      availableModelIds: uniqueStrings(provider.availableModelIds ?? [], 500),
+      ...(provider.lastSyncedAt ? { lastSyncedAt: provider.lastSyncedAt } : {}),
+      modelCount: models.filter((model) => model.providerId === provider.id).length,
     }
   }
 
@@ -1594,6 +1768,215 @@ function replaceProvider(
     : [...providers, provider]
 }
 
+async function encryptProviderApiKey(apiKey: string): Promise<string> {
+  if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    throw new ProviderSecretUnavailableError()
+  }
+  return (await safeStorage.encryptStringAsync(apiKey)).toString('base64')
+}
+
+function legacyProviderAdapter(id: string): ProviderAdapterId {
+  switch (id) {
+    case 'openai': return 'openai'
+    case 'openai-relay':
+    case 'openai-sub2api': return 'openai-sub2api'
+    case 'volcengine': return 'volcengine'
+    case 'minimax': return 'minimax'
+    default: return 'openai-sub2api'
+  }
+}
+
+function legacyProviderName(id: string): string {
+  switch (id) {
+    case 'apimart': return 'APIMart'
+    case 'comfly': return 'Comfly'
+    case 'openai': return 'OpenAI'
+    case 'openai-relay':
+    case 'openai-sub2api': return 'OpenAI 中转'
+    case 'volcengine': return '火山引擎'
+    case 'minimax': return 'MiniMax'
+    default: return id
+  }
+}
+
+function isProviderAdapterId(value: unknown): value is ProviderAdapterId {
+  return value === 'openai' || value === 'openai-sub2api' || value === 'volcengine' || value === 'minimax'
+}
+
+function normalizeStoredProviders(value: ReadonlyArray<StoredProvider>): ReadonlyArray<StoredProvider> {
+  const providers: StoredProvider[] = []
+  const ids = new Set<string>()
+  for (const item of value) {
+    if (!isBoundedString(item?.id, 128) || ids.has(item.id)) continue
+    if (!isBoundedString(item.name, 100) || !isProviderAdapterId(item.adapterId)) continue
+    if (typeof item.baseUrl !== 'string' || item.baseUrl.length > 2_000) continue
+    ids.add(item.id)
+    providers.push({
+      id: item.id,
+      name: item.name,
+      adapterId: item.adapterId,
+      baseUrl: item.baseUrl,
+      enabled: item.enabled === true,
+      ...(isBoundedString(item.encryptedApiKey, 20_000) ? { encryptedApiKey: item.encryptedApiKey } : {}),
+      connectionStatus: isConnectionStatus(item.connectionStatus) ? item.connectionStatus : 'untested',
+      ...(isBoundedString(item.lastTestedAt, 100) ? { lastTestedAt: item.lastTestedAt } : {}),
+      ...(isBoundedString(item.lastSyncedAt, 100) ? { lastSyncedAt: item.lastSyncedAt } : {}),
+    })
+    if (providers.length >= 50) break
+  }
+  return providers
+}
+
+function migrateLegacyProviders(
+  storedProviders: ReadonlyArray<StoredProvider>,
+  legacyOpenAiProvider: StoredProvider | undefined,
+  legacyOpenAiTarget: 'openai' | 'openai-sub2api',
+): ReadonlyArray<StoredProvider> {
+  const migratedDefaults = defaultProviders().map((fallback) => {
+    const stored = storedProviders.find((provider) => provider?.id === fallback.id) ?? (
+      fallback.id === legacyOpenAiTarget ? legacyOpenAiProvider : undefined
+    )
+    if (!stored) return fallback
+    const shouldMigrateMiniMaxGlobalEndpoint =
+      fallback.id === 'minimax' &&
+      stored.baseUrl === 'https://api.minimax.io/v1' &&
+      !stored.encryptedApiKey
+    return {
+      id: fallback.id,
+      name: fallback.name ?? legacyProviderName(fallback.id),
+      adapterId: fallback.adapterId ?? legacyProviderAdapter(fallback.id),
+      baseUrl: fallback.id === 'openai'
+        ? fallback.baseUrl
+        : typeof stored.baseUrl === 'string' && stored.baseUrl && !shouldMigrateMiniMaxGlobalEndpoint
+          ? stored.baseUrl
+          : fallback.baseUrl,
+      enabled: typeof stored.enabled === 'boolean' ? stored.enabled : fallback.enabled,
+      ...(typeof stored.encryptedApiKey === 'string' && stored.encryptedApiKey
+        ? { encryptedApiKey: stored.encryptedApiKey }
+        : {}),
+      connectionStatus: isConnectionStatus(stored.connectionStatus) ? stored.connectionStatus : 'untested',
+      ...(typeof stored.lastTestedAt === 'string' && stored.lastTestedAt
+        ? { lastTestedAt: stored.lastTestedAt }
+        : {}),
+      availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
+    }
+  })
+  const defaultIds = new Set(migratedDefaults.map((provider) => provider.id))
+  const migratedLegacyServices = storedProviders.flatMap((stored): ReadonlyArray<StoredProvider> => {
+    if (
+      !isBoundedString(stored?.id, 128) ||
+      stored.id === 'openai-relay' ||
+      defaultIds.has(stored.id) ||
+      typeof stored.baseUrl !== 'string' ||
+      !stored.baseUrl ||
+      stored.baseUrl.length > 2_000
+    ) return []
+    return [{
+      id: stored.id,
+      name: legacyProviderName(stored.id),
+      adapterId: legacyProviderAdapter(stored.id),
+      baseUrl: stored.baseUrl,
+      enabled: stored.enabled === true,
+      ...(isBoundedString(stored.encryptedApiKey, 20_000) ? { encryptedApiKey: stored.encryptedApiKey } : {}),
+      connectionStatus: isConnectionStatus(stored.connectionStatus) ? stored.connectionStatus : 'untested',
+      ...(isBoundedString(stored.lastTestedAt, 100) ? { lastTestedAt: stored.lastTestedAt } : {}),
+      availableModelIds: uniqueStrings(stored.availableModelIds ?? [], 500),
+    }]
+  })
+  return [...migratedDefaults, ...migratedLegacyServices].slice(0, 50)
+}
+
+function normalizeConfiguredModels(
+  value: ReadonlyArray<ConfiguredProviderModel> | undefined,
+  providers: ReadonlyArray<StoredProvider>,
+): ReadonlyArray<ConfiguredProviderModel> {
+  if (!Array.isArray(value)) return []
+  const providerIds = new Set(providers.map((provider) => provider.id))
+  const keys = new Set<string>()
+  const models: ConfiguredProviderModel[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    if (!isBoundedString(item.key, 400) || keys.has(item.key)) continue
+    if (!isBoundedString(item.providerId, 128) || !providerIds.has(item.providerId)) continue
+    if (!isBoundedString(item.remoteModelId, 200)) continue
+    if (item.key !== createProviderModelKey(item.providerId, item.remoteModelId)) continue
+    if (!isBoundedString(item.displayName, 200) || !isModelKind(item.kind)) continue
+    if (item.source !== 'builtin' && item.source !== 'discovered' && item.source !== 'manual') continue
+    const builtin = findBuiltinModelByKey(item.key)
+    keys.add(item.key)
+    models.push({
+      ...(builtin ?? {}),
+      key: item.key,
+      providerId: item.providerId,
+      remoteModelId: item.remoteModelId,
+      displayName: item.displayName,
+      kind: item.kind,
+      description: typeof item.description === 'string' ? item.description.slice(0, 500) : '',
+      ...(typeof item.badge === 'string' && item.badge ? { badge: item.badge.slice(0, 50) } : {}),
+      source: item.source,
+      enabled: item.enabled === true,
+      available: item.available === true,
+    })
+    if (models.length >= 1_000) break
+  }
+  return models
+}
+
+function createDiscoveredModel(
+  provider: StoredProvider,
+  remoteModelId: string,
+): ConfiguredProviderModel {
+  const adapterId = provider.adapterId ?? legacyProviderAdapter(provider.id)
+  const builtin = BUILTIN_PROVIDER_MODELS.find((model) =>
+    model.providerId === adapterId && model.remoteModelId === remoteModelId)
+  const definition = builtin
+    ? {
+        ...builtin,
+        key: createProviderModelKey(provider.id, remoteModelId),
+        providerId: provider.id,
+      }
+    : {
+        key: createProviderModelKey(provider.id, remoteModelId),
+        providerId: provider.id,
+        remoteModelId,
+        displayName: remoteModelId,
+        kind: inferModelKind(remoteModelId),
+        description: '由服务商模型列表接口发现',
+      }
+  return createConfiguredModel(definition, 'discovered')
+}
+
+function isModelKind(value: unknown): value is ModelKind {
+  return value === 'image' || value === 'video' || value === 'chat' || value === 'audio'
+}
+
+function normalizeModelRoutes(
+  value: ModelRoutes | undefined,
+  models: ReadonlyArray<ConfiguredProviderModel>,
+): ModelRoutes {
+  const modelByKey = new Map(models.map((model) => [model.key, model]))
+  const routes: Partial<Record<ModelKind, { modelKeys: ReadonlyArray<string> }>> = {}
+  for (const kind of ['image', 'video', 'chat', 'audio'] as const) {
+    const keys = Array.isArray(value?.[kind]?.modelKeys)
+      ? [...new Set(value[kind]?.modelKeys.filter((key): key is string => {
+          const model = typeof key === 'string' ? modelByKey.get(key) : undefined
+          return Boolean(model && model.kind === kind)
+        }))].slice(0, 3)
+      : []
+    if (keys.length) routes[kind] = { modelKeys: keys }
+  }
+  return routes
+}
+
+function removeModelKeysFromRoutes(routes: ModelRoutes, removedKeys: ReadonlySet<string>): ModelRoutes {
+  return Object.fromEntries(
+    (['image', 'video', 'chat', 'audio'] as const).flatMap((kind) => {
+      const modelKeys = routes[kind]?.modelKeys.filter((key) => !removedKeys.has(key)) ?? []
+      return modelKeys.length ? [[kind, { modelKeys }]] : []
+    }),
+  )
+}
+
 function isConnectionStatus(value: unknown): value is ProviderConnectionStatus {
   return value === 'untested' || value === 'connected' || value === 'failed'
 }
@@ -1650,11 +2033,7 @@ function normalizeDefaultModelKeys(
 function inferModelKindFromKey(key: string): ModelKind {
   const builtin = findBuiltinModelByKey(key)
   if (builtin) return builtin.kind
-  const remoteModelId = key.slice(key.indexOf(':') + 1).toLowerCase()
-  if (/(speech|audio|voice|tts|music)/.test(remoteModelId)) return 'audio'
-  if (/(video|veo|sora|seedance|kling|wan.*video)/.test(remoteModelId)) return 'video'
-  if (/(image|seedream|flux|dall|midjourney|recraft|ideogram)/.test(remoteModelId)) return 'image'
-  return 'chat'
+  return inferModelKind(key.slice(key.indexOf(':') + 1))
 }
 
 function migrateModelKey(
