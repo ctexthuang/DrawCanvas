@@ -144,7 +144,7 @@ jobs:
         run: pnpm exec electron-forge make --arch=x64
 
       - name: Make Windows NSIS EXE
-        run: pnpm exec electron-builder --win nsis --x64
+        run: pnpm exec electron-builder --win nsis --x64 --publish never
 
       - name: Verify Windows installers
         shell: pwsh
