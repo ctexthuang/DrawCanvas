@@ -66,6 +66,10 @@ const allowedTargets: Readonly<Record<CanvasNodeType, ReadonlySet<CanvasNodeType
   audio: new Set(),
 }
 
+export function canConnectNodeTypes(from: CanvasNodeType, to: CanvasNodeType): boolean {
+  return allowedTargets[from].has(to)
+}
+
 export function nodeDimensions(node: CanvasNodeData): Readonly<{ width: number; height: number }> {
   return {
     width: node.width ?? defaultWidths[node.type],
@@ -107,7 +111,7 @@ export function canConnect(
   const from = nodes.find((node) => node.id === fromId)
   const to = nodes.find((node) => node.id === toId)
   if (!from || !to) return { ok: false, reason: '连接节点不存在' }
-  if (!allowedTargets[from.type].has(to.type)) return { ok: false, reason: `${from.title} 不能连接到 ${to.title}` }
+  if (!canConnectNodeTypes(from.type, to.type)) return { ok: false, reason: `${from.title} 不能连接到 ${to.title}` }
   if (from.type === 'image' && !from.imageFileName) {
     return { ok: false, reason: '图片生成或导入完成后才能作为参考图连接' }
   }

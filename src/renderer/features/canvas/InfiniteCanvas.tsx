@@ -81,6 +81,7 @@ import {
 import {
   arrangeSelection,
   canConnect,
+  canConnectNodeTypes,
   duplicateSelection,
   graphBounds,
   groupImageSelection,
@@ -161,7 +162,7 @@ type DragState =
       currentClient: CanvasPoint
       baseSelection: ReadonlySet<string>
     }>
-  | Readonly<{ kind: 'link'; nodeId: string; side: 'input' | 'output'; currentWorld: CanvasPoint }>
+  | Readonly<{ kind: 'link'; nodeId: string; side: 'input' | 'output'; currentWorld: CanvasPoint; startClient: CanvasPoint }>
   | Readonly<{
       kind: 'resize'
       nodeId: string
@@ -177,6 +178,13 @@ type ContextMenuState = Readonly<{
   clientX: number
   clientY: number
   world: CanvasPoint
+}>
+
+type ConnectionNodeMenuState = Readonly<{
+  nodeId: string
+  side: 'input' | 'output'
+  left: number
+  top: number
 }>
 
 type PendingGenerationTask = Readonly<{
@@ -206,6 +214,11 @@ type ReferenceMentionRange = Readonly<{
 
 const HISTORY_LIMIT = 30
 const MAX_CONCURRENT_GENERATIONS = 4
+const ZOOM_SETTLE_DELAY_MS = 140
+const ZOOM_SNAP_STEP = 0.05
+const SEMANTIC_ZOOM_THRESHOLD = 0.75
+const OVERVIEW_ZOOM_THRESHOLD = 0.5
+const NODE_MENU_MAX_HEIGHT = 560
 const AUDIO_VOICE_OPTIONS = [
   { value: 'female-shaonv', label: '少女音' },
   { value: 'male-qn-qingse', label: '青年男声' },
@@ -236,6 +249,16 @@ const nodeTypes: ReadonlyArray<Readonly<{ type: CanvasNodeType; label: string; d
   { type: 'audio', label: '语音', description: '将文本合成为本地语音', icon: AudioLines },
 ]
 
+function connectionNodeTypeOptions(
+  node: CanvasNodeData,
+  side: 'input' | 'output',
+): typeof nodeTypes {
+  if (side === 'output' && node.type === 'image' && !node.imageFileName) return []
+  return nodeTypes.filter(({ type }) => side === 'output'
+    ? canConnectNodeTypes(node.type, type)
+    : type !== 'image' && canConnectNodeTypes(type, node.type))
+}
+
 export function createInitialCanvas(
   name = '未命名画布',
   prompt?: string,
@@ -253,13 +276,13 @@ export function createInitialCanvas(
     nodes: [
       { id: 'prompt-1', type: 'prompt', title: '创意提示词', subtitle: prompt ?? '未来主义建筑漂浮在云层之上，清晨金色光线，电影感构图', x: 90, y: 135, color: '#aaff00' },
       { id: 'generator-1', type: 'generator', title: '图像生成', subtitle: `跟随默认 · ${defaultImageModelName} · ${formatImageSize(defaultImageSize)}`, imageSize: defaultImageSize, generationCount: 1, x: 440, y: 225, color: '#7c5cff' },
-      { id: 'note-1', type: 'note', title: '方向备注', subtitle: '尝试增加云海层次，保留画面中央的视觉焦点。', x: 470, y: 500, color: '#ffdb5c' },
     ],
   }
 }
 
 export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, document, imageModels, videoModels, onChange, onClose, onGenerateAudio, onGenerateChatReply, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportDroppedImages, onImportImages, onLoadImage, onOpen, onOptimizePrompt, onSave, notify }: InfiniteCanvasProps) {
   const canvasRef = useRef<HTMLDivElement>(null)
+  const worldRef = useRef<HTMLDivElement>(null)
   const documentRef = useRef(document)
   const selectedIdsRef = useRef<ReadonlySet<string>>(new Set(['generator-1']))
   const selectedConnectionIdRef = useRef<string | null>(null)
@@ -274,11 +297,15 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const activeGenerationCountRef = useRef(0)
   const fileDragDepthRef = useRef(0)
   const workflowRunIdRef = useRef<string | null>(null)
+  const zoomSettleTimerRef = useRef<number | null>(null)
+  const rasterRefreshFrameRef = useRef<number | null>(null)
+  const zoomAnchorRef = useRef<Readonly<{ screen: CanvasPoint; world: CanvasPoint }> | null>(null)
   const [selectedIds, setSelectedIdsState] = useState<ReadonlySet<string>>(() => new Set(['generator-1']))
   const [selectedConnectionId, setSelectedConnectionIdState] = useState<string | null>(null)
   const [tool, setTool] = useState<'select' | 'hand'>('select')
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  const [connectionNodeMenu, setConnectionNodeMenu] = useState<ConnectionNodeMenuState | null>(null)
   const [drag, setDragState] = useState<DragState | null>(null)
   const [savedAt, setSavedAt] = useState('刚刚')
   const [generationNow, setGenerationNow] = useState(() => Date.now())
@@ -288,6 +315,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const [chattingNodeIds, setChattingNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [storyboardNodeIds, setStoryboardNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [workflowRunning, setWorkflowRunning] = useState(false)
+  const [isZooming, setZooming] = useState(false)
   const [, setHistoryRevision] = useState(0)
   documentRef.current = document
 
@@ -297,10 +325,16 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     generationQueueRef.current = generationQueueRef.current.filter((task) => task.documentId === document.id)
     setSelectedIds(new Set(document.nodes.some((node) => node.id === 'generator-1') ? ['generator-1'] : []))
     setSelectedConnectionId(null)
+    setConnectionNodeMenu(null)
     undoStackRef.current = []
     redoStackRef.current = []
     setHistoryRevision((revision) => revision + 1)
   }, [document.id])
+
+  useEffect(() => () => {
+    if (zoomSettleTimerRef.current !== null) window.clearTimeout(zoomSettleTimerRef.current)
+    if (rasterRefreshFrameRef.current !== null) window.cancelAnimationFrame(rasterRefreshFrameRef.current)
+  }, [])
 
   const hasActiveGenerationTasks = document.nodes.some((node) =>
     node.generationStatus === 'queued' || node.generationStatus === 'generating',
@@ -309,6 +343,12 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     node.workflowStatus === 'failed' || node.workflowStatus === 'skipped',
   ).length
   const selectedNodes = document.nodes.filter((node) => selectedIds.has(node.id))
+  const connectionMenuNode = connectionNodeMenu
+    ? document.nodes.find((node) => node.id === connectionNodeMenu.nodeId)
+    : undefined
+  const connectionMenuOptions = connectionMenuNode && connectionNodeMenu
+    ? connectionNodeTypeOptions(connectionMenuNode, connectionNodeMenu.side)
+    : []
   const canGroupSelectedImages = selectedNodes.length >= 2 && selectedNodes.every((node) =>
     node.type === 'image' && Boolean(node.imageFileName),
   ) && new Set(selectedNodes.flatMap((node) => node.imageFileName ? [node.imageFileName] : [])).size >= 2
@@ -357,6 +397,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       } else if (event.key === 'Escape') {
         setActiveDrag(null)
         setContextMenu(null)
+        setConnectionNodeMenu(null)
         setAddMenuOpen(false)
         setSelectedConnectionId(null)
       }
@@ -381,6 +422,9 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const worldStyle = {
     transform: `translate(${document.viewport.x}px, ${document.viewport.y}px) scale(${document.viewport.zoom})`,
   } satisfies CSSProperties
+  const isSemanticZoom = document.viewport.zoom < SEMANTIC_ZOOM_THRESHOLD
+  const isOverviewZoom = document.viewport.zoom < OVERVIEW_ZOOM_THRESHOLD
+  const isViewportTransforming = isZooming || drag?.kind === 'pan'
   const minimap = useMemo(() => buildMinimap(document, canvasRef.current), [document])
 
   function setSelectedIds(ids: ReadonlySet<string>): void {
@@ -406,8 +450,47 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     onChange(reconciled)
   }
 
-  function updateViewport(viewport: CanvasViewport): void {
-    emitDocument({ ...documentRef.current, viewport, updatedAt: new Date().toISOString() })
+  function updateViewport(viewport: CanvasViewport): CanvasViewport {
+    const alignedViewport = alignViewportToDevicePixels(viewport)
+    emitDocument({ ...documentRef.current, viewport: alignedViewport, updatedAt: new Date().toISOString() })
+    return alignedViewport
+  }
+
+  function scheduleWorldRasterRefresh(): void {
+    if (rasterRefreshFrameRef.current !== null) window.cancelAnimationFrame(rasterRefreshFrameRef.current)
+    rasterRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      setZooming(false)
+      rasterRefreshFrameRef.current = window.requestAnimationFrame(() => {
+        rasterRefreshFrameRef.current = null
+        const world = worldRef.current
+        if (!world) return
+        const transform = world.style.transform
+        world.style.transform = 'none'
+        void world.offsetWidth
+        world.style.transform = transform
+      })
+    })
+  }
+
+  function scheduleZoomSettle(anchor: Readonly<{ screen: CanvasPoint; world: CanvasPoint }>): void {
+    zoomAnchorRef.current = anchor
+    setZooming(true)
+    if (zoomSettleTimerRef.current !== null) window.clearTimeout(zoomSettleTimerRef.current)
+    zoomSettleTimerRef.current = window.setTimeout(() => {
+      zoomSettleTimerRef.current = null
+      const current = documentRef.current.viewport
+      const settledAnchor = zoomAnchorRef.current
+      const zoom = snapZoom(current.zoom)
+      updateViewport(settledAnchor
+        ? {
+            zoom,
+            x: settledAnchor.screen.x - settledAnchor.world.x * zoom,
+            y: settledAnchor.screen.y - settledAnchor.world.y * zoom,
+          }
+        : { ...current, zoom })
+      zoomAnchorRef.current = null
+      scheduleWorldRasterRefresh()
+    }, ZOOM_SETTLE_DELAY_MS)
   }
 
   function updateNode(nodeId: string, patch: Partial<CanvasNodeData>): void {
@@ -455,6 +538,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const target = event.target as HTMLElement
     if (target.closest('.canvas-node, .connection-interaction')) return
     setContextMenu(null)
+    setConnectionNodeMenu(null)
     setAddMenuOpen(false)
     const viewport = documentRef.current.viewport
     const world = clientToWorld(canvasRef.current, viewport, event.clientX, event.clientY)
@@ -484,6 +568,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     event.stopPropagation()
     event.currentTarget.setPointerCapture(event.pointerId)
     setContextMenu(null)
+    setConnectionNodeMenu(null)
     setSelectedConnectionId(null)
     const viewport = documentRef.current.viewport
     if (tool === 'hand' || spacePressedRef.current) {
@@ -531,9 +616,16 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     event.currentTarget.setPointerCapture(event.pointerId)
     const node = documentRef.current.nodes.find((item) => item.id === nodeId)
     if (!node) return
+    setConnectionNodeMenu(null)
     setSelectedIds(new Set([nodeId]))
     setSelectedConnectionId(null)
-    setActiveDrag({ kind: 'link', nodeId, side, currentWorld: nodePortPoint(node, side) })
+    setActiveDrag({
+      kind: 'link',
+      nodeId,
+      side,
+      currentWorld: nodePortPoint(node, side),
+      startClient: { x: event.clientX, y: event.clientY },
+    })
   }
 
   function onResizePointerDown(event: ReactPointerEvent<HTMLElement>, node: CanvasNodeData): void {
@@ -620,8 +712,100 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const activeDrag = dragRef.current
     if (!activeDrag) return
     if (activeDrag.kind === 'selection') finishSelection(activeDrag)
-    if (activeDrag.kind === 'link') finishLink(activeDrag, event.clientX, event.clientY)
+    if (activeDrag.kind === 'link') {
+      const distance = Math.hypot(
+        event.clientX - activeDrag.startClient.x,
+        event.clientY - activeDrag.startClient.y,
+      )
+      if (distance <= 6) openConnectionNodeMenu(activeDrag.nodeId, activeDrag.side, event.clientX, event.clientY)
+      else finishLink(activeDrag, event.clientX, event.clientY)
+    }
     setActiveDrag(null)
+    if (activeDrag.kind === 'pan') scheduleWorldRasterRefresh()
+  }
+
+  function openConnectionNodeMenu(
+    nodeId: string,
+    side: 'input' | 'output',
+    clientX: number,
+    clientY: number,
+  ): void {
+    const source = documentRef.current.nodes.find((node) => node.id === nodeId)
+    const canvas = canvasRef.current
+    if (!source || !canvas) return
+    const options = connectionNodeTypeOptions(source, side)
+    if (options.length === 0) return
+    const rect = canvas.getBoundingClientRect()
+    const menuWidth = 264
+    const menuHeight = Math.min(396, 76 + options.length * 49)
+    const pointX = clientX - rect.left
+    const pointY = clientY - rect.top
+    const preferredLeft = side === 'output' ? pointX + 16 : pointX - menuWidth - 16
+    setContextMenu(null)
+    setAddMenuOpen(false)
+    setConnectionNodeMenu({
+      nodeId,
+      side,
+      left: clamp(preferredLeft, 8, Math.max(8, rect.width - menuWidth - 8)),
+      top: clamp(pointY - menuHeight / 2, 8, Math.max(8, rect.height - menuHeight - 8)),
+    })
+  }
+
+  function createConnectedNode(type: CanvasNodeType): void {
+    const menu = connectionNodeMenu
+    if (!menu) return
+    const current = documentRef.current
+    const source = current.nodes.find((node) => node.id === menu.nodeId)
+    if (!source) {
+      setConnectionNodeMenu(null)
+      return
+    }
+    if (current.nodes.length >= 500 || current.connections.length >= 1000) {
+      notify('画布节点或连线数量已达到上限')
+      return
+    }
+    const provisionalNode = createNodeData(
+      type,
+      current,
+      { x: 0, y: 0 },
+      defaultImageModelKey,
+      defaultVideoModelKey,
+      imageModels,
+      videoModels,
+    )
+    const sourceDimensions = nodeDimensions(source)
+    const newNodeDimensions = nodeDimensions(provisionalNode)
+    const siblingCount = current.connections.filter((connection) =>
+      menu.side === 'output' ? connection.from === source.id : connection.to === source.id,
+    ).length
+    const newNode = {
+      ...provisionalNode,
+      x: Math.round(menu.side === 'output'
+        ? source.x + sourceDimensions.width + 92
+        : source.x - newNodeDimensions.width - 92),
+      y: Math.round(source.y + siblingCount * 42),
+    }
+    const nextNodes = [...current.nodes, newNode]
+    const fromId = menu.side === 'output' ? source.id : newNode.id
+    const toId = menu.side === 'output' ? newNode.id : source.id
+    const validation = canConnect(nextNodes, current.connections, fromId, toId)
+    if (!validation.ok) {
+      notify(validation.reason ?? '无法连接节点')
+      return
+    }
+    pushUndo()
+    emitDocument({
+      ...current,
+      nodes: nextNodes,
+      connections: [
+        ...current.connections,
+        { id: `connection-${crypto.randomUUID()}`, from: fromId, to: toId },
+      ],
+      updatedAt: new Date().toISOString(),
+    })
+    setSelectedIds(new Set([newNode.id]))
+    setSelectedConnectionId(null)
+    setConnectionNodeMenu(null)
   }
 
   function finishSelection(selection: Extract<DragState, { kind: 'selection' }>): void {
@@ -682,6 +866,13 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const rect = canvasRef.current.getBoundingClientRect()
     const pointX = event.clientX - rect.left
     const pointY = event.clientY - rect.top
+    const anchor = {
+      screen: { x: pointX, y: pointY },
+      world: {
+        x: (pointX - current.viewport.x) / current.viewport.zoom,
+        y: (pointY - current.viewport.y) / current.viewport.zoom,
+      },
+    }
     const nextZoom = clamp(current.viewport.zoom * Math.exp(-event.deltaY * 0.0015), 0.2, 2.5)
     const scale = nextZoom / current.viewport.zoom
     updateViewport({
@@ -689,36 +880,40 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       x: pointX - (pointX - current.viewport.x) * scale,
       y: pointY - (pointY - current.viewport.y) * scale,
     })
+    scheduleZoomSettle(anchor)
   }
 
   function setZoom(zoom: number): void {
     const current = documentRef.current
     const width = canvasRef.current?.clientWidth ?? 1200
     const height = canvasRef.current?.clientHeight ?? 760
-    const nextZoom = clamp(zoom, 0.2, 2.5)
+    const nextZoom = snapZoom(zoom)
     const scale = nextZoom / current.viewport.zoom
     updateViewport({
       zoom: nextZoom,
       x: width / 2 - (width / 2 - current.viewport.x) * scale,
       y: height / 2 - (height / 2 - current.viewport.y) * scale,
     })
+    scheduleWorldRasterRefresh()
   }
 
   function fitView(): void {
     const current = documentRef.current
     if (current.nodes.length === 0) {
       updateViewport({ x: 90, y: 55, zoom: 0.9 })
+      scheduleWorldRasterRefresh()
       return
     }
     const bounds = graphBounds(current.nodes)
     const width = canvasRef.current?.clientWidth ?? 1200
     const height = canvasRef.current?.clientHeight ?? 760
-    const zoom = clamp(Math.min((width - 160) / bounds.width, (height - 160) / bounds.height), 0.2, 1.5)
+    const zoom = snapZoom(clamp(Math.min((width - 160) / bounds.width, (height - 160) / bounds.height), 0.2, 1.5))
     updateViewport({
       zoom,
       x: Math.round((width - bounds.width * zoom) / 2 - bounds.x * zoom),
       y: Math.round((height - bounds.height * zoom) / 2 - bounds.y * zoom),
     })
+    scheduleWorldRasterRefresh()
   }
 
   function addNode(type: CanvasNodeType, position?: CanvasPoint): void {
@@ -853,9 +1048,11 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const world = clientToWorld(canvasRef.current, documentRef.current.viewport, event.clientX, event.clientY)
     const rect = canvasRef.current?.getBoundingClientRect() ?? { left: 0, top: 0 }
     const menuLeft = clamp(event.clientX - rect.left, 8, Math.max(8, (canvasRef.current?.clientWidth ?? 1200) - 253))
-    const menuTop = clamp(event.clientY - rect.top, 8, Math.max(8, (canvasRef.current?.clientHeight ?? 760) - 320))
+    const menuHeight = Math.min(NODE_MENU_MAX_HEIGHT, Math.max(0, (canvasRef.current?.clientHeight ?? 760) - 16))
+    const menuTop = clamp(event.clientY - rect.top, 8, Math.max(8, (canvasRef.current?.clientHeight ?? 760) - menuHeight - 8))
     lastPointerWorldRef.current = world
     setAddMenuOpen(false)
+    setConnectionNodeMenu(null)
     setContextMenu({ kind: nodeId ? 'selection' : 'canvas', clientX: menuLeft, clientY: menuTop, world })
   }
 
@@ -1732,14 +1929,18 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
 
       <div className="canvas-stage-wrap">
         <div
-          className={`${tool === 'hand' || drag?.kind === 'pan' ? 'canvas-stage is-panning' : drag?.kind === 'selection' ? 'canvas-stage is-selecting' : 'canvas-stage'}${isFileDragActive ? ' is-file-dragging' : ''}`}
+          className={`canvas-stage${tool === 'hand' || drag?.kind === 'pan' ? ' is-panning' : ''}${drag?.kind === 'selection' ? ' is-selecting' : ''}${isFileDragActive ? ' is-file-dragging' : ''}${isViewportTransforming ? ' is-transforming' : ''}${isSemanticZoom ? ' is-semantic-zoom' : ''}${isOverviewZoom ? ' is-overview-zoom' : ''}`}
           onContextMenu={onContextMenu}
           onDoubleClick={onDoubleClick}
           onDragEnter={onFileDragEnter}
           onDragLeave={onFileDragLeave}
           onDragOver={onFileDragOver}
           onDrop={onFileDrop}
-          onPointerCancel={() => setActiveDrag(null)}
+          onPointerCancel={() => {
+            const wasPanning = dragRef.current?.kind === 'pan'
+            setActiveDrag(null)
+            if (wasPanning) scheduleWorldRasterRefresh()
+          }}
           onPointerDown={onCanvasPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -1747,7 +1948,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
           ref={canvasRef}
         >
           <div className="canvas-grid" />
-          <div className="canvas-world" style={worldStyle}>
+          <div className="canvas-world" ref={worldRef} style={worldStyle}>
             <CanvasConnections
               document={document}
               drag={drag?.kind === 'link' ? drag : null}
@@ -1770,6 +1971,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
                 defaultVideoModelKey={defaultVideoModelKey}
                 generationNow={generationNow}
                 imageModels={imageModels}
+                hasInputPort={connectionNodeTypeOptions(node, 'input').length > 0}
+                hasOutputPort={connectionNodeTypeOptions(node, 'output').length > 0}
                 isChatting={chattingNodeIds.has(node.id)}
                 isGeneratingStoryboard={storyboardNodeIds.has(node.id)}
                 isOptimizingPrompt={optimizingPromptNodeIds.has(node.id)}
@@ -1786,6 +1989,10 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
                 onOptimizePrompt={() => void optimizePrompt(node)}
                 onCreatePrompt={(content, title) => createPromptFromText(node, content, title)}
                 onPointerDown={(event) => onNodePointerDown(event, node)}
+                onPortOpen={(element, side) => {
+                  const rect = element.getBoundingClientRect()
+                  openConnectionNodeMenu(node.id, side, rect.left + rect.width / 2, rect.top + rect.height / 2)
+                }}
                 onPortPointerDown={(event, side) => onPortPointerDown(event, node.id, side)}
                 onResizePointerDown={(event) => onResizePointerDown(event, node)}
                 onUpdate={(patch) => updateNode(node.id, patch)}
@@ -1816,7 +2023,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
           <button className={tool === 'hand' ? 'is-active' : ''} onClick={() => setTool('hand')} title="抓手" type="button"><Hand size={18}/></button>
           <i />
           <div className="add-node-wrap">
-            <button className={addMenuOpen ? 'add-node-trigger is-active' : 'add-node-trigger'} onClick={() => { setContextMenu(null); setAddMenuOpen(!addMenuOpen) }} type="button"><Plus size={18}/><span>添加节点</span><ChevronDown size={14}/></button>
+            <button className={addMenuOpen ? 'add-node-trigger is-active' : 'add-node-trigger'} onClick={() => { setContextMenu(null); setConnectionNodeMenu(null); setAddMenuOpen(!addMenuOpen) }} type="button"><Plus size={18}/><span>添加节点</span><ChevronDown size={14}/></button>
             {addMenuOpen && <NodeMenu onAdd={(type) => addNode(type)} />}
           </div>
           <i />
@@ -1870,6 +2077,21 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
                     selectedCount={selectedNodes.length}
                   />
                 )}
+          </div>
+        )}
+        {connectionNodeMenu && connectionMenuNode && connectionMenuOptions.length > 0 && (
+          <div
+            className="canvas-connection-node-menu"
+            onPointerDown={(event) => event.stopPropagation()}
+            style={{ left: connectionNodeMenu.left, top: connectionNodeMenu.top }}
+          >
+            <ConnectionNodeMenu
+              node={connectionMenuNode}
+              onAdd={createConnectedNode}
+              onClose={() => setConnectionNodeMenu(null)}
+              options={connectionMenuOptions}
+              side={connectionNodeMenu.side}
+            />
           </div>
         )}
       </div>
@@ -1928,6 +2150,8 @@ type CanvasNodeProps = Readonly<{
   defaultImageModelKey: string
   defaultVideoModelKey: string
   generationNow: number
+  hasInputPort: boolean
+  hasOutputPort: boolean
   imageModels: ReadonlyArray<CanvasImageModelOption>
   isChatting: boolean
   isGeneratingStoryboard: boolean
@@ -1941,6 +2165,7 @@ type CanvasNodeProps = Readonly<{
   referenceImages: ReadonlyArray<ConnectedReferenceImage>
   selected: boolean
   onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void
+  onPortOpen: (element: HTMLElement, side: 'input' | 'output') => void
   onPortPointerDown: (event: ReactPointerEvent<HTMLElement>, side: 'input' | 'output') => void
   onResizePointerDown: (event: ReactPointerEvent<HTMLElement>) => void
   onUpdate: (patch: Partial<CanvasNodeData>) => void
@@ -1957,7 +2182,7 @@ type CanvasNodeProps = Readonly<{
   onDelete: () => void
 }>
 
-function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, imageModels, videoModels, videoPromptOptions, node, dropTarget, isChatting, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, mentionReferenceImages, referenceImages, selected, onPointerDown, onPortPointerDown, onResizePointerDown, onUpdate, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onRemoveReference, onSendChat, onDelete }: CanvasNodeProps) {
+function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, hasInputPort, hasOutputPort, imageModels, videoModels, videoPromptOptions, node, dropTarget, isChatting, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, mentionReferenceImages, referenceImages, selected, onPointerDown, onPortOpen, onPortPointerDown, onResizePointerDown, onUpdate, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onRemoveReference, onSendChat, onDelete }: CanvasNodeProps) {
   const [storyboardHelpOpen, setStoryboardHelpOpen] = useState(false)
   const renderedHeight = nodeDimensions(node).height
 
@@ -1988,8 +2213,40 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
       onPointerDown={onPointerDown}
       style={{ left: node.x, top: node.y, width: node.width, height: renderedHeight, minHeight: renderedHeight, '--node-color': node.color ?? '#aaff00' } as CSSProperties}
     >
-      <span className="node-input-port" data-node-id={node.id} data-port="input" onPointerDown={(event) => onPortPointerDown(event, 'input')} title={node.type === 'storyboard' ? '输入：连接创意提示词或 AI 对话节点' : node.type === 'shot-list' ? '输入：分镜生成结果' : '输入端口'} />
-      <span className="node-output-port" data-node-id={node.id} data-port="output" onPointerDown={(event) => onPortPointerDown(event, 'output')} title={node.type === 'shot-list' ? '输出：将分镜提示词传给视频等下游节点' : '输出端口'} />
+      {hasInputPort && (
+        <button
+          aria-label="添加或连接上一个节点"
+          className="node-input-port"
+          data-node-id={node.id}
+          data-port="input"
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            event.stopPropagation()
+            onPortOpen(event.currentTarget, 'input')
+          }}
+          onPointerDown={(event) => onPortPointerDown(event, 'input')}
+          title="点击添加上一个可连接节点，或拖动连接已有节点"
+          type="button"
+        ><Plus size={9}/></button>
+      )}
+      {hasOutputPort && (
+        <button
+          aria-label="添加或连接下一个节点"
+          className="node-output-port"
+          data-node-id={node.id}
+          data-port="output"
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            event.stopPropagation()
+            onPortOpen(event.currentTarget, 'output')
+          }}
+          onPointerDown={(event) => onPortPointerDown(event, 'output')}
+          title="点击添加下一个可连接节点，或拖动连接已有节点"
+          type="button"
+        ><Plus size={9}/></button>
+      )}
       <header>
         <span className="node-header-icon">{nodeIcon(node.type)}</span>
         <input aria-label="节点标题" onChange={(event) => onUpdate({ title: event.target.value })} value={node.title}/>
@@ -2732,6 +2989,32 @@ function NodeMenu({ onAdd }: Readonly<{ onAdd: (type: CanvasNodeType) => void }>
   )
 }
 
+function ConnectionNodeMenu({ node, onAdd, onClose, options, side }: Readonly<{
+  node: CanvasNodeData
+  onAdd: (type: CanvasNodeType) => void
+  onClose: () => void
+  options: typeof nodeTypes
+  side: 'input' | 'output'
+}>) {
+  return (
+    <div className="connection-node-menu">
+      <header>
+        <div><strong>{side === 'output' ? '选择下一个节点' : '选择上一个节点'}</strong><small>{node.title}</small></div>
+        <button aria-label="关闭节点选择" onClick={onClose} title="关闭" type="button"><X size={14}/></button>
+      </header>
+      <div className="connection-node-options">
+        {options.map(({ type, label, description, icon: Icon }) => (
+          <button key={type} onClick={() => onAdd(type)} type="button">
+            <span className={`node-type-icon type-${type}`}><Icon size={17}/></span>
+            <span><b>{label}</b><small>{description}</small></span>
+            <ChevronRight size={14}/>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function SelectionContextMenu({ canGroupImages, onCopy, onDelete, onGroupImages, selectedCount }: Readonly<{
   canGroupImages: boolean
   onCopy: () => void
@@ -2912,6 +3195,20 @@ function clientToWorld(element: HTMLDivElement | null, viewport: CanvasViewport,
     x: (clientX - rect.left - viewport.x) / viewport.zoom,
     y: (clientY - rect.top - viewport.y) / viewport.zoom,
   }
+}
+
+function alignViewportToDevicePixels(viewport: CanvasViewport): CanvasViewport {
+  const pixelRatio = Math.max(1, window.devicePixelRatio || 1)
+  return {
+    ...viewport,
+    x: Math.round(viewport.x * pixelRatio) / pixelRatio,
+    y: Math.round(viewport.y * pixelRatio) / pixelRatio,
+  }
+}
+
+function snapZoom(zoom: number): number {
+  const snapped = Math.round(zoom / ZOOM_SNAP_STEP) * ZOOM_SNAP_STEP
+  return Number(clamp(snapped, 0.2, 2.5).toFixed(2))
 }
 
 function hasDraggedFiles(dataTransfer: DataTransfer): boolean {
