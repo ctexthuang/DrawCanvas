@@ -25,12 +25,14 @@ export const CANVAS_IPC_CHANNELS = {
   listRecent: 'canvas:list-recent',
   loadRecent: 'canvas:load-recent',
   deleteRecent: 'canvas:delete-recent',
+  writeClipboardMarker: 'canvas:write-clipboard-marker',
 } as const
 
 export const LIBRARY_IPC_CHANNELS = {
   load: 'library:load',
   importImages: 'library:import-images',
   importDroppedImages: 'library:import-dropped-images',
+  importPastedImages: 'library:import-pasted-images',
   remove: 'library:remove',
 } as const
 

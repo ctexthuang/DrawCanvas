@@ -282,6 +282,12 @@ export type DeleteRecentCanvasProjectRequest = Readonly<{
   id: string
 }>
 
+export const CANVAS_NODE_CLIPBOARD_TEXT_PREFIX = 'drawcanvas:nodes:'
+
+export type WriteCanvasClipboardMarkerRequest = Readonly<{
+  marker: string
+}>
+
 export type StorageCategory =
   | 'projects'
   | 'history'
@@ -442,6 +448,21 @@ export type ImportDroppedImagesRequest = Readonly<{
   paths: ReadonlyArray<string>
 }>
 
+export type PastedImageInput = Readonly<{
+  bytes: Uint8Array
+  name?: string
+}>
+
+export type ImportPastedImagesRequest = Readonly<{
+  images: ReadonlyArray<PastedImageInput>
+  remoteUrls: ReadonlyArray<string>
+}>
+
+export type ImportPastedImagesResult = Readonly<{
+  imported: ReadonlyArray<GeneratedArtwork>
+  library: ReadonlyArray<GeneratedArtwork>
+}>
+
 export type RemoveHistoryArtworkRequest = Readonly<{
   id: string
 }>
@@ -551,6 +572,9 @@ export type DesktopApi = Readonly<{
   library: Readonly<{
     load: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
     importImages: () => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
+    importPastedImages: (
+      request: ImportPastedImagesRequest,
+    ) => Promise<DesktopResult<ImportPastedImagesResult>>
     remove: (request: RemoveLibraryImageRequest) => Promise<DesktopResult<ReadonlyArray<GeneratedArtwork>>>
   }>
   resources: Readonly<{
@@ -580,6 +604,7 @@ export type DesktopApi = Readonly<{
     listRecent: () => Promise<DesktopResult<ReadonlyArray<RecentCanvasProject>>>
     loadRecent: (request: LoadRecentCanvasProjectRequest) => Promise<DesktopResult<CanvasDocument>>
     deleteRecent: (request: DeleteRecentCanvasProjectRequest) => Promise<DesktopResult<ReadonlyArray<RecentCanvasProject>>>
+    writeClipboardMarker: (request: WriteCanvasClipboardMarkerRequest) => Promise<DesktopResult<null>>
     openFile: () => Promise<DesktopResult<CanvasDocument>>
     saveFile: (document: CanvasDocument) => Promise<DesktopResult<string>>
   }>

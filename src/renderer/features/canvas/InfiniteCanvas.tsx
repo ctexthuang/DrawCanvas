@@ -72,6 +72,7 @@ import type {
   VideoGenerationRatio,
   VideoGenerationResolution,
 } from '../../../shared/contracts/desktop'
+import { CANVAS_NODE_CLIPBOARD_TEXT_PREFIX } from '../../../shared/contracts/desktop'
 import {
   normalizeApiMartTtsVoiceId,
   normalizeMiniMaxTtsVoiceId,
@@ -149,6 +150,10 @@ type InfiniteCanvasProps = Readonly<{
   onOptimizePrompt: (request: OptimizePromptRequest) => Promise<CanvasPromptOptimizationOutcome>
   onImportDroppedImages: (files: ReadonlyArray<File>) => Promise<ReadonlyArray<GeneratedArtwork>>
   onImportImages: () => Promise<ReadonlyArray<GeneratedArtwork>>
+  onImportPastedImages: (
+    files: ReadonlyArray<File>,
+    remoteUrls: ReadonlyArray<string>,
+  ) => Promise<ReadonlyArray<GeneratedArtwork>>
   onLoadImage: (fileName: string) => Promise<string | null>
   onOpen: () => void
   onSave: () => void
@@ -220,6 +225,10 @@ type ReferenceMentionRange = Readonly<{
 
 const HISTORY_LIMIT = 30
 const MAX_CONCURRENT_GENERATIONS = 4
+const MAX_PASTED_IMAGE_COUNT = 20
+const MAX_PASTED_IMAGE_BYTES = 25 * 1024 * 1024
+const MAX_PASTED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+const INTERNAL_CANVAS_CLIPBOARD_TYPE = 'application/x-drawcanvas-node-graph'
 const ZOOM_SETTLE_DELAY_MS = 140
 const ZOOM_SNAP_STEP = 0.05
 const SEMANTIC_ZOOM_THRESHOLD = 0.75
@@ -294,7 +303,7 @@ export function createInitialCanvas(
   }
 }
 
-export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, document, imageModels, videoModels, onChange, onClose, onGenerateAudio, onGenerateChatReply, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportDroppedImages, onImportImages, onLoadImage, onOpen, onOptimizePrompt, onSave, notify }: InfiniteCanvasProps) {
+export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, document, imageModels, videoModels, onChange, onClose, onGenerateAudio, onGenerateChatReply, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportDroppedImages, onImportImages, onImportPastedImages, onLoadImage, onOpen, onOptimizePrompt, onSave, notify }: InfiniteCanvasProps) {
   const canvasRef = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
   const documentRef = useRef(document)
@@ -304,6 +313,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const undoStackRef = useRef<CanvasGraphSnapshot[]>([])
   const redoStackRef = useRef<CanvasGraphSnapshot[]>([])
   const clipboardRef = useRef<CanvasGraphSnapshot | null>(null)
+  const internalClipboardMarkerRef = useRef<string | null>(null)
+  const importPastedImagesRef = useRef(onImportPastedImages)
   const lastPointerWorldRef = useRef<CanvasPoint>({ x: 300, y: 240 })
   const spacePressedRef = useRef(false)
   const minimapPointerIdRef = useRef<number | null>(null)
@@ -328,6 +339,10 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const [optimizingPromptNodeIds, setOptimizingPromptNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [chattingNodeIds, setChattingNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [storyboardNodeIds, setStoryboardNodeIds] = useState<ReadonlySet<string>>(() => new Set())
+
+  useEffect(() => {
+    importPastedImagesRef.current = onImportPastedImages
+  }, [onImportPastedImages])
   const [workflowRunning, setWorkflowRunning] = useState(false)
   const [isZooming, setZooming] = useState(false)
   const [, setHistoryRevision] = useState(0)
@@ -392,12 +407,6 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       if (command && event.key.toLowerCase() === 'a') {
         event.preventDefault()
         setSelectedIds(new Set(documentRef.current.nodes.map((node) => node.id)))
-      } else if (command && event.key.toLowerCase() === 'c') {
-        event.preventDefault()
-        copySelectedNodes()
-      } else if (command && event.key.toLowerCase() === 'v') {
-        event.preventDefault()
-        pasteSelectedNodes()
       } else if (command && event.key.toLowerCase() === 'z') {
         event.preventDefault()
         if (event.shiftKey) redo()
@@ -422,13 +431,72 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     function onWindowBlur(): void {
       spacePressedRef.current = false
     }
+    function onCopy(event: ClipboardEvent): void {
+      const target = event.target
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return
+      if (selectedIdsRef.current.size === 0 || !event.clipboardData) return
+      event.preventDefault()
+      copySelectedNodes(event.clipboardData)
+    }
+    function onPaste(event: ClipboardEvent): void {
+      const target = event.target
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return
+      if (!event.clipboardData) return
+
+      const marker = internalClipboardMarkerRef.current
+      const isInternalClipboard = Boolean(marker && (
+        event.clipboardData.getData(INTERNAL_CANVAS_CLIPBOARD_TYPE) === marker ||
+        event.clipboardData.getData('text/plain') === `${CANVAS_NODE_CLIPBOARD_TEXT_PREFIX}${marker}`
+      ))
+      if (isInternalClipboard && clipboardRef.current) {
+        event.preventDefault()
+        pasteSelectedNodes()
+        return
+      }
+      if (marker) {
+        internalClipboardMarkerRef.current = null
+        clipboardRef.current = null
+      }
+      const files = clipboardImageFiles(event.clipboardData)
+      const remoteUrls = files.length > 0 ? [] : clipboardImageUrls(event.clipboardData)
+      if (files.length === 0 && remoteUrls.length === 0) return
+
+      event.preventDefault()
+      const current = documentRef.current
+      const targetNodeId = selectedImagePasteTargetNodeId(current, selectedIdsRef.current)
+      const targetNode = targetNodeId
+        ? current.nodes.find((node) => node.id === targetNodeId)
+        : undefined
+      const maximumImages = targetNode?.type === 'reference-folder'
+        ? Math.max(0, 50 - (targetNode.imageFileNames?.length ?? 0))
+        : targetNode?.type === 'image'
+          ? Math.max(0, 501 - current.nodes.length)
+          : Math.max(0, 500 - current.nodes.length)
+      if (maximumImages === 0) {
+        notify(targetNode?.type === 'reference-folder' ? '参考图文件夹已达到 50 张上限' : '画布节点数量已达到上限')
+        return
+      }
+      const acceptedFiles = files.slice(0, Math.min(20, maximumImages))
+      const acceptedUrls = remoteUrls.slice(0, Math.min(20 - acceptedFiles.length, maximumImages - acceptedFiles.length))
+      void importPastedImagesAt(
+        acceptedFiles,
+        acceptedUrls,
+        lastPointerWorldRef.current,
+        targetNodeId,
+        current.id,
+      )
+    }
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('keyup', onKeyUp)
     window.addEventListener('blur', onWindowBlur)
+    window.addEventListener('copy', onCopy)
+    window.addEventListener('paste', onPaste)
     return () => {
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
       window.removeEventListener('blur', onWindowBlur)
+      window.removeEventListener('copy', onCopy)
+      window.removeEventListener('paste', onPaste)
     }
   }, [])
 
@@ -1010,7 +1078,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     else deleteNodes(selectedIdsRef.current)
   }
 
-  function copySelectedNodes(): void {
+  function copySelectedNodes(clipboardData?: DataTransfer): void {
     const ids = selectedIdsRef.current
     if (ids.size === 0) return
     const current = documentRef.current
@@ -1018,7 +1086,37 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       nodes: current.nodes.filter((node) => ids.has(node.id)).map((node) => ({ ...node })),
       connections: current.connections.filter((connection) => ids.has(connection.from) && ids.has(connection.to)).map((connection) => ({ ...connection })),
     }
-    notify(`已复制 ${ids.size} 个节点`)
+    const marker = crypto.randomUUID()
+    internalClipboardMarkerRef.current = marker
+    const markerText = `${CANVAS_NODE_CLIPBOARD_TEXT_PREFIX}${marker}`
+    if (clipboardData) {
+      clipboardData.clearData()
+      clipboardData.setData(INTERNAL_CANVAS_CLIPBOARD_TYPE, marker)
+      clipboardData.setData('text/plain', markerText)
+      notify(`已复制 ${ids.size} 个节点`)
+      return
+    }
+    if (!window.desktop) {
+      clipboardRef.current = null
+      internalClipboardMarkerRef.current = null
+      notify('节点复制需要在 Electron 桌面端运行')
+      return
+    }
+    void window.desktop.canvas.writeClipboardMarker({ marker }).then((result) => {
+      if (!result.ok && internalClipboardMarkerRef.current === marker) {
+        clipboardRef.current = null
+        internalClipboardMarkerRef.current = null
+        notify(result.error.message)
+        return
+      }
+      if (internalClipboardMarkerRef.current === marker) notify(`已复制 ${ids.size} 个节点`)
+    }).catch(() => {
+      if (internalClipboardMarkerRef.current === marker) {
+        clipboardRef.current = null
+        internalClipboardMarkerRef.current = null
+        notify('无法写入系统剪贴板')
+      }
+    })
   }
 
   function pasteSelectedNodes(): void {
@@ -1783,6 +1881,27 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     documentId: string,
   ): Promise<void> {
     const imported = await onImportDroppedImages(files)
+    placeImportedImagesAt(imported, dropPoint, targetNodeId, documentId, '本地参考图')
+  }
+
+  async function importPastedImagesAt(
+    files: ReadonlyArray<File>,
+    remoteUrls: ReadonlyArray<string>,
+    pastePoint: CanvasPoint,
+    targetNodeId: string | null,
+    documentId: string,
+  ): Promise<void> {
+    const imported = await importPastedImagesRef.current(files, remoteUrls)
+    placeImportedImagesAt(imported, pastePoint, targetNodeId, documentId, '粘贴参考图')
+  }
+
+  function placeImportedImagesAt(
+    imported: ReadonlyArray<GeneratedArtwork>,
+    dropPoint: CanvasPoint,
+    targetNodeId: string | null,
+    documentId: string,
+    subtitle: string,
+  ): void {
     if (imported.length === 0) return
     const current = documentRef.current
     if (current.id !== documentId) return
@@ -1820,7 +1939,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
         id: `image-${crypto.randomUUID()}`,
         type: 'image',
         title: artwork.title,
-        subtitle: '本地参考图',
+        subtitle,
         imageFileName: artwork.imageFileName,
         x: origin.x + (index % 4) * 320,
         y: origin.y + Math.floor(index / 4) * 330,
@@ -1836,7 +1955,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
           ? {
               ...node,
               title: firstArtwork.title,
-              subtitle: '本地参考图',
+              subtitle,
               imageFileName: firstArtwork.imageFileName,
               generationStatus: undefined,
               generationStartedAt: undefined,
@@ -3261,6 +3380,96 @@ function hasDraggedFiles(dataTransfer: DataTransfer): boolean {
 
 function isSupportedDroppedImage(file: File): boolean {
   return /^image\/(png|jpeg|webp)$/i.test(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name)
+}
+
+function clipboardImageFiles(clipboardData: DataTransfer): ReadonlyArray<File> {
+  const nativeFiles = Array.from(clipboardData.files).filter(isSupportedDroppedImage)
+  if (nativeFiles.length > 0) return nativeFiles.slice(0, MAX_PASTED_IMAGE_COUNT)
+
+  const itemFiles = Array.from(clipboardData.items).flatMap((item) => {
+    if (item.kind !== 'file' || !/^image\/(png|jpeg|webp)$/i.test(item.type)) return []
+    const file = item.getAsFile()
+    return file ? [file] : []
+  })
+  if (itemFiles.length > 0) return itemFiles.slice(0, MAX_PASTED_IMAGE_COUNT)
+
+  const html = clipboardData.getData('text/html')
+  const dataUrls = html
+    ? Array.from(new DOMParser().parseFromString(html, 'text/html').querySelectorAll('img[src]'))
+      .map((image) => image.getAttribute('src') ?? '')
+      .slice(0, MAX_PASTED_IMAGE_COUNT)
+    : []
+  const plainText = clipboardData.getData('text/plain').trim()
+  if (plainText.startsWith('data:image/')) dataUrls.push(plainText)
+
+  const files: File[] = []
+  let totalBytes = 0
+  for (const [index, value] of dataUrls.entries()) {
+    if (files.length >= MAX_PASTED_IMAGE_COUNT) break
+    const file = dataUrlImageFile(value, index)
+    if (!file || totalBytes + file.size > MAX_PASTED_IMAGE_TOTAL_BYTES) continue
+    files.push(file)
+    totalBytes += file.size
+  }
+  return files
+}
+
+function clipboardImageUrls(clipboardData: DataTransfer): ReadonlyArray<string> {
+  const candidates: string[] = []
+  const uriList = clipboardData.getData('text/uri-list')
+  if (uriList) {
+    candidates.push(...uriList.split(/\r?\n/).map((value) => value.trim()).filter((value) => value && !value.startsWith('#')))
+  }
+  const html = clipboardData.getData('text/html')
+  if (html) {
+    const document = new DOMParser().parseFromString(html, 'text/html')
+    candidates.push(...Array.from(document.querySelectorAll('img[src]')).map((image) => image.getAttribute('src') ?? ''))
+  }
+  const plainText = clipboardData.getData('text/plain').trim()
+  if (plainText) candidates.push(plainText)
+
+  const urls: string[] = []
+  const seen = new Set<string>()
+  for (const candidate of candidates) {
+    if (candidate.length === 0 || candidate.length > 4_096) continue
+    try {
+      const url = new URL(candidate)
+      if (url.protocol !== 'https:' || url.username || url.password || seen.has(url.toString())) continue
+      seen.add(url.toString())
+      urls.push(url.toString())
+      if (urls.length >= 20) break
+    } catch {
+      continue
+    }
+  }
+  return urls
+}
+
+function dataUrlImageFile(value: string, index: number): File | null {
+  const match = /^data:(image\/(?:png|jpeg|webp));base64,([a-z0-9+/=\r\n]+)$/i.exec(value)
+  if (!match || match[2].length > Math.ceil(MAX_PASTED_IMAGE_BYTES * 4 / 3) + 4) return null
+  try {
+    const decoded = window.atob(match[2].replace(/\s/g, ''))
+    if (decoded.length === 0 || decoded.length > MAX_PASTED_IMAGE_BYTES) return null
+    const bytes = new Uint8Array(decoded.length)
+    for (let byteIndex = 0; byteIndex < decoded.length; byteIndex += 1) {
+      bytes[byteIndex] = decoded.charCodeAt(byteIndex)
+    }
+    const extension = match[1].toLowerCase() === 'image/jpeg' ? 'jpg' : match[1].split('/')[1].toLowerCase()
+    return new File([bytes], `clipboard-image-${index + 1}.${extension}`, { type: match[1].toLowerCase() })
+  } catch {
+    return null
+  }
+}
+
+function selectedImagePasteTargetNodeId(
+  document: CanvasDocument,
+  selectedIds: ReadonlySet<string>,
+): string | null {
+  if (selectedIds.size !== 1) return null
+  const selectedId = [...selectedIds][0]
+  const node = document.nodes.find((item) => item.id === selectedId)
+  return node?.type === 'image' || node?.type === 'reference-folder' ? node.id : null
 }
 
 function findImageDropTargetNodeId(

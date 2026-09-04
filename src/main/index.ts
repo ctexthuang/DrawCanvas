@@ -14,7 +14,7 @@ import {
   type OpenDialogOptions,
   type SaveDialogOptions,
 } from 'electron/main'
-import { shell } from 'electron'
+import { clipboard, shell } from 'electron'
 import type {
   AddProviderModelRequest,
   CanvasDocument,
@@ -34,6 +34,7 @@ import type {
   GenerateVideoRequest,
   GeneratedArtwork,
   ImportDroppedImagesRequest,
+  ImportPastedImagesRequest,
   LoadGeneratedImageRequest,
   LoadRecentCanvasProjectRequest,
   OptimizePromptRequest,
@@ -57,7 +58,9 @@ import type {
   UpdateProviderModelRequest,
   UpdateProviderRequest,
   UpdateSettingsRequest,
+  WriteCanvasClipboardMarkerRequest,
 } from '../shared/contracts/desktop'
+import { CANVAS_NODE_CLIPBOARD_TEXT_PREFIX } from '../shared/contracts/desktop'
 import {
   CANVAS_IPC_CHANNELS,
   GENERATION_IPC_CHANNELS,
@@ -98,6 +101,10 @@ import {
   UpdateCheckServiceError,
   type UpdateCheckServiceErrorCode,
 } from './application/update-check-service'
+import {
+  LibraryImageImportService,
+  LibraryImageImportServiceError,
+} from './application/library-image-import-service'
 import { AppDataMigrationError } from './infrastructure/app-data-layout'
 import { DRAW_CANVAS_RELEASES_URL } from './infrastructure/github-release-client'
 import { ProviderRequestError, testProvider } from './infrastructure/provider-client'
@@ -108,6 +115,7 @@ const promptOptimizationService = new PromptOptimizationService(appState)
 const textGenerationService = new TextGenerationService(appState)
 const videoGenerationService = new VideoGenerationService(appState)
 const audioGenerationService = new AudioGenerationService(appState)
+const libraryImageImportService = new LibraryImageImportService(appState)
 const updateCheckService = new UpdateCheckService()
 let mainWindow: BrowserWindow | null = null
 const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1'
@@ -452,6 +460,34 @@ function isImportDroppedImagesRequest(value: unknown): value is ImportDroppedIma
       ['.png', '.jpg', '.jpeg', '.webp'].includes(extname(filePath).toLowerCase()),
     )
   )
+}
+
+function isImportPastedImagesRequest(value: unknown): value is ImportPastedImagesRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<ImportPastedImagesRequest>
+  if (!Array.isArray(request.images) || !Array.isArray(request.remoteUrls)) return false
+  if (request.images.length + request.remoteUrls.length === 0 || request.images.length + request.remoteUrls.length > 20) {
+    return false
+  }
+  let totalBytes = 0
+  for (const image of request.images) {
+    if (!image || typeof image !== 'object' || Array.isArray(image)) return false
+    if (!(image.bytes instanceof Uint8Array) || image.bytes.byteLength === 0 || image.bytes.byteLength > 25 * 1024 * 1024) {
+      return false
+    }
+    if (image.name !== undefined && (typeof image.name !== 'string' || image.name.length > 200)) return false
+    totalBytes += image.bytes.byteLength
+    if (totalBytes > 50 * 1024 * 1024) return false
+  }
+  return request.remoteUrls.every((remoteUrl) => {
+    if (typeof remoteUrl !== 'string' || remoteUrl.length === 0 || remoteUrl.length > 4_096) return false
+    try {
+      const url = new URL(remoteUrl)
+      return url.protocol === 'https:' && !url.username && !url.password
+    } catch {
+      return false
+    }
+  })
 }
 
 function isLoadGeneratedImageRequest(value: unknown): value is LoadGeneratedImageRequest {
@@ -1005,6 +1041,23 @@ function registerIpc(): void {
   )
 
   ipcMain.handle(
+    LIBRARY_IPC_CHANNELS.importPastedImages,
+    trustedHandler(async (request: ImportPastedImagesRequest) => {
+      if (!isImportPastedImagesRequest(request)) {
+        return failure('INVALID_INPUT', '粘贴图片无效、数量超过 20 张或总大小超过 50 MB')
+      }
+      try {
+        return success(await libraryImageImportService.importPastedImages(request))
+      } catch (error) {
+        if (error instanceof LibraryImageImportServiceError) {
+          return failure('INVALID_FILE', error.message)
+        }
+        return failure('INVALID_FILE', '粘贴内容不是支持的 PNG、JPG 或 WEBP 图片')
+      }
+    }),
+  )
+
+  ipcMain.handle(
     LIBRARY_IPC_CHANNELS.remove,
     trustedHandler(async (request: RemoveLibraryImageRequest) => {
       if (!isResourceItemRequest(request)) return failure('INVALID_INPUT', '图片资源标识无效')
@@ -1324,6 +1377,25 @@ function registerIpc(): void {
         return success(await appState.deleteRecentProject(request.id))
       } catch {
         return failure('IO_ERROR', '无法删除最近项目')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    CANVAS_IPC_CHANNELS.writeClipboardMarker,
+    trustedHandler(async (request: WriteCanvasClipboardMarkerRequest) => {
+      if (
+        !request ||
+        typeof request.marker !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.marker)
+      ) {
+        return failure('INVALID_INPUT', '画布剪贴板标记无效')
+      }
+      try {
+        clipboard.writeText(`${CANVAS_NODE_CLIPBOARD_TEXT_PREFIX}${request.marker}`)
+        return success(null)
+      } catch {
+        return failure('IO_ERROR', '无法写入系统剪贴板')
       }
     }),
   )

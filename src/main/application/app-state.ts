@@ -71,6 +71,7 @@ const MAX_REFERENCE_IMAGE_BYTES = 45 * 1024 * 1024
 const MAX_STORED_VIDEO_BYTES = 300 * 1024 * 1024
 const MAX_STORED_AUDIO_BYTES = 50 * 1024 * 1024
 const MAX_LIBRARY_IMPORT_COUNT = 50
+const MAX_PASTED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 const MAX_CANVAS_PROJECT_BYTES = 20 * 1024 * 1024
 const MAX_RECENT_PROJECTS = 50
 
@@ -87,6 +88,17 @@ export type StoredImageInput = Readonly<{
   fileName: string
   bytes: Uint8Array
   mediaType: GeneratedImageMediaType
+}>
+
+export type LibraryImageDataInput = Readonly<{
+  bytes: Uint8Array
+  title: string
+  source: 'clipboard' | 'network'
+}>
+
+export type LibraryImageDataImportResult = Readonly<{
+  imported: ReadonlyArray<GeneratedArtwork>
+  library: ReadonlyArray<GeneratedArtwork>
 }>
 
 type SaveGeneratedVideoRequest = Readonly<{
@@ -994,7 +1006,6 @@ export class AppState {
       if (sourcePaths.length === 0 || sourcePaths.length > MAX_LIBRARY_IMPORT_COUNT) {
         throw new Error('Invalid library import count')
       }
-      const current = (await this.libraryStore.read()) ?? []
       const imported: GeneratedArtwork[] = []
       const writtenPaths: string[] = []
       try {
@@ -1004,27 +1015,19 @@ export class AppState {
             throw new Error('Library image is invalid or too large')
           }
           const bytes = await readFile(sourcePath)
-          const extension = detectLibraryImageExtension(bytes)
-          if (!extension) throw new Error('Unsupported library image')
-          const id = randomUUID()
-          const imageFileName = `${id}.${extension}`
-          const imagePath = join(this.paths.imagesDirectory, imageFileName)
-          await writeFile(imagePath, bytes, { flag: 'wx' })
-          writtenPaths.push(imagePath)
           const rawTitle = basename(sourcePath, extname(sourcePath)).trim()
-          imported.push({
-            id,
+          const written = await this.writeLibraryImageUnsafe({
+            bytes,
             title: rawTitle.slice(0, 200) || '本地图片',
-            prompt: '',
-            model: '本地导入',
-            size: '原始尺寸',
-            createdAt: new Date().toISOString(),
-            palette: 'linear-gradient(145deg, #2e3445 0%, #7552be 52%, #f06b82 100%)',
-            tags: ['本地导入'],
-            imageFileName,
+            sourceLabel: '本地导入',
           })
+          writtenPaths.push(written.path)
+          imported.push(written.artwork)
         }
-        return await this.libraryStore.write([...imported.reverse(), ...current].slice(0, 1000))
+        return await this.libraryStore.update((value) => [
+          ...[...imported].reverse(),
+          ...(value ?? []),
+        ].slice(0, 1000))
       } catch (error) {
         await Promise.all(writtenPaths.map((filePath) => unlink(filePath).catch(() => undefined)))
         throw error
@@ -1032,19 +1035,86 @@ export class AppState {
     })
   }
 
+  async importLibraryImageData(inputs: ReadonlyArray<LibraryImageDataInput>): Promise<LibraryImageDataImportResult> {
+    return this.withStorageOperation(async () => {
+      const totalBytes = inputs.reduce((total, input) => total + input.bytes.byteLength, 0)
+      if (
+        inputs.length === 0 ||
+        inputs.length > MAX_LIBRARY_IMPORT_COUNT ||
+        totalBytes <= 0 ||
+        totalBytes > MAX_PASTED_IMAGE_TOTAL_BYTES
+      ) throw new Error('Invalid pasted image data')
+
+      const imported: GeneratedArtwork[] = []
+      const writtenPaths: string[] = []
+      try {
+        for (const input of inputs) {
+          const written = await this.writeLibraryImageUnsafe({
+            bytes: input.bytes,
+            title: input.title.trim().slice(0, 200) || (input.source === 'network' ? '网络图片' : '粘贴图片'),
+            sourceLabel: input.source === 'network' ? '网络导入' : '剪贴板导入',
+          })
+          writtenPaths.push(written.path)
+          imported.push(written.artwork)
+        }
+        const library = await this.libraryStore.update((value) => [
+          ...[...imported].reverse(),
+          ...(value ?? []),
+        ].slice(0, 1000))
+        return { imported, library }
+      } catch (error) {
+        await Promise.all(writtenPaths.map((filePath) => unlink(filePath).catch(() => undefined)))
+        throw error
+      }
+    })
+  }
+
+  private async writeLibraryImageUnsafe(input: Readonly<{
+    bytes: Uint8Array
+    title: string
+    sourceLabel: '本地导入' | '剪贴板导入' | '网络导入'
+  }>): Promise<Readonly<{ artwork: GeneratedArtwork; path: string }>> {
+    if (input.bytes.byteLength === 0 || input.bytes.byteLength > MAX_STORED_IMAGE_BYTES) {
+      throw new Error('Library image is invalid or too large')
+    }
+    const extension = detectLibraryImageExtension(input.bytes)
+    if (!extension) throw new Error('Unsupported library image')
+    const id = randomUUID()
+    const imageFileName = `${id}.${extension}`
+    const imagePath = join(this.paths.imagesDirectory, imageFileName)
+    await writeFile(imagePath, input.bytes, { flag: 'wx' })
+    return {
+      path: imagePath,
+      artwork: {
+        id,
+        title: input.title,
+        prompt: '',
+        model: input.sourceLabel,
+        size: '原始尺寸',
+        createdAt: new Date().toISOString(),
+        palette: 'linear-gradient(145deg, #2e3445 0%, #7552be 52%, #f06b82 100%)',
+        tags: [input.sourceLabel],
+        imageFileName,
+      },
+    }
+  }
+
   async removeLibraryImage(request: RemoveLibraryImageRequest): Promise<ReadonlyArray<GeneratedArtwork>> {
     return this.withStorageOperation(async () => {
-      const current = (await this.libraryStore.read()) ?? []
-      const artwork = current.find((item) => item.id === request.id)
-      if (!artwork) return current
-      const next = current.filter((item) => item.id !== request.id)
-      await this.libraryStore.write(next)
-      if (artwork.imageFileName && isGeneratedImageFileName(artwork.imageFileName)) {
+      let artwork: GeneratedArtwork | undefined
+      const next = await this.libraryStore.update((value) => {
+        const current = value ?? []
+        artwork = current.find((item) => item.id === request.id)
+        return artwork ? current.filter((item) => item.id !== request.id) : current
+      })
+      if (!artwork) return next
+      const imageFileName = artwork.imageFileName
+      if (imageFileName && isGeneratedImageFileName(imageFileName)) {
         const history = (await this.historyStore.read()) ?? []
-        const isStillReferenced = history.some((item) => item.imageFileName === artwork.imageFileName) ||
-          await this.isImageReferencedByCanvasUnsafe(artwork.imageFileName)
+        const isStillReferenced = history.some((item) => item.imageFileName === imageFileName) ||
+          await this.isImageReferencedByCanvasUnsafe(imageFileName)
         if (!isStillReferenced) {
-          await unlink(join(this.paths.imagesDirectory, artwork.imageFileName)).catch(() => undefined)
+          await unlink(join(this.paths.imagesDirectory, imageFileName)).catch(() => undefined)
         }
       }
       return next

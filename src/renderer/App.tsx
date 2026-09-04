@@ -706,6 +706,52 @@ export function App() {
     return imported
   }, [libraryCatalog, notify])
 
+  const importPastedCanvasReferenceImages = useCallback(async (
+    files: ReadonlyArray<File>,
+    remoteUrls: ReadonlyArray<string>,
+  ): Promise<ReadonlyArray<GeneratedArtwork>> => {
+    if (!window.desktop) {
+      notify('粘贴图片需要在 Electron 桌面端运行')
+      return []
+    }
+    try {
+      const images: Array<Readonly<{ bytes: Uint8Array; name?: string }>> = []
+      let totalBytes = 0
+      for (const [index, file] of files.slice(0, 20).entries()) {
+        if (file.size <= 0 || file.size > 25 * 1024 * 1024) {
+          notify('粘贴图片不能为空，且单张不能超过 25 MB')
+          return []
+        }
+        totalBytes += file.size
+        if (totalBytes > 50 * 1024 * 1024) {
+          notify('本次粘贴图片总大小不能超过 50 MB')
+          return []
+        }
+        const rawName = file.name.replace(/\.(?:png|jpe?g|webp)$/i, '').trim()
+        images.push({
+          bytes: new Uint8Array(await file.arrayBuffer()),
+          name: rawName.slice(0, 200) || `粘贴图片 ${index + 1}`,
+        })
+      }
+      const result = await window.desktop.library.importPastedImages({
+        images,
+        remoteUrls: remoteUrls.slice(0, Math.max(0, 20 - images.length)),
+      })
+      if (!result.ok) {
+        notify(result.error.message)
+        return []
+      }
+      const { imported, library } = result.value
+      setLibraryCatalog(library)
+      if (imported.length > 0) notify(`已粘贴 ${imported.length} 张参考图`)
+      void refreshStorageStats()
+      return imported
+    } catch {
+      notify('无法读取剪贴板图片，请重新复制后再试')
+      return []
+    }
+  }, [notify])
+
   const loadGeneratedImage = useCallback(async (fileName: string): Promise<string | null> => {
     if (!window.desktop) return null
     const result = await window.desktop.generation.loadImage({ fileName })
@@ -1026,7 +1072,7 @@ export function App() {
       case 'settings':
         return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onCheckForUpdates={() => void checkForUpdates()} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onOpenLatestRelease={() => void openLatestRelease()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} updateCheck={updateCheck} updateChecking={updateChecking} updateError={updateError} />
       case 'canvas':
-        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={primaryModelKey(settings.modelRoutes, 'audio') ?? ''} defaultChatModelKey={primaryModelKey(settings.modelRoutes, 'chat') ?? ''} defaultImageModelKey={primaryModelKey(settings.modelRoutes, 'image') ?? ''} defaultVideoModelKey={primaryModelKey(settings.modelRoutes, 'video') ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
+        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={primaryModelKey(settings.modelRoutes, 'audio') ?? ''} defaultChatModelKey={primaryModelKey(settings.modelRoutes, 'chat') ?? ''} defaultImageModelKey={primaryModelKey(settings.modelRoutes, 'image') ?? ''} defaultVideoModelKey={primaryModelKey(settings.modelRoutes, 'video') ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onImportPastedImages={importPastedCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
     }
   }
 

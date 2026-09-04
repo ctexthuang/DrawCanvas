@@ -19,6 +19,7 @@ import type {
   GenerateVideoRequest,
   GeneratedArtwork,
   ImportDroppedImagesRequest,
+  ImportPastedImagesRequest,
   LoadGeneratedImageRequest,
   LoadRecentCanvasProjectRequest,
   OptimizePromptRequest,
@@ -37,6 +38,7 @@ import type {
   UpdateProviderModelRequest,
   UpdateProviderRequest,
   UpdateSettingsRequest,
+  WriteCanvasClipboardMarkerRequest,
 } from '../shared/contracts/desktop'
 import {
   CANVAS_IPC_CHANNELS,
@@ -119,6 +121,8 @@ const desktopApi: FileDropDesktopApi = {
       const request: ImportDroppedImagesRequest = { paths }
       return ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.importDroppedImages, request)
     },
+    importPastedImages: (request: ImportPastedImagesRequest) =>
+      ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.importPastedImages, request),
     remove: (request: RemoveLibraryImageRequest) => ipcRenderer.invoke(LIBRARY_IPC_CHANNELS.remove, request),
   },
   resources: {
@@ -148,6 +152,8 @@ const desktopApi: FileDropDesktopApi = {
     listRecent: () => ipcRenderer.invoke(CANVAS_IPC_CHANNELS.listRecent),
     loadRecent: (request: LoadRecentCanvasProjectRequest) => ipcRenderer.invoke(CANVAS_IPC_CHANNELS.loadRecent, request),
     deleteRecent: (request: DeleteRecentCanvasProjectRequest) => ipcRenderer.invoke(CANVAS_IPC_CHANNELS.deleteRecent, request),
+    writeClipboardMarker: (request: WriteCanvasClipboardMarkerRequest) =>
+      ipcRenderer.invoke(CANVAS_IPC_CHANNELS.writeClipboardMarker, request),
     openFile: () => ipcRenderer.invoke('canvas:open-file'),
     saveFile: (document: CanvasDocument) => ipcRenderer.invoke('canvas:save-file', document),
   },

@@ -13,11 +13,18 @@ export function parseSafeRemoteMediaUrl(value: string): URL | null {
   }
 }
 
+export function isPublicRemoteMediaAddress(value: string): boolean {
+  const address = value.toLowerCase().replace(/^\[|\]$/g, '')
+  const ipVersion = isIP(address)
+  if (ipVersion === 4) return !isNonPublicIpv4(address)
+  if (ipVersion === 6) return !isNonPublicIpv6(address)
+  return false
+}
+
 function isNonPublicHostname(value: string): boolean {
   const hostname = value.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
   const ipVersion = isIP(hostname)
-  if (ipVersion === 4) return isNonPublicIpv4(hostname)
-  if (ipVersion === 6) return isNonPublicIpv6(hostname)
+  if (ipVersion !== 0) return !isPublicRemoteMediaAddress(hostname)
   if (
     !hostname.includes('.') ||
     hostname === 'localhost' ||
