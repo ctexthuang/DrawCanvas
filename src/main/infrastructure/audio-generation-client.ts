@@ -1,4 +1,9 @@
 import { net } from 'electron/main'
+import {
+  normalizeApiMartTtsVoiceId,
+  normalizeMiniMaxTtsVoiceId,
+} from '../../shared/domain/audio-generation'
+import { ApiMartRequestError, generateApiMartSpeech } from './apimart/client'
 
 const REQUEST_TIMEOUT_MS = 180_000
 const MAX_RESPONSE_BYTES = 100 * 1024 * 1024
@@ -17,8 +22,11 @@ export type AudioGenerationClientRequest = Readonly<{
 
 export type AudioGenerationClientResult = Readonly<{
   bytes: Uint8Array
-  mediaType: 'audio/mpeg'
+  mediaType: 'audio/mpeg' | 'audio/wav'
   durationMs: number
+  voiceId: string
+  pitch: number
+  emotion: string
 }>
 
 export type AudioGenerationRequestErrorCode =
@@ -40,9 +48,44 @@ export class AudioGenerationRequestError extends Error {
   }
 }
 
+export async function generateApiMartAudio(
+  request: AudioGenerationClientRequest,
+): Promise<AudioGenerationClientResult> {
+  if (request.text.length > 4_096) {
+    throw new AudioGenerationRequestError(
+      'REMOTE',
+      'API Mart TTS 单次文本不能超过 4096 个字符，请拆分后重试',
+      400,
+    )
+  }
+  const voiceId = normalizeApiMartTtsVoiceId(request.voiceId)
+  try {
+    const bytes = await generateApiMartSpeech({
+      baseUrl: request.baseUrl,
+      apiKey: request.apiKey,
+      model: request.model,
+      input: request.text,
+      voice: voiceId,
+      speed: request.speed,
+    })
+    return {
+      bytes,
+      mediaType: 'audio/wav',
+      durationMs: 0,
+      voiceId,
+      pitch: 0,
+      emotion: '',
+    }
+  } catch (error) {
+    if (!(error instanceof ApiMartRequestError)) throw error
+    throw new AudioGenerationRequestError(error.code, error.message, error.httpStatus)
+  }
+}
+
 export async function generateMiniMaxAudio(
   request: AudioGenerationClientRequest,
 ): Promise<AudioGenerationClientResult> {
+  const voiceId = normalizeMiniMaxTtsVoiceId(request.voiceId)
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
   try {
@@ -60,7 +103,7 @@ export async function generateMiniMaxAudio(
         stream: false,
         output_format: 'hex',
         voice_setting: {
-          voice_id: request.voiceId,
+          voice_id: voiceId,
           speed: request.speed,
           vol: 1,
           pitch: request.pitch,
@@ -113,7 +156,14 @@ export async function generateMiniMaxAudio(
     const durationMs = typeof extraInfo?.audio_length === 'number' && Number.isFinite(extraInfo.audio_length)
       ? Math.max(0, Math.round(extraInfo.audio_length))
       : 0
-    return { bytes: audioBytes, mediaType: 'audio/mpeg', durationMs }
+    return {
+      bytes: audioBytes,
+      mediaType: 'audio/mpeg',
+      durationMs,
+      voiceId,
+      pitch: request.pitch,
+      emotion: request.emotion,
+    }
   } catch (error) {
     if (error instanceof AudioGenerationRequestError) throw error
     if (controller.signal.aborted) {

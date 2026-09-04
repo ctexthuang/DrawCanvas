@@ -58,6 +58,7 @@ const routeSlotLabels = ['主选模型', '第二选择', '第三选择'] as cons
 const adapterLabels: Readonly<Record<ProviderAdapterId, string>> = {
   openai: 'OpenAI 官方协议',
   'openai-sub2api': 'OpenAI 兼容 / Sub2API',
+  apimart: 'API Mart 协议',
   volcengine: '火山方舟协议',
   minimax: 'MiniMax 协议',
 }
@@ -253,7 +254,7 @@ function ProviderSettingsView({ activeProvider, activeProviderId, creating, onCl
           {(creating || activeProvider) && <>
             <div className="provider-form-grid">
               <label><span>服务名称</span><input disabled={Boolean(busy)} maxLength={100} onChange={(event) => setName(event.target.value)} placeholder="例如：团队中转站" value={name}/></label>
-              <label><span>协议适配器</span><select disabled={Boolean(busy)} onChange={(event) => { const next = event.target.value as ProviderAdapterId; setAdapterId(next); if (next === 'openai') setBaseUrl('https://api.openai.com/v1') }} value={adapterId}>{Object.entries(adapterLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              <label><span>协议适配器</span><select disabled={Boolean(busy)} onChange={(event) => { const next = event.target.value as ProviderAdapterId; setAdapterId(next); const defaultBaseUrl = defaultBaseUrlForAdapter(next); if (defaultBaseUrl) setBaseUrl(defaultBaseUrl) }} value={adapterId}>{Object.entries(adapterLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
               <label className="span-two"><span>Base URL</span><input aria-invalid={Boolean(baseUrlError)} disabled={Boolean(busy) || adapterId === 'openai'} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" value={baseUrl}/>{baseUrlError && <small className="field-error">{baseUrlError}</small>}</label>
               <label className="span-two"><span>API Key</span><div className="password-field"><input autoComplete="off" disabled={Boolean(busy)} onChange={(event) => setApiKey(event.target.value)} placeholder={activeProvider?.hasApiKey ? '已安全保存，输入新密钥可覆盖' : 'sk-...'} type={showKey ? 'text' : 'password'} value={apiKey}/><button aria-label={showKey ? '隐藏 API Key' : '显示 API Key'} onClick={() => setShowKey(!showKey)} type="button">{showKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div></label>
             </div>
@@ -352,5 +353,15 @@ function getBaseUrlError(value: string, adapterId: ProviderAdapterId): string | 
       : '仅支持 HTTPS；本机 OpenAI 中转可使用 HTTP'
   } catch {
     return '接口地址格式无效'
+  }
+}
+
+function defaultBaseUrlForAdapter(adapterId: ProviderAdapterId): string | null {
+  switch (adapterId) {
+    case 'openai': return 'https://api.openai.com/v1'
+    case 'apimart': return 'https://api.apimart.ai/v1'
+    case 'volcengine': return 'https://ark.cn-beijing.volces.com/api/v3'
+    case 'minimax': return 'https://api.minimaxi.com/v1'
+    case 'openai-sub2api': return null
   }
 }

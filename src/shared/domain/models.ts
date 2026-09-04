@@ -1,8 +1,15 @@
 export type ModelKind = 'image' | 'video' | 'chat' | 'audio'
 
-export type ProviderAdapterId = 'openai' | 'openai-sub2api' | 'volcengine' | 'minimax'
+export type ProviderAdapterId = 'openai' | 'openai-sub2api' | 'apimart' | 'volcengine' | 'minimax'
 
 export type ProviderModelSource = 'builtin' | 'discovered' | 'manual'
+
+export type DiscoveredProviderModel = Readonly<{
+  remoteModelId: string
+  displayName?: string
+  kind?: ModelKind
+  description?: string
+}>
 
 export const IMAGE_GENERATION_SIZES = [
   'auto',

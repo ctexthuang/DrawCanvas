@@ -1,9 +1,11 @@
 import { net } from 'electron/main'
 import type { ImageGenerationSize } from '../../shared/contracts/desktop'
+import { ApiMartRequestError, submitApiMartMediaTask } from './apimart/client'
 import {
   createOpenAiEndpointCandidates,
   type OpenAiCompatibleProfile,
 } from './openai-compatible-endpoints'
+import { parseSafeRemoteMediaUrl } from './remote-media-url'
 
 const REQUEST_TIMEOUT_MS = 180_000
 const PREMATURE_DISCONNECT_THRESHOLD_MS = 30_000
@@ -45,6 +47,53 @@ export class ImageGenerationRequestError extends Error {
   ) {
     super(message, options)
     this.name = 'ImageGenerationRequestError'
+  }
+}
+
+export async function generateApiMartImage(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+  size: ImageGenerationSize,
+  referenceImages: ReadonlyArray<ImageReferenceInput> = [],
+): Promise<ImageGenerationClientResult> {
+  try {
+    const imageUrl = await submitApiMartMediaTask({
+      baseUrl,
+      apiKey,
+      endpoint: 'images/generations',
+      resultKind: 'image',
+      body: {
+        model,
+        prompt,
+        ...apiMartImageDimensions(size),
+        n: 1,
+        ...(referenceImages.length > 0
+          ? { image_urls: referenceImages.map(referenceImageDataUrl) }
+          : {}),
+      },
+    })
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    try {
+      return await downloadGeneratedImage(imageUrl, controller.signal)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new ImageGenerationRequestError('TIMEOUT', 'API Mart 生成图片下载超时')
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+  } catch (error) {
+    if (!(error instanceof ApiMartRequestError)) throw error
+    throw new ImageGenerationRequestError(
+      mapApiMartImageErrorCode(error.code),
+      error.message,
+      { cause: error },
+      error.httpStatus,
+    )
   }
 }
 
@@ -531,13 +580,9 @@ async function downloadGeneratedImage(
 }
 
 function validateRemoteImageUrl(value: string): URL {
-  try {
-    const url = new URL(value)
-    if (url.protocol !== 'https:' || url.username || url.password) throw new Error('unsafe image URL')
-    return url
-  } catch {
-    throw new ImageGenerationRequestError('INVALID_RESPONSE', '图片服务返回了不安全的下载地址')
-  }
+  const url = parseSafeRemoteMediaUrl(value)
+  if (url) return url
+  throw new ImageGenerationRequestError('INVALID_RESPONSE', '图片服务返回了不安全的下载地址')
 }
 
 function extractRemoteErrorMessage(payload: unknown | null, body: Uint8Array): string {
@@ -561,6 +606,51 @@ function imageSizeAspectRatio(size: ImageGenerationSize): '1:1' | '16:9' | '4:3'
     case '720x1280': return '9:16'
     case '1344x576': return '21:9'
     default: return '1:1'
+  }
+}
+
+function apiMartImageDimensions(
+  size: ImageGenerationSize,
+): Readonly<{ size?: string; resolution?: '1K' | '2K' | '4K' }> {
+  if (size === 'auto') return {}
+  const [width, height] = size.split('x').map(Number)
+  const ratio = width / height
+  const candidates = [
+    ['1:1', 1],
+    ['4:3', 4 / 3],
+    ['3:4', 3 / 4],
+    ['3:2', 3 / 2],
+    ['2:3', 2 / 3],
+    ['16:9', 16 / 9],
+    ['9:16', 9 / 16],
+    ['21:9', 21 / 9],
+    ['9:21', 9 / 21],
+  ] as const
+  const nearestRatio = candidates.reduce((nearest, candidate) =>
+    Math.abs(Math.log(candidate[1] / ratio)) < Math.abs(Math.log(nearest[1] / ratio))
+      ? candidate
+      : nearest,
+  )[0]
+  return { size: nearestRatio, resolution: apiMartImageResolution(size) }
+}
+
+function apiMartImageResolution(size: ImageGenerationSize): '1K' | '2K' | '4K' {
+  if (size === 'auto') return '1K'
+  const maximumDimension = Math.max(...size.split('x').map(Number))
+  if (maximumDimension >= 3_500) return '4K'
+  return maximumDimension >= 1_900 ? '2K' : '1K'
+}
+
+function mapApiMartImageErrorCode(
+  code: ApiMartRequestError['code'],
+): ImageGenerationRequestErrorCode {
+  switch (code) {
+    case 'NETWORK': return 'NETWORK'
+    case 'TIMEOUT': return 'TIMEOUT'
+    case 'AUTHENTICATION': return 'AUTHENTICATION'
+    case 'RATE_LIMIT': return 'RATE_LIMIT'
+    case 'REMOTE': return 'REMOTE'
+    case 'INVALID_RESPONSE': return 'INVALID_RESPONSE'
   }
 }
 

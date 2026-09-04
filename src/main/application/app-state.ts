@@ -43,6 +43,7 @@ import {
   findBuiltinModelsByRemoteId,
   inferModelKind,
   type ConfiguredProviderModel,
+  type DiscoveredProviderModel,
   type ModelKind,
   type ModelRoutes,
   type ProviderAdapterId,
@@ -102,7 +103,7 @@ type SaveGeneratedVideoRequest = Readonly<{
 
 export type SaveGeneratedAudioRequest = Readonly<{
   bytes: Uint8Array
-  mediaType: 'audio/mpeg'
+  mediaType: 'audio/mpeg' | 'audio/wav'
   text: string
   modelKey: string
   modelName: string
@@ -157,7 +158,7 @@ type StoredModelConfigDocument = Readonly<{
 }>
 
 type ModelConfigDocument = Readonly<{
-  schemaVersion: 7
+  schemaVersion: 8
   providers: ReadonlyArray<StoredProvider>
   models: ReadonlyArray<ConfiguredProviderModel>
   modelRoutes: ModelRoutes
@@ -175,7 +176,7 @@ type StoredRecentProjectsDocument = Readonly<{
 
 const DEFAULT_ACCENT = '#ff5f77'
 const LEGACY_PROVIDER_DEFAULTS: ReadonlyArray<StoredProvider> = [
-  createLegacyProvider('apimart', 'APIMart', 'openai-sub2api', 'https://api.apimart.ai/v1', false),
+  createLegacyProvider('apimart', 'APIMart', 'apimart', 'https://api.apimart.ai/v1', false),
   createLegacyProvider('volcengine', '火山引擎', 'volcengine', 'https://ark.cn-beijing.volces.com/api/v3', true),
   createLegacyProvider('minimax', 'MiniMax', 'minimax', 'https://api.minimaxi.com/v1', true),
   createLegacyProvider('comfly', 'Comfly', 'openai-sub2api', 'https://api.comfly.chat/v1', false),
@@ -455,15 +456,15 @@ export class AppState {
 
   async syncProviderModels(
     id: string,
-    remoteModelIds: ReadonlyArray<string>,
+    remoteModels: ReadonlyArray<DiscoveredProviderModel>,
     syncedAt: string,
   ): Promise<AppSettings> {
     return this.withStorageOperation(async () => {
       await this.modelConfigStore.update((value) => {
         const current = this.normalizeModelConfig(value)
         const provider = findProvider(current, id)
-        const discoveredIds = uniqueStrings(remoteModelIds, 500)
-        const discoveredSet = new Set(discoveredIds)
+        const discoveredModels = normalizeDiscoveredProviderModels(remoteModels)
+        const discoveredSet = new Set(discoveredModels.map((model) => model.remoteModelId))
         const existingByRemoteId = new Map(current.models
           .filter((model) => model.providerId === id)
           .map((model) => [model.remoteModelId, model]))
@@ -473,10 +474,19 @@ export class AppState {
           .filter((model) => model.providerId === id)
           .filter((model) => !discoveredSet.has(model.remoteModelId))
           .map((model) => model.source === 'manual' ? model : { ...model, available: false })
-        const discovered = discoveredIds.map((remoteModelId) => {
-          const existing = existingByRemoteId.get(remoteModelId)
-          if (existing) return { ...existing, available: true }
-          return createDiscoveredModel(provider, remoteModelId)
+        const discovered = discoveredModels.map((remoteModel) => {
+          const existing = existingByRemoteId.get(remoteModel.remoteModelId)
+          if (existing?.source === 'manual') return { ...existing, available: true }
+          if (existing) {
+            return {
+              ...existing,
+              displayName: remoteModel.displayName ?? existing.displayName,
+              kind: remoteModel.kind ?? existing.kind,
+              description: remoteModel.description ?? existing.description,
+              available: true,
+            }
+          }
+          return createDiscoveredModel(provider, remoteModel)
         })
         return {
           ...current,
@@ -793,7 +803,7 @@ export class AppState {
               selectedIds.has(audio.id) && isGeneratedAudioFileName(audio.audioFileName)
                 ? [{
                     sourcePath: join(this.paths.audiosDirectory, audio.audioFileName),
-                    targetName: batchExportFileName(audio.title, audio.id, '.mp3'),
+                    targetName: batchExportFileName(audio.title, audio.id, extname(audio.audioFileName)),
                   }]
                 : [],
             )
@@ -921,7 +931,7 @@ export class AppState {
         throw new Error('Generated audio is invalid or too large')
       }
       const id = randomUUID()
-      const audioFileName = `${id}.mp3`
+      const audioFileName = `${id}.${audioExtensionForMediaType(request.mediaType)}`
       const audioPath = join(this.paths.audiosDirectory, audioFileName)
       const audio: GeneratedAudioAsset = {
         id,
@@ -1332,7 +1342,7 @@ export class AppState {
     const preferences = this.normalizePreferences(importedPreferences)
     const modelConfig = this.normalizeModelConfig(
       storedModelConfig ?? legacyModelConfig ?? {
-        schemaVersion: importedPreferences?.providers ? 0 : 7,
+        schemaVersion: importedPreferences?.providers ? 0 : 8,
         selectedModelIds: importedPreferences?.selectedModelIds ?? [],
         providers: importedPreferences?.providers ?? [],
         models: [],
@@ -1519,11 +1529,22 @@ export class AppState {
     const storedProviders = Array.isArray(value?.providers) ? value.providers : []
     const legacyOpenAiProvider = storedProviders.find((provider) => provider?.id === 'openai-relay')
     const legacyOpenAiTarget = getLegacyOpenAiTarget(legacyOpenAiProvider)
-    if ((value?.schemaVersion ?? 0) >= 7) {
+    if ((value?.schemaVersion ?? 0) >= 8) {
       const providers = normalizeStoredProviders(storedProviders)
       const models = normalizeConfiguredModels(value?.models, providers)
       return {
-        schemaVersion: 7,
+        schemaVersion: 8,
+        providers,
+        models,
+        modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
+      }
+    }
+
+    if ((value?.schemaVersion ?? 0) === 7) {
+      const providers = normalizeStoredProviders(storedProviders).map(migrateVersion7Provider)
+      const models = normalizeConfiguredModels(value?.models, providers)
+      return {
+        schemaVersion: 8,
         providers,
         models,
         modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
@@ -1531,14 +1552,14 @@ export class AppState {
     }
 
     if ((value?.schemaVersion ?? 0) === 6) {
-      const normalizedProviders = normalizeStoredProviders(storedProviders)
+      const normalizedProviders = normalizeStoredProviders(storedProviders).map(migrateVersion7Provider)
       const retainedModels = migrateVersion6Models(value?.models, normalizedProviders)
       const providers = normalizedProviders.filter((provider) =>
         shouldRetainSeededProvider(provider, retainedModels))
       const providerIds = new Set(providers.map((provider) => provider.id))
       const models = retainedModels.filter((model) => providerIds.has(model.providerId))
       return {
-        schemaVersion: 7,
+        schemaVersion: 8,
         providers,
         models,
         modelRoutes: normalizeModelRoutes(value?.modelRoutes, models),
@@ -1561,7 +1582,10 @@ export class AppState {
     const models = providers.flatMap((provider) =>
       uniqueStrings(provider.availableModelIds ?? [], 500).flatMap((remoteModelId) => {
         const key = createProviderModelKey(provider.id, remoteModelId)
-        return [{ ...createDiscoveredModel(provider, remoteModelId), enabled: enabledModelKeys.includes(key) }]
+        return [{
+          ...createDiscoveredModel(provider, { remoteModelId }),
+          enabled: enabledModelKeys.includes(key),
+        }]
       }))
     const legacyRoutes: ModelRoutes = Object.fromEntries(
       (['image', 'video', 'chat', 'audio'] as const).flatMap((kind) => {
@@ -1570,7 +1594,7 @@ export class AppState {
       }),
     )
     return {
-      schemaVersion: 7,
+      schemaVersion: 8,
       providers: providers.map(({ availableModelIds: _availableModelIds, ...provider }) => provider),
       models,
       modelRoutes: normalizeModelRoutes(legacyRoutes, models),
@@ -1768,6 +1792,7 @@ async function encryptProviderApiKey(apiKey: string): Promise<string> {
 
 function legacyProviderAdapter(id: string): ProviderAdapterId {
   switch (id) {
+    case 'apimart': return 'apimart'
     case 'openai': return 'openai'
     case 'openai-relay':
     case 'openai-sub2api': return 'openai-sub2api'
@@ -1791,7 +1816,7 @@ function legacyProviderName(id: string): string {
 }
 
 function isProviderAdapterId(value: unknown): value is ProviderAdapterId {
-  return value === 'openai' || value === 'openai-sub2api' || value === 'volcengine' || value === 'minimax'
+  return value === 'openai' || value === 'openai-sub2api' || value === 'apimart' || value === 'volcengine' || value === 'minimax'
 }
 
 function normalizeStoredProviders(value: ReadonlyArray<StoredProvider>): ReadonlyArray<StoredProvider> {
@@ -1911,6 +1936,16 @@ function migrateVersion6Models(
   })
 }
 
+function migrateVersion7Provider(provider: StoredProvider): StoredProvider {
+  if (provider.adapterId !== 'openai-sub2api') return provider
+  try {
+    if (new URL(provider.baseUrl).hostname.toLowerCase() !== 'api.apimart.ai') return provider
+  } catch {
+    return provider
+  }
+  return { ...provider, adapterId: 'apimart', connectionStatus: 'untested' }
+}
+
 function legacyProviderDefault(id: string): StoredProvider | undefined {
   return LEGACY_PROVIDER_DEFAULTS.find((provider) => provider.id === id)
 }
@@ -1953,8 +1988,9 @@ function normalizeConfiguredModels(
 
 function createDiscoveredModel(
   provider: StoredProvider,
-  remoteModelId: string,
+  remoteModel: DiscoveredProviderModel,
 ): ConfiguredProviderModel {
+  const remoteModelId = remoteModel.remoteModelId
   const adapterId = provider.adapterId ?? legacyProviderAdapter(provider.id)
   const builtin = BUILTIN_PROVIDER_MODELS.find((model) =>
     model.providerId === adapterId && model.remoteModelId === remoteModelId)
@@ -1968,11 +2004,30 @@ function createDiscoveredModel(
         key: createProviderModelKey(provider.id, remoteModelId),
         providerId: provider.id,
         remoteModelId,
-        displayName: remoteModelId,
-        kind: inferModelKind(remoteModelId),
-        description: '由服务商模型列表接口发现',
+        displayName: remoteModel.displayName ?? remoteModelId,
+        kind: remoteModel.kind ?? inferModelKind(remoteModelId),
+        description: remoteModel.description ?? '由服务商模型列表接口发现',
       }
   return createConfiguredModel(definition, 'discovered')
+}
+
+function normalizeDiscoveredProviderModels(
+  value: ReadonlyArray<DiscoveredProviderModel>,
+): ReadonlyArray<DiscoveredProviderModel> {
+  const models: DiscoveredProviderModel[] = []
+  const ids = new Set<string>()
+  for (const item of value) {
+    if (!item || !isBoundedString(item.remoteModelId, 200) || ids.has(item.remoteModelId)) continue
+    ids.add(item.remoteModelId)
+    models.push({
+      remoteModelId: item.remoteModelId,
+      ...(isBoundedString(item.displayName, 200) ? { displayName: item.displayName } : {}),
+      ...(isModelKind(item.kind) ? { kind: item.kind } : {}),
+      ...(isBoundedString(item.description, 500) ? { description: item.description } : {}),
+    })
+    if (models.length >= 500) break
+  }
+  return models
 }
 
 function isModelKind(value: unknown): value is ModelKind {
@@ -2135,7 +2190,11 @@ function isGeneratedVideoFileName(fileName: string): boolean {
 }
 
 function isGeneratedAudioFileName(fileName: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.mp3$/i.test(fileName)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp3|wav)$/i.test(fileName)
+}
+
+function audioExtensionForMediaType(mediaType: SaveGeneratedAudioRequest['mediaType']): 'mp3' | 'wav' {
+  return mediaType === 'audio/wav' ? 'wav' : 'mp3'
 }
 
 function batchExportFileName(title: string, id: string, extension: string): string {

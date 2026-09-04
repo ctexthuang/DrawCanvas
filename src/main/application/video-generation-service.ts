@@ -3,6 +3,7 @@ import type {
   GenerateVideoRequest,
 } from '../../shared/contracts/desktop'
 import {
+  generateApiMartVideo,
   generateMiniMaxVideo,
   generateVolcengineVideo,
   VideoGenerationRequestError,
@@ -37,7 +38,7 @@ export class VideoGenerationService {
         request.modelKey,
         isRetryableVideoError,
         async ({ apiKey, model, provider }) => {
-          if (provider.adapterId !== 'minimax' && provider.adapterId !== 'volcengine') {
+          if (provider.adapterId !== 'minimax' && provider.adapterId !== 'volcengine' && provider.adapterId !== 'apimart') {
             throw new VideoGenerationServiceError('UNSUPPORTED_PROVIDER', '该 API 服务的视频生成协议尚未接入')
           }
           const maximumReferences = model.remoteModelId === 'MiniMax-H3'
@@ -55,7 +56,15 @@ export class VideoGenerationService {
                 model: model.remoteModelId,
                 referenceImages,
               })
-            : await generateVolcengineVideo({
+            : provider.adapterId === 'apimart'
+              ? await generateApiMartVideo({
+                  ...normalizedRequest,
+                  baseUrl: provider.baseUrl,
+                  apiKey,
+                  model: model.remoteModelId,
+                  referenceImages,
+                })
+              : await generateVolcengineVideo({
                 ...normalizedRequest,
                 baseUrl: provider.baseUrl,
                 apiKey,

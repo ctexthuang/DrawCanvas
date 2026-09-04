@@ -100,7 +100,7 @@ import {
 } from './application/update-check-service'
 import { AppDataMigrationError } from './infrastructure/app-data-layout'
 import { DRAW_CANVAS_RELEASES_URL } from './infrastructure/github-release-client'
-import { ProviderRequestError, testOpenAiCompatibleProvider } from './infrastructure/provider-client'
+import { ProviderRequestError, testProvider } from './infrastructure/provider-client'
 
 const appState = new AppState()
 const imageGenerationService = new ImageGenerationService(appState)
@@ -269,7 +269,7 @@ function isModelRoutes(value: unknown): value is ModelRoutes {
 }
 
 function isProviderAdapterId(value: unknown): value is ProviderAdapterId {
-  return value === 'openai' || value === 'openai-sub2api' || value === 'volcengine' || value === 'minimax'
+  return value === 'openai' || value === 'openai-sub2api' || value === 'apimart' || value === 'volcengine' || value === 'minimax'
 }
 
 function normalizeProviderName(value: unknown): string | null {
@@ -650,10 +650,10 @@ function registerIpc(): void {
         if (!apiKey) return failure('INVALID_INPUT', '请先保存 API Key')
         const testedAt = new Date().toISOString()
         try {
-          const result = await testOpenAiCompatibleProvider(
+          const result = await testProvider(
+            savedProvider.adapterId,
             savedProvider.baseUrl,
             apiKey,
-            savedProvider.adapterId === 'openai-sub2api' ? 'sub2api' : 'openai',
           )
           const provider = await appState.markProviderTest(request.id, 'connected', testedAt)
           const value: ProviderConnectionTestResult = {
@@ -688,21 +688,21 @@ function registerIpc(): void {
         const provider = await appState.getProvider(request.id)
         const apiKey = await appState.loadProviderApiKey(request.id)
         if (!apiKey) return failure('INVALID_INPUT', '请先保存 API Key')
-        const result = await testOpenAiCompatibleProvider(
+        const result = await testProvider(
+          provider.adapterId,
           provider.baseUrl,
           apiKey,
-          provider.adapterId === 'openai-sub2api' ? 'sub2api' : 'openai',
         )
-        const settings = await appState.syncProviderModels(request.id, result.availableModelIds, new Date().toISOString())
+        const settings = await appState.syncProviderModels(request.id, result.availableModels, new Date().toISOString())
         const syncedProvider = settings.providers.find((item) => item.id === request.id)
         if (!syncedProvider) return failure('IO_ERROR', '模型同步后 API 服务不存在')
         const models = settings.models.filter((model) => model.providerId === request.id)
         const value: ProviderModelDiscoveryResult = {
           provider: syncedProvider,
           models,
-          discoveredCount: result.availableModelIds.length,
-          message: result.availableModelIds.length
-            ? `已获取 ${result.availableModelIds.length} 个模型`
+          discoveredCount: result.availableModels.length,
+          message: result.availableModels.length
+            ? `已获取 ${result.availableModels.length} 个模型`
             : '接口未返回可识别的模型',
         }
         return success(value)
@@ -913,10 +913,11 @@ function registerIpc(): void {
       try {
         const audio = await appState.getGeneratedAudio(request.id)
         if (!audio) return failure('NOT_FOUND', '语音生成记录不存在')
+        const extension = extname(audio.audioFileName).slice(1).toLowerCase() === 'wav' ? 'wav' : 'mp3'
         const options: SaveDialogOptions = {
           title: '导出生成语音',
-          defaultPath: `${safeExportFileName(audio.title)}.mp3`,
-          filters: [{ name: 'MP3 音频', extensions: ['mp3'] }],
+          defaultPath: `${safeExportFileName(audio.title)}.${extension}`,
+          filters: [{ name: extension === 'wav' ? 'WAV 音频' : 'MP3 音频', extensions: [extension] }],
         }
         const result = mainWindow
           ? await dialog.showSaveDialog(mainWindow, options)
@@ -1446,7 +1447,7 @@ async function registerMediaProtocol(): Promise<void> {
         url.hash ||
         !(
           (url.host === 'video' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp4|webm)$/i.test(fileName)) ||
-          (url.host === 'audio' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.mp3$/i.test(fileName))
+          (url.host === 'audio' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp3|wav)$/i.test(fileName))
         )
       ) return new Response(null, { status: 404 })
       const filePath = url.host === 'audio'

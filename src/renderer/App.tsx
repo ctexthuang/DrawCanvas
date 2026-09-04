@@ -39,6 +39,7 @@ import { AppShell, type AppPage } from './components/AppShell'
 import {
   createInitialCanvas,
   InfiniteCanvas,
+  type CanvasImageModelOption,
   type CanvasImageGenerationOutcome,
   type CanvasAudioGenerationOutcome,
   type CanvasChatGenerationOutcome,
@@ -123,22 +124,10 @@ export function App() {
     () => [...generatedArtworks, ...libraryCatalog.filter((artwork) => !generatedArtworks.some((generated) => generated.id === artwork.id))],
     [generatedArtworks, libraryCatalog],
   )
-  const imageModels = useMemo(() => settings.models
-    .filter((model) => model.kind === 'image' && model.enabled && model.available)
-    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
-    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const videoModels = useMemo(() => settings.models
-    .filter((model) => model.kind === 'video' && model.enabled && model.available)
-    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
-    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const chatModels = useMemo(() => settings.models
-    .filter((model) => model.kind === 'chat' && model.enabled && model.available)
-    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
-    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
-  const audioModels = useMemo(() => settings.models
-    .filter((model) => model.kind === 'audio' && model.enabled && model.available)
-    .filter((model) => settings.providers.some((provider) => provider.id === model.providerId && provider.enabled))
-    .map((model) => ({ key: model.key, label: model.displayName })), [settings])
+  const imageModels = useMemo(() => canvasModelOptions(settings, 'image'), [settings])
+  const videoModels = useMemo(() => canvasModelOptions(settings, 'video'), [settings])
+  const chatModels = useMemo(() => canvasModelOptions(settings, 'chat'), [settings])
+  const audioModels = useMemo(() => canvasModelOptions(settings, 'audio'), [settings])
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -1059,6 +1048,18 @@ function removeModelKeysFromRoutes(routes: ModelRoutes, removedKeys: ReadonlySet
       return modelKeys.length ? [[kind, { modelKeys }]] : []
     }),
   )
+}
+
+function canvasModelOptions(settings: AppSettings, kind: ModelKind): ReadonlyArray<CanvasImageModelOption> {
+  const enabledProviders = new Map(settings.providers
+    .filter((provider) => provider.enabled)
+    .map((provider) => [provider.id, provider.adapterId]))
+  return settings.models
+    .filter((model) => model.kind === kind && model.enabled && model.available)
+    .flatMap((model) => {
+      const adapterId = enabledProviders.get(model.providerId)
+      return adapterId ? [{ key: model.key, label: model.displayName, adapterId }] : []
+    })
 }
 
 function loadBrowserAutosave(): CanvasDocument | null {

@@ -73,10 +73,15 @@ import type {
   VideoGenerationResolution,
 } from '../../../shared/contracts/desktop'
 import {
+  normalizeApiMartTtsVoiceId,
+  normalizeMiniMaxTtsVoiceId,
+} from '../../../shared/domain/audio-generation'
+import {
   DEFAULT_IMAGE_MODEL_KEY,
   defaultImageGenerationSizeForModel,
   imageGenerationSizeOptionsForModel,
   normalizeImageGenerationSize,
+  type ProviderAdapterId,
 } from '../../../shared/domain/models'
 import {
   arrangeSelection,
@@ -97,6 +102,7 @@ import {
 export type CanvasImageModelOption = Readonly<{
   key: string
   label: string
+  adapterId: ProviderAdapterId
 }>
 
 export type CanvasImageGenerationOutcome =
@@ -224,6 +230,14 @@ const AUDIO_VOICE_OPTIONS = [
   { value: 'male-qn-qingse', label: '青年男声' },
   { value: 'female-yujie', label: '御姐音' },
   { value: 'male-qn-jingying', label: '精英男声' },
+] as const
+const APIMART_AUDIO_VOICE_OPTIONS = [
+  { value: 'alloy', label: 'Alloy · 中性' },
+  { value: 'echo', label: 'Echo · 男声' },
+  { value: 'fable', label: 'Fable · 叙述' },
+  { value: 'onyx', label: 'Onyx · 深沉男声' },
+  { value: 'nova', label: 'Nova · 活力女声' },
+  { value: 'shimmer', label: 'Shimmer · 温柔女声' },
 ] as const
 const AUDIO_EMOTION_OPTIONS = [
   { value: '', label: '自动情绪' },
@@ -1493,6 +1507,11 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       notify('请先在模型设置中启用一个语音模型')
       return false
     }
+    const audioModel = audioModels.find((model) => model.key === effectiveModelKey)
+    const isApiMartModel = audioModel?.adapterId === 'apimart'
+    const voiceId = isApiMartModel
+      ? normalizeApiMartTtsVoiceId(latestSource.audioVoiceId ?? '')
+      : latestSource.audioVoiceId ?? 'female-shaonv'
     pushUndo()
     updateNode(latestSource.id, {
       generationStatus: 'generating',
@@ -1505,10 +1524,10 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       const outcome = await onGenerateAudio({
         text,
         ...(latestSource.modelKey ? { modelKey: latestSource.modelKey } : {}),
-        voiceId: latestSource.audioVoiceId ?? 'female-shaonv',
+        voiceId,
         speed: latestSource.audioSpeed ?? 1,
-        pitch: latestSource.audioPitch ?? 0,
-        emotion: latestSource.audioEmotion ?? '',
+        pitch: isApiMartModel ? 0 : latestSource.audioPitch ?? 0,
+        emotion: isApiMartModel ? '' : latestSource.audioEmotion ?? '',
       })
       if (!outcome.ok) {
         updateNode(latestSource.id, {
@@ -1521,6 +1540,9 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       }
       updateNode(latestSource.id, {
         audioFileName: outcome.value.audio.audioFileName,
+        audioVoiceId: outcome.value.audio.voiceId,
+        audioPitch: outcome.value.audio.pitch,
+        audioEmotion: outcome.value.audio.emotion,
         generationStatus: 'succeeded',
         generationCompletedAt: new Date().toISOString(),
         generationError: undefined,
@@ -1531,9 +1553,9 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       updateNode(latestSource.id, {
         generationStatus: 'failed',
         generationCompletedAt: new Date().toISOString(),
-        generationError: '语音生成失败，请检查 MiniMax 配置和网络后重试',
+        generationError: '语音生成失败，请检查模型配置和网络后重试',
       })
-      notify('语音生成失败，请检查 MiniMax 配置和网络后重试')
+      notify('语音生成失败，请检查模型配置和网络后重试')
       return false
     }
   }
@@ -2834,6 +2856,12 @@ function CanvasAudioNode({ audioModels, defaultAudioModelKey, generationNow, nod
     node.generationStartedAt,
     node.generationCompletedAt ? Date.parse(node.generationCompletedAt) : generationNow,
   )
+  const effectiveModelKey = node.modelKey ?? defaultAudioModelKey
+  const isApiMartModel = audioModels.find((model) => model.key === effectiveModelKey)?.adapterId === 'apimart'
+  const voiceOptions = isApiMartModel ? APIMART_AUDIO_VOICE_OPTIONS : AUDIO_VOICE_OPTIONS
+  const voiceId = isApiMartModel
+    ? normalizeApiMartTtsVoiceId(node.audioVoiceId ?? '')
+    : normalizeMiniMaxTtsVoiceId(node.audioVoiceId ?? 'female-shaonv')
   return (
     <div className="audio-node-body">
       {(pending || node.generationStatus === 'failed' || node.audioFileName) && (
@@ -2848,14 +2876,29 @@ function CanvasAudioNode({ audioModels, defaultAudioModelKey, generationNow, nod
         </div>
       )}
       <label className="audio-text">旁白文本<textarea maxLength={9_999} onChange={(event) => onUpdate({ subtitle: event.target.value })} placeholder="也可以连接提示词、AI 对话或分镜节点" value={node.subtitle === '连接提示词或输入旁白文本' ? '' : node.subtitle ?? ''}/></label>
-      <label>模型<select onChange={(event) => onUpdate({ modelKey: event.target.value || undefined })} value={node.modelKey ?? ''}><option value="">跟随默认 · {audioModels.find((model) => model.key === defaultAudioModelKey)?.label ?? '音频模型'}</option>{node.modelKey && !audioModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}{audioModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
+      <label>模型<select onChange={(event) => {
+        const modelKey = event.target.value || undefined
+        const adapterId = audioModels.find((model) => model.key === (modelKey ?? defaultAudioModelKey))?.adapterId
+        onUpdate({
+          modelKey,
+          ...(adapterId === 'apimart'
+            ? {
+                audioVoiceId: normalizeApiMartTtsVoiceId(node.audioVoiceId ?? ''),
+                audioPitch: 0,
+                audioEmotion: '',
+              }
+            : adapterId === 'minimax'
+              ? { audioVoiceId: normalizeMiniMaxTtsVoiceId(node.audioVoiceId ?? 'female-shaonv') }
+              : {}),
+        })
+      }} value={node.modelKey ?? ''}><option value="">跟随默认 · {audioModels.find((model) => model.key === defaultAudioModelKey)?.label ?? '音频模型'}</option>{node.modelKey && !audioModels.some((model) => model.key === node.modelKey) && <option value={node.modelKey}>当前固定模型（不可用）</option>}{audioModels.map((model) => <option key={model.key} value={model.key}>{model.label}</option>)}</select></label>
       <div className="audio-fields">
-        <label>音色<input list={`audio-voices-${node.id}`} onChange={(event) => onUpdate({ audioVoiceId: event.target.value })} placeholder="系统或克隆音色 ID" value={node.audioVoiceId ?? 'female-shaonv'}/><datalist id={`audio-voices-${node.id}`}>{AUDIO_VOICE_OPTIONS.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}</datalist></label>
+        <label>音色<input list={`audio-voices-${node.id}`} onChange={(event) => onUpdate({ audioVoiceId: event.target.value })} placeholder={isApiMartModel ? '选择 API Mart 音色' : '系统或克隆音色 ID'} value={voiceId}/><datalist id={`audio-voices-${node.id}`}>{voiceOptions.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}</datalist></label>
         <label>语速<select onChange={(event) => onUpdate({ audioSpeed: Number(event.target.value) })} value={node.audioSpeed ?? 1}>{[0.5, 0.75, 1, 1.25, 1.5, 2].map((speed) => <option key={speed} value={speed}>{speed}×</option>)}</select></label>
-        <label>音调<select onChange={(event) => onUpdate({ audioPitch: Number(event.target.value) })} value={node.audioPitch ?? 0}>{[-6, -3, 0, 3, 6].map((pitch) => <option key={pitch} value={pitch}>{pitch > 0 ? `+${pitch}` : pitch}</option>)}</select></label>
-        <label>情绪<select onChange={(event) => onUpdate({ audioEmotion: event.target.value })} value={node.audioEmotion ?? ''}>{AUDIO_EMOTION_OPTIONS.map((emotion) => <option key={emotion.value} value={emotion.value}>{emotion.label}</option>)}</select></label>
+        <label title={isApiMartModel ? 'API Mart TTS 不支持音调参数' : undefined}>音调<select disabled={isApiMartModel} onChange={(event) => onUpdate({ audioPitch: Number(event.target.value) })} value={isApiMartModel ? 0 : node.audioPitch ?? 0}>{[-6, -3, 0, 3, 6].map((pitch) => <option key={pitch} value={pitch}>{pitch > 0 ? `+${pitch}` : pitch}</option>)}</select></label>
+        <label title={isApiMartModel ? 'API Mart TTS 不支持情绪参数' : undefined}>情绪<select disabled={isApiMartModel} onChange={(event) => onUpdate({ audioEmotion: event.target.value })} value={isApiMartModel ? '' : node.audioEmotion ?? ''}>{AUDIO_EMOTION_OPTIONS.map((emotion) => <option key={emotion.value} value={emotion.value}>{emotion.label}</option>)}</select></label>
       </div>
-      <button className="generate-button" disabled={pending || audioModels.length === 0 || !(node.audioVoiceId ?? 'female-shaonv').trim()} onClick={onGenerate} type="button">{pending ? <LoaderCircle className="is-spinning" size={14}/> : <Play fill="currentColor" size={14}/>} {pending ? `生成中 · ${elapsedSeconds} 秒` : node.audioFileName ? '重新生成语音' : '生成语音'}</button>
+      <button className="generate-button" disabled={pending || audioModels.length === 0 || !voiceId.trim()} onClick={onGenerate} type="button">{pending ? <LoaderCircle className="is-spinning" size={14}/> : <Play fill="currentColor" size={14}/>} {pending ? `生成中 · ${elapsedSeconds} 秒` : node.audioFileName ? '重新生成语音' : '生成语音'}</button>
     </div>
   )
 }

@@ -169,6 +169,7 @@ function providerProfile(adapterId: ProviderAdapterId): PromptOptimizationClient
   switch (adapterId) {
     case 'openai': return 'openai-responses'
     case 'openai-sub2api': return 'sub2api-compatible'
+    case 'apimart': return 'apimart'
     case 'volcengine':
     case 'minimax':
       return 'chat-completions'

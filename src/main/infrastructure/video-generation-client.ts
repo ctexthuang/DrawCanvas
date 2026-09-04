@@ -4,6 +4,8 @@ import type {
   VideoGenerationResolution,
 } from '../../shared/contracts/desktop'
 import type { ImageReferenceInput } from './image-generation-client'
+import { ApiMartRequestError, submitApiMartMediaTask } from './apimart/client'
+import { parseSafeRemoteMediaUrl } from './remote-media-url'
 
 const JSON_RESPONSE_LIMIT = 2 * 1024 * 1024
 const VIDEO_RESPONSE_LIMIT = 300 * 1024 * 1024
@@ -44,6 +46,33 @@ export class VideoGenerationRequestError extends Error {
   ) {
     super(message)
     this.name = 'VideoGenerationRequestError'
+  }
+}
+
+export async function generateApiMartVideo(
+  request: VideoGenerationClientRequest,
+): Promise<VideoGenerationClientResult> {
+  try {
+    const videoUrl = await submitApiMartMediaTask({
+      baseUrl: request.baseUrl,
+      apiKey: request.apiKey,
+      endpoint: 'videos/generations',
+      resultKind: 'video',
+      body: {
+        model: request.model,
+        prompt: request.prompt,
+        duration: request.duration,
+        aspect_ratio: request.ratio === 'adaptive' ? '16:9' : request.ratio,
+        resolution: apiMartVideoResolution(request.resolution),
+        ...(request.referenceImages.length > 0
+          ? { image_urls: request.referenceImages.map(imageDataUrl) }
+          : {}),
+      },
+    })
+    return await downloadVideo(videoUrl)
+  } catch (error) {
+    if (!(error instanceof ApiMartRequestError)) throw error
+    throw new VideoGenerationRequestError(error.code, error.message, error.httpStatus)
   }
 }
 
@@ -342,6 +371,11 @@ function volcengineResolution(resolution: VideoGenerationResolution): '720p' | '
   return resolution === '1080P' || resolution === '2K' ? '1080p' : '720p'
 }
 
+function apiMartVideoResolution(resolution: VideoGenerationResolution): '720p' | '1080p' | '2K' {
+  if (resolution === '2K') return '2K'
+  return resolution === '1080P' ? '1080p' : '720p'
+}
+
 function unversionedApiRoot(baseUrl: string): string {
   const url = new URL(baseUrl)
   url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1$/i, '') || '/'
@@ -365,13 +399,9 @@ function withQuery(url: string, key: string, value: string): string {
 }
 
 function safeHttpsUrl(value: string): URL {
-  try {
-    const url = new URL(value)
-    if (url.protocol !== 'https:' || url.username || url.password) throw new Error('unsafe URL')
-    return url
-  } catch {
-    throw new VideoGenerationRequestError('INVALID_RESPONSE', '视频服务返回了不安全的下载地址')
-  }
+  const url = parseSafeRemoteMediaUrl(value)
+  if (url) return url
+  throw new VideoGenerationRequestError('INVALID_RESPONSE', '视频服务返回了不安全的下载地址')
 }
 
 function requiredString(

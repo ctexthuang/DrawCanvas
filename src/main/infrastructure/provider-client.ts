@@ -1,5 +1,7 @@
 import { net } from 'electron/main'
 import type { ProviderTestErrorCode } from '../../shared/contracts/desktop'
+import type { DiscoveredProviderModel, ProviderAdapterId } from '../../shared/domain/models'
+import { ApiMartRequestError, fetchApiMartModels } from './apimart/client'
 import {
   createOpenAiEndpointCandidates,
   type OpenAiCompatibleProfile,
@@ -11,7 +13,7 @@ const REQUEST_TIMEOUT_MS = 15_000
 
 export type ProviderClientResult = Readonly<{
   latencyMs: number
-  availableModelIds: ReadonlyArray<string>
+  availableModels: ReadonlyArray<DiscoveredProviderModel>
   message: string
 }>
 
@@ -23,6 +25,36 @@ export class ProviderRequestError extends Error {
   ) {
     super(message)
     this.name = 'ProviderRequestError'
+  }
+}
+
+export async function testProvider(
+  adapterId: ProviderAdapterId,
+  baseUrl: string,
+  apiKey: string,
+): Promise<ProviderClientResult> {
+  if (adapterId !== 'apimart') {
+    return testOpenAiCompatibleProvider(
+      baseUrl,
+      apiKey,
+      adapterId === 'openai-sub2api' ? 'sub2api' : 'openai',
+    )
+  }
+
+  const startedAt = performance.now()
+  try {
+    const availableModels = await fetchApiMartModels(baseUrl, apiKey)
+    const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
+    return {
+      latencyMs,
+      availableModels,
+      message: availableModels.length
+        ? `连接成功，发现 ${availableModels.length} 个模型`
+        : '连接成功，API Mart 未返回可识别的模型列表',
+    }
+  } catch (error) {
+    if (!(error instanceof ApiMartRequestError)) throw error
+    throw new ProviderRequestError(mapApiMartErrorCode(error.code), error.message, Math.max(1, Math.round(performance.now() - startedAt)))
   }
 }
 
@@ -74,12 +106,12 @@ export async function testOpenAiCompatibleProvider(
         throw new ProviderRequestError('INVALID_RESPONSE', '服务商未返回有效的 JSON 数据', latencyMs)
       }
 
-      const availableModelIds = extractModelIds(payload)
+      const availableModels = extractModelIds(payload).map((remoteModelId) => ({ remoteModelId }))
       return {
         latencyMs,
-        availableModelIds,
-        message: availableModelIds.length
-          ? `连接成功，发现 ${availableModelIds.length} 个模型`
+        availableModels,
+        message: availableModels.length
+          ? `连接成功，发现 ${availableModels.length} 个模型`
           : '连接成功，接口未返回可识别的模型列表',
       }
     }
@@ -93,6 +125,17 @@ export async function testOpenAiCompatibleProvider(
     throw new ProviderRequestError('NETWORK', '无法连接服务商，请检查接口地址和网络', latencyMs)
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+function mapApiMartErrorCode(code: ApiMartRequestError['code']): ProviderTestErrorCode {
+  switch (code) {
+    case 'NETWORK': return 'NETWORK'
+    case 'TIMEOUT': return 'TIMEOUT'
+    case 'AUTHENTICATION': return 'AUTHENTICATION'
+    case 'RATE_LIMIT':
+    case 'REMOTE': return 'REMOTE'
+    case 'INVALID_RESPONSE': return 'INVALID_RESPONSE'
   }
 }
 

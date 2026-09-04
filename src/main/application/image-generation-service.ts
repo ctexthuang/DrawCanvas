@@ -7,6 +7,7 @@ import {
   isImageGenerationSizeSupported,
 } from '../../shared/domain/models'
 import {
+  generateApiMartImage,
   generateOpenAiCompatibleImage,
   generateMiniMaxImage,
   generateVolcengineImage,
@@ -78,6 +79,15 @@ export class ImageGenerationService {
                   request.size,
                   referenceImages,
                 )
+              : provider.adapterId === 'apimart'
+                ? await generateApiMartImage(
+                    provider.baseUrl,
+                    apiKey,
+                    model.remoteModelId,
+                    request.prompt,
+                    request.size,
+                    referenceImages,
+                  )
               : provider.adapterId === 'openai' || provider.adapterId === 'openai-sub2api'
                 ? await generateOpenAiCompatibleImage(
                     provider.baseUrl,

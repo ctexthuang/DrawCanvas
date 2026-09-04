@@ -4,6 +4,7 @@ import type {
 } from '../../shared/contracts/desktop'
 import {
   AudioGenerationRequestError,
+  generateApiMartAudio,
   generateMiniMaxAudio,
 } from '../infrastructure/audio-generation-client'
 import type { AppState } from './app-state'
@@ -36,10 +37,13 @@ export class AudioGenerationService {
         request.modelKey,
         isRetryableAudioError,
         async ({ apiKey, model, provider }) => {
-          if (provider.adapterId !== 'minimax') {
+          if (provider.adapterId !== 'minimax' && provider.adapterId !== 'apimart') {
             throw new AudioGenerationServiceError('UNSUPPORTED_PROVIDER', '该 API 服务的音频生成协议尚未接入')
           }
-          const generated = await generateMiniMaxAudio({
+          const generateAudio = provider.adapterId === 'apimart'
+            ? generateApiMartAudio
+            : generateMiniMaxAudio
+          const generated = await generateAudio({
             baseUrl: provider.baseUrl,
             apiKey,
             model: model.remoteModelId,
@@ -54,10 +58,7 @@ export class AudioGenerationService {
             text: request.text,
             modelKey: model.key,
             modelName: model.displayName,
-            voiceId: request.voiceId,
             speed: request.speed,
-            pitch: request.pitch,
-            emotion: request.emotion,
           })
           return { audio }
         },

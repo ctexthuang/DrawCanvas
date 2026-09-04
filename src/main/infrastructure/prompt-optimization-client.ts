@@ -1,4 +1,5 @@
 import { net } from 'electron/main'
+import { createApiMartChatEndpointCandidates } from './apimart/endpoints'
 import {
   createOpenAiEndpointCandidates,
   type OpenAiCompatibleProfile,
@@ -20,6 +21,7 @@ export type PromptOptimizationClientProfile =
   | 'openai-responses'
   | 'sub2api-compatible'
   | 'chat-completions'
+  | 'apimart'
 
 export type PromptOptimizationClientErrorCode =
   | 'NETWORK'
@@ -102,25 +104,27 @@ export async function generateTextWithModel(
       const bytes = await readLimitedBody(response)
       const payload = parseJson(bytes)
       const message = extractRemoteErrorMessage(payload, bytes)
-      if (response.status === 401 || response.status === 403) {
+      const remoteStatus = profile === 'apimart' ? apiMartStatus(payload, response.status) : response.status
+      if (remoteStatus === 401 || remoteStatus === 403) {
         throw new PromptOptimizationClientError('AUTHENTICATION', message || 'API Key 无效或没有对话模型权限')
       }
-      if (response.status === 429) {
+      if (remoteStatus === 402 || remoteStatus === 429) {
         throw new PromptOptimizationClientError('RATE_LIMIT', message || '请求过于频繁或账户额度不足，请稍后重试')
       }
-      if (!response.ok) {
-        if (hasNextAttempt) continue
+      if (!response.ok || remoteStatus !== 200) {
+        if (hasNextAttempt && shouldTryNextEndpoint(profile, response.status)) continue
         throw new PromptOptimizationClientError(
           'REMOTE',
-          message || `对话模型请求失败（HTTP ${response.status}）`,
-          response.status,
+          message || `对话模型请求失败（HTTP ${remoteStatus}）`,
+          remoteStatus,
         )
       }
+      const resultPayload = profile === 'apimart' ? unwrapApiMartPayload(payload) : payload
       const generatedText = cleanGeneratedText(attempt.kind === 'responses'
-        ? extractResponsesText(payload)
-        : extractChatCompletionText(payload))
+        ? extractResponsesText(resultPayload)
+        : extractChatCompletionText(resultPayload))
       if (!generatedText) {
-        if (hasNextAttempt) continue
+        if (hasNextAttempt && profile !== 'apimart') continue
         throw new PromptOptimizationClientError('INVALID_RESPONSE', '对话模型没有返回可用内容')
       }
       return generatedText
@@ -151,6 +155,23 @@ function requestAttempts(
   instructions: string,
 ): ReadonlyArray<PromptRequestAttempt> {
   const attempts: PromptRequestAttempt[] = []
+  if (profile === 'apimart') {
+    for (const url of createApiMartChatEndpointCandidates(baseUrl)) {
+      attempts.push({
+        url,
+        kind: 'chat-completions',
+        body: {
+          model,
+          stream: false,
+          messages: [
+            { role: 'system', content: instructions },
+            ...messages,
+          ],
+        },
+      })
+    }
+    return attempts
+  }
   if (profile === 'openai-responses' || profile === 'sub2api-compatible') {
     const endpointProfile: OpenAiCompatibleProfile = profile === 'sub2api-compatible' ? 'sub2api' : 'openai'
     for (const url of createOpenAiEndpointCandidates(baseUrl, 'responses', endpointProfile)) {
@@ -266,11 +287,26 @@ function extractRemoteErrorMessage(payload: unknown | null, bytes: Uint8Array): 
   if (isRecord(payload)) {
     const error = isRecord(payload.error) ? payload.error : null
     const baseResponse = isRecord(payload.base_resp) ? payload.base_resp : null
-    const candidate = error?.message ?? baseResponse?.status_msg ?? payload.message ?? payload.detail
+    const data = isRecord(payload.data) ? payload.data : null
+    const dataError = isRecord(data?.error) ? data.error : null
+    const candidate = error?.message ?? dataError?.message ?? data?.message ?? baseResponse?.status_msg ?? payload.message ?? payload.detail
     if (typeof candidate === 'string') return sanitizeRemoteMessage(candidate)
   }
   const text = Buffer.from(bytes).toString('utf8').trim()
   return text && !text.startsWith('<') ? sanitizeRemoteMessage(text) : ''
+}
+
+function apiMartStatus(payload: unknown | null, httpStatus: number): number {
+  if (httpStatus >= 400 || !isRecord(payload)) return httpStatus
+  return typeof payload.code === 'number' ? payload.code : payload.success === false ? 500 : httpStatus
+}
+
+function unwrapApiMartPayload(payload: unknown | null): unknown | null {
+  return isRecord(payload) && isRecord(payload.data) ? payload.data : payload
+}
+
+function shouldTryNextEndpoint(profile: PromptOptimizationClientProfile, httpStatus: number): boolean {
+  return profile !== 'apimart' || httpStatus === 404 || httpStatus === 405
 }
 
 function sanitizeRemoteMessage(value: string): string {
