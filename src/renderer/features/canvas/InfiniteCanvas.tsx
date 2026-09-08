@@ -15,6 +15,7 @@ import {
   Image as ImageIcon,
   Images,
   LayoutGrid,
+  Layers3,
   LoaderCircle,
   Maximize2,
   MessageSquare,
@@ -49,6 +50,8 @@ import {
   type WheelEvent,
 } from 'react'
 import type {
+  AnalyzeImageLayersRequest,
+  AnalyzedImageLayers,
   CanvasDocument,
   CanvasChatMessage,
   CanvasNodeData,
@@ -67,6 +70,7 @@ import type {
   GeneratedVideoResult,
   ImageGenerationCount,
   ImageGenerationSize,
+  ImageLayerSlice,
   OptimizePromptRequest,
   OptimizedPromptResult,
   VideoGenerationRatio,
@@ -99,6 +103,7 @@ import {
   type CanvasGraphSnapshot,
   type CanvasPoint,
 } from './canvas-graph'
+import { ImageLayerSplitNode } from './ImageLayerSplitNode'
 
 export type CanvasImageModelOption = Readonly<{
   key: string
@@ -130,6 +135,10 @@ export type CanvasAudioGenerationOutcome =
   | Readonly<{ ok: true; value: GeneratedAudioResult }>
   | Readonly<{ ok: false; error: string }>
 
+export type CanvasImageLayerAnalysisOutcome =
+  | Readonly<{ ok: true; value: AnalyzedImageLayers }>
+  | Readonly<{ ok: false; error: string }>
+
 type InfiniteCanvasProps = Readonly<{
   document: CanvasDocument
   defaultChatModelKey: string
@@ -145,6 +154,7 @@ type InfiniteCanvasProps = Readonly<{
   onGenerateChatReply: (request: GenerateChatReplyRequest) => Promise<CanvasChatGenerationOutcome>
   onGenerateAudio: (request: GenerateAudioRequest) => Promise<CanvasAudioGenerationOutcome>
   onGenerateImage: (request: GenerateImageRequest) => Promise<CanvasImageGenerationOutcome>
+  onAnalyzeImageLayers: (request: AnalyzeImageLayersRequest) => Promise<CanvasImageLayerAnalysisOutcome>
   onGenerateStoryboard: (request: GenerateStoryboardRequest) => Promise<CanvasStoryboardGenerationOutcome>
   onGenerateVideo: (request: GenerateVideoRequest) => Promise<CanvasVideoGenerationOutcome>
   onOptimizePrompt: (request: OptimizePromptRequest) => Promise<CanvasPromptOptimizationOutcome>
@@ -153,6 +163,7 @@ type InfiniteCanvasProps = Readonly<{
   onImportPastedImages: (
     files: ReadonlyArray<File>,
     remoteUrls: ReadonlyArray<string>,
+    options?: Readonly<{ notify?: boolean }>,
   ) => Promise<ReadonlyArray<GeneratedArtwork>>
   onLoadImage: (fileName: string) => Promise<string | null>
   onOpen: () => void
@@ -228,11 +239,20 @@ const MAX_CONCURRENT_GENERATIONS = 4
 const MAX_PASTED_IMAGE_COUNT = 20
 const MAX_PASTED_IMAGE_BYTES = 25 * 1024 * 1024
 const MAX_PASTED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+const MAX_LAYER_EXPORT_PIXELS = 33_554_432
+const MAX_LAYER_EXPORT_TOTAL_PIXELS = 67_108_864
+const MAX_LAYER_EXPORT_TOTAL_BYTES = MAX_PASTED_IMAGE_TOTAL_BYTES
+const MAX_LAYER_FOREGROUND_PIXELS = 4_194_304
+const FOREGROUND_ALPHA_THRESHOLD = 16
+const BACKGROUND_COLOR_TOLERANCE = 42
+const DOMINANT_BORDER_COLOR_SHARE = 0.5
+const MIN_BACKGROUND_REMOVAL_SHARE = 0.03
+const MIN_RETAINED_FOREGROUND_SHARE = 0.01
+const PIXEL_WORK_YIELD_INTERVAL = 262_144
 const INTERNAL_CANVAS_CLIPBOARD_TYPE = 'application/x-drawcanvas-node-graph'
 const ZOOM_SETTLE_DELAY_MS = 140
 const ZOOM_SNAP_STEP = 0.05
 const SEMANTIC_ZOOM_THRESHOLD = 0.75
-const OVERVIEW_ZOOM_THRESHOLD = 0.5
 const NODE_MENU_MAX_HEIGHT = 560
 const AUDIO_VOICE_OPTIONS = [
   { value: 'female-shaonv', label: '少女音' },
@@ -265,6 +285,7 @@ const nodeTypes: ReadonlyArray<Readonly<{ type: CanvasNodeType; label: string; d
   { type: 'generator', label: '图像生成', description: '调用图像模型生成内容', icon: WandSparkles },
   { type: 'compositor', label: '图片合成', description: '使用多张参考图合成图片', icon: Images },
   { type: 'image', label: '图片', description: '添加或预览图片素材', icon: ImageIcon },
+  { type: 'layer-split', label: '图层拆分', description: '识别并裁切图片中的独立图层', icon: Layers3 },
   { type: 'reference-folder', label: '参考图文件夹', description: '批量管理并整体连接参考图', icon: FolderOpen },
   { type: 'chat', label: 'AI 对话', description: '与模型讨论创意方向', icon: MessageSquare },
   { type: 'note', label: '便签', description: '记录灵感与待办事项', icon: StickyNote },
@@ -275,8 +296,13 @@ const nodeTypes: ReadonlyArray<Readonly<{ type: CanvasNodeType; label: string; d
 function connectionNodeTypeOptions(
   node: CanvasNodeData,
   side: 'input' | 'output',
+  connections?: CanvasDocument['connections'],
 ): typeof nodeTypes {
   if (side === 'output' && node.type === 'image' && !node.imageFileName) return []
+  if (side === 'input' && node.type === 'layer-split') {
+    if (connections?.some((connection) => connection.to === node.id)) return []
+    return nodeTypes.filter(({ type }) => type === 'image')
+  }
   return nodeTypes.filter(({ type }) => side === 'output'
     ? canConnectNodeTypes(node.type, type)
     : type !== 'image' && canConnectNodeTypes(type, node.type))
@@ -303,7 +329,7 @@ export function createInitialCanvas(
   }
 }
 
-export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, document, imageModels, videoModels, onChange, onClose, onGenerateAudio, onGenerateChatReply, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportDroppedImages, onImportImages, onImportPastedImages, onLoadImage, onOpen, onOptimizePrompt, onSave, notify }: InfiniteCanvasProps) {
+export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, document, imageModels, videoModels, onAnalyzeImageLayers, onChange, onClose, onGenerateAudio, onGenerateChatReply, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportDroppedImages, onImportImages, onImportPastedImages, onLoadImage, onOpen, onOptimizePrompt, onSave, notify }: InfiniteCanvasProps) {
   const canvasRef = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
   const documentRef = useRef(document)
@@ -320,6 +346,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const minimapPointerIdRef = useRef<number | null>(null)
   const generationQueueRef = useRef<PendingGenerationTask[]>([])
   const activeGenerationCountRef = useRef(0)
+  const analyzingLayerNodeIdsRef = useRef(new Set<string>())
+  const exportingLayerNodeIdsRef = useRef(new Set<string>())
   const fileDragDepthRef = useRef(0)
   const workflowRunIdRef = useRef<string | null>(null)
   const zoomSettleTimerRef = useRef<number | null>(null)
@@ -339,6 +367,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   const [optimizingPromptNodeIds, setOptimizingPromptNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [chattingNodeIds, setChattingNodeIds] = useState<ReadonlySet<string>>(() => new Set())
   const [storyboardNodeIds, setStoryboardNodeIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [analyzingLayerNodeIds, setAnalyzingLayerNodeIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [exportingLayerNodeIds, setExportingLayerNodeIds] = useState<ReadonlySet<string>>(() => new Set())
 
   useEffect(() => {
     importPastedImagesRef.current = onImportPastedImages
@@ -351,6 +381,8 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
   useEffect(() => {
     workflowRunIdRef.current = null
     setWorkflowRunning(false)
+    setAnalyzingLayerNodeIds(activeOperationNodeIds(analyzingLayerNodeIdsRef.current, document.id))
+    setExportingLayerNodeIds(activeOperationNodeIds(exportingLayerNodeIdsRef.current, document.id))
     generationQueueRef.current = generationQueueRef.current.filter((task) => task.documentId === document.id)
     setSelectedIds(new Set(document.nodes.some((node) => node.id === 'generator-1') ? ['generator-1'] : []))
     setSelectedConnectionId(null)
@@ -376,7 +408,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     ? document.nodes.find((node) => node.id === connectionNodeMenu.nodeId)
     : undefined
   const connectionMenuOptions = connectionMenuNode && connectionNodeMenu
-    ? connectionNodeTypeOptions(connectionMenuNode, connectionNodeMenu.side)
+    ? connectionNodeTypeOptions(connectionMenuNode, connectionNodeMenu.side, document.connections)
     : []
   const canGroupSelectedImages = selectedNodes.length >= 2 && selectedNodes.every((node) =>
     node.type === 'image' && Boolean(node.imageFileName),
@@ -505,7 +537,6 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     transform: `translate(${document.viewport.x}px, ${document.viewport.y}px) scale(${document.viewport.zoom})`,
   } satisfies CSSProperties
   const isSemanticZoom = document.viewport.zoom < SEMANTIC_ZOOM_THRESHOLD
-  const isOverviewZoom = document.viewport.zoom < OVERVIEW_ZOOM_THRESHOLD
   const isViewportTransforming = isZooming || drag?.kind === 'pan'
   const minimap = useMemo(() => buildMinimap(document, canvasRef.current), [document])
 
@@ -815,7 +846,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     const source = documentRef.current.nodes.find((node) => node.id === nodeId)
     const canvas = canvasRef.current
     if (!source || !canvas) return
-    const options = connectionNodeTypeOptions(source, side)
+    const options = connectionNodeTypeOptions(source, side, documentRef.current.connections)
     if (options.length === 0) return
     const rect = canvas.getBoundingClientRect()
     const menuWidth = 264
@@ -855,17 +886,10 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       imageModels,
       videoModels,
     )
-    const sourceDimensions = nodeDimensions(source)
-    const newNodeDimensions = nodeDimensions(provisionalNode)
-    const siblingCount = current.connections.filter((connection) =>
-      menu.side === 'output' ? connection.from === source.id : connection.to === source.id,
-    ).length
+    const position = findAvailableConnectedNodePosition(current, source, provisionalNode, menu.side)
     const newNode = {
       ...provisionalNode,
-      x: Math.round(menu.side === 'output'
-        ? source.x + sourceDimensions.width + 92
-        : source.x - newNodeDimensions.width - 92),
-      y: Math.round(source.y + siblingCount * 42),
+      ...position,
     }
     const nextNodes = [...current.nodes, newNode]
     const fromId = menu.side === 'output' ? source.id : newNode.id
@@ -1475,6 +1499,249 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
     }
   }
 
+  async function analyzeLayerNode(
+    source: CanvasNodeData,
+    request: AnalyzeImageLayersRequest,
+    sourceFileName: string,
+    dataUrl: string,
+  ): Promise<void> {
+    const current = documentRef.current
+    const sourceDocumentId = current.id
+    const latestSource = current.nodes.find((node) => node.id === source.id && node.type === 'layer-split')
+    const operationKey = `${sourceDocumentId}:${source.id}`
+    if (!latestSource || analyzingLayerNodeIdsRef.current.has(operationKey)) return
+    if (!defaultChatModelKey && !latestSource.modelKey) {
+      updateNode(latestSource.id, { imageLayerError: '请先配置支持图片理解的默认对话模型' })
+      notify('请先在模型设置中启用支持图片理解的对话模型')
+      return
+    }
+    analyzingLayerNodeIdsRef.current.add(operationKey)
+    setAnalyzingLayerNodeIds((ids) => new Set([...ids, latestSource.id]))
+    updateNode(latestSource.id, { imageLayerError: undefined })
+    try {
+      let outcome: CanvasImageLayerAnalysisOutcome
+      try {
+        outcome = await onAnalyzeImageLayers(request)
+      } catch {
+        if (documentRef.current.id === sourceDocumentId) {
+          updateNode(latestSource.id, { imageLayerError: '无法发送图片图层分析请求，请稍后重试' })
+          notify('无法发送图片图层分析请求，请稍后重试')
+        }
+        return
+      }
+      if (!outcome.ok) {
+        if (documentRef.current.id === sourceDocumentId) {
+          updateNode(latestSource.id, { imageLayerError: outcome.error })
+          notify(outcome.error)
+        }
+        return
+      }
+      const latestDocument = documentRef.current
+      if (latestDocument.id !== sourceDocumentId) return
+      const currentNode = latestDocument.nodes.find((node) => node.id === latestSource.id && node.type === 'layer-split')
+      const currentImage = currentNode ? findLayerSplitSourceImage(latestDocument, currentNode) : null
+      if (!currentNode || currentImage?.fileName !== sourceFileName) {
+        notify('分析期间源图片已改变，未覆盖当前图层')
+        return
+      }
+      let refinedLayers = outcome.value.layers
+      let refinementFailed = false
+      try {
+        refinedLayers = await refineImageLayerBounds(
+          dataUrl,
+          outcome.value.layers,
+          outcome.value.sourceWidth,
+          outcome.value.sourceHeight,
+        )
+      } catch {
+        refinementFailed = true
+      }
+      const refinedDocument = documentRef.current
+      const refinedNode = refinedDocument.id === sourceDocumentId
+        ? refinedDocument.nodes.find((node) => node.id === currentNode.id && node.type === 'layer-split')
+        : null
+      const refinedSource = refinedNode ? findLayerSplitSourceImage(refinedDocument, refinedNode) : null
+      if (!refinedNode || refinedSource?.fileName !== sourceFileName) {
+        notify('校准期间源图片已改变，未覆盖当前图层')
+        return
+      }
+      pushUndo()
+      updateNode(refinedNode.id, {
+        imageLayerSourceFileName: sourceFileName,
+        imageLayerSourceWidth: outcome.value.sourceWidth,
+        imageLayerSourceHeight: outcome.value.sourceHeight,
+        imageLayers: refinedLayers,
+        imageLayerError: undefined,
+        subtitle: `${refinedLayers.length} 个可见图层 · ${outcome.value.modelName}${refinementFailed ? ' · 待手动校准' : ''}`,
+      })
+      if (refinementFailed) {
+        notify(`已使用 ${outcome.value.modelName} 识别 ${refinedLayers.length} 个图层；本地边界校准未完成，请手动检查范围`)
+      } else {
+        notify(refinedLayers.length > 0
+          ? `已使用 ${outcome.value.modelName} 识别并校准 ${refinedLayers.length} 个可见图层`
+          : '模型没有识别到适合独立裁切的图层，可手动添加矩形图层')
+      }
+    } catch (error) {
+      if (documentRef.current.id === sourceDocumentId) {
+        const message = error instanceof Error ? error.message : '图片图层处理失败，请重试'
+        updateNode(latestSource.id, { imageLayerError: message })
+        notify(message)
+      }
+    } finally {
+      analyzingLayerNodeIdsRef.current.delete(operationKey)
+      if (documentRef.current.id === sourceDocumentId) {
+        setAnalyzingLayerNodeIds((ids) => {
+          const next = new Set(ids)
+          next.delete(latestSource.id)
+          return next
+        })
+      }
+    }
+  }
+
+  async function exportLayerNode(
+    source: CanvasNodeData,
+    dataUrl: string,
+    requestedLayers: ReadonlyArray<ImageLayerSlice>,
+    sourceFileName: string,
+  ): Promise<void> {
+    const current = documentRef.current
+    const sourceDocumentId = current.id
+    const latestSource = current.nodes.find((node) => node.id === source.id && node.type === 'layer-split')
+    const operationKey = `${sourceDocumentId}:${source.id}`
+    const currentImage = latestSource ? findLayerSplitSourceImage(current, latestSource) : null
+    if (
+      !latestSource ||
+      exportingLayerNodeIdsRef.current.has(operationKey) ||
+      !latestSource.imageLayerSourceWidth ||
+      !latestSource.imageLayerSourceHeight ||
+      latestSource.imageLayerSourceFileName !== sourceFileName ||
+      currentImage?.fileName !== sourceFileName
+    ) return
+    const availableSlots = Math.max(0, Math.min(
+      500 - current.nodes.length,
+      1000 - current.connections.length,
+    ))
+    const layers = requestedLayers.slice(0, Math.min(availableSlots, MAX_PASTED_IMAGE_COUNT))
+    if (layers.length === 0) {
+      notify('画布节点或连线数量已达到上限')
+      return
+    }
+    if (layers.length < requestedLayers.length) {
+      notify(`受画布容量或单次导入上限影响，本次只生成前 ${layers.length} 个图层`)
+    }
+    exportingLayerNodeIdsRef.current.add(operationKey)
+    setExportingLayerNodeIds((ids) => new Set([...ids, latestSource.id]))
+    updateNode(latestSource.id, { imageLayerError: undefined })
+    try {
+      const files = await cropImageLayerFiles(
+        dataUrl,
+        layers,
+        latestSource.imageLayerSourceWidth,
+        latestSource.imageLayerSourceHeight,
+      )
+      const beforeImport = documentRef.current
+      if (beforeImport.id !== sourceDocumentId) return
+      const beforeImportNode = beforeImport.nodes.find((node) => node.id === latestSource.id && node.type === 'layer-split')
+      const beforeImportImage = beforeImportNode ? findLayerSplitSourceImage(beforeImport, beforeImportNode) : null
+      if (!beforeImportNode || beforeImportImage?.fileName !== sourceFileName) {
+        notify('生成期间源图片已改变，未导入本次裁切结果')
+        return
+      }
+      const imported = await importPastedImagesRef.current(files, [], { notify: false })
+      const latestDocument = documentRef.current
+      if (latestDocument.id !== sourceDocumentId) return
+      const currentNode = latestDocument.nodes.find((node) => node.id === latestSource.id && node.type === 'layer-split')
+      const latestImage = currentNode ? findLayerSplitSourceImage(latestDocument, currentNode) : null
+      if (!currentNode || latestImage?.fileName !== sourceFileName) {
+        notify('图层图片已保存到图片库，但源节点或源图片已经改变')
+        return
+      }
+      if (imported.length !== files.length) {
+        const message = imported.length === 0
+          ? '图层图片未能完整导入，请检查存储目录后重试'
+          : `只成功导入 ${imported.length} / ${files.length} 个图层，未自动创建不完整的节点组`
+        updateNode(currentNode.id, { imageLayerError: message })
+        notify(message)
+        return
+      }
+      const remainingSlots = Math.max(0, Math.min(
+        500 - latestDocument.nodes.length,
+        1000 - latestDocument.connections.length,
+      ))
+      const usableImported = imported.slice(0, remainingSlots)
+      if (usableImported.length < files.length) {
+        notify(`本次已导入 ${imported.length} 个图层，其中 ${usableImported.length} 个已添加到画布`)
+      }
+      const addedNodes: CanvasNodeData[] = []
+      let placementDocument = latestDocument
+      for (const [index, artwork] of usableImported.entries()) {
+        const layer = layers[index]
+        if (!artwork.imageFileName || !layer) continue
+        const provisionalNode: CanvasNodeData = {
+          id: `image-${crypto.randomUUID()}`,
+          type: 'image',
+          title: layer.name,
+          subtitle: `来自 ${currentNode.title} · ${layer.bounds.width} × ${layer.bounds.height}`,
+          imageFileName: artwork.imageFileName,
+          x: 0,
+          y: 0,
+          color: '#23c8ff',
+        }
+        const placedNode = {
+          ...provisionalNode,
+          ...findAvailableConnectedNodePosition(placementDocument, currentNode, provisionalNode, 'output'),
+        }
+        addedNodes.push(placedNode)
+        placementDocument = {
+          ...placementDocument,
+          nodes: [...placementDocument.nodes, placedNode],
+          connections: [
+            ...placementDocument.connections,
+            { id: `placement-${placedNode.id}`, from: currentNode.id, to: placedNode.id },
+          ],
+        }
+      }
+      if (addedNodes.length === 0) return
+      pushUndo()
+      emitDocument({
+        ...latestDocument,
+        nodes: [
+          ...latestDocument.nodes.map((node) => node.id === currentNode.id
+            ? { ...node, subtitle: `${addedNodes.length} 个图层已生成` }
+            : node),
+          ...addedNodes,
+        ],
+        connections: [
+          ...latestDocument.connections,
+          ...addedNodes.map((node) => ({
+            id: `connection-${crypto.randomUUID()}`,
+            from: currentNode.id,
+            to: node.id,
+          })),
+        ],
+        updatedAt: new Date().toISOString(),
+      })
+      setSelectedIds(new Set(addedNodes.map((node) => node.id)))
+      notify(`已生成 ${addedNodes.length} 个独立图片节点`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '图层裁切失败'
+      if (documentRef.current.id === sourceDocumentId) {
+        updateNode(latestSource.id, { imageLayerError: message })
+        notify(message)
+      }
+    } finally {
+      exportingLayerNodeIdsRef.current.delete(operationKey)
+      if (documentRef.current.id === sourceDocumentId) {
+        setExportingLayerNodeIds((ids) => {
+          const next = new Set(ids)
+          next.delete(latestSource.id)
+          return next
+        })
+      }
+    }
+  }
+
   function createPromptFromText(source: CanvasNodeData, content: string, title = '创意提示词'): void {
     const prompt = content.trim()
     const current = documentRef.current
@@ -1753,6 +2020,14 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
         return generateAudio(latestNode)
       case 'image':
         return Boolean(latestNode.imageFileName)
+      case 'layer-split':
+        return Boolean(
+          latestNode.imageLayers?.length &&
+          latestNode.imageLayerSourceWidth &&
+          latestNode.imageLayerSourceHeight &&
+          latestNode.imageLayerSourceFileName &&
+          findLayerSplitSourceImage(current, latestNode)?.fileName === latestNode.imageLayerSourceFileName,
+        )
       case 'reference-folder':
         return (latestNode.imageFileNames?.length ?? 0) > 0 || !current.connections.some((connection) => connection.from === latestNode.id)
       case 'note':
@@ -2070,7 +2345,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
 
       <div className="canvas-stage-wrap">
         <div
-          className={`canvas-stage${tool === 'hand' || drag?.kind === 'pan' ? ' is-panning' : ''}${drag?.kind === 'selection' ? ' is-selecting' : ''}${isFileDragActive ? ' is-file-dragging' : ''}${isViewportTransforming ? ' is-transforming' : ''}${isSemanticZoom ? ' is-semantic-zoom' : ''}${isOverviewZoom ? ' is-overview-zoom' : ''}`}
+          className={`canvas-stage${tool === 'hand' || drag?.kind === 'pan' ? ' is-panning' : ''}${drag?.kind === 'selection' ? ' is-selecting' : ''}${isFileDragActive ? ' is-file-dragging' : ''}${isViewportTransforming ? ' is-transforming' : ''}${isSemanticZoom ? ' is-semantic-zoom' : ''}`}
           onContextMenu={onContextMenu}
           onDoubleClick={onDoubleClick}
           onDragEnter={onFileDragEnter}
@@ -2115,16 +2390,21 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
                 hasInputPort={connectionNodeTypeOptions(node, 'input').length > 0}
                 hasOutputPort={connectionNodeTypeOptions(node, 'output').length > 0}
                 isChatting={chattingNodeIds.has(node.id)}
+                isAnalyzingLayers={analyzingLayerNodeIds.has(node.id)}
+                isExportingLayers={exportingLayerNodeIds.has(node.id)}
                 isGeneratingStoryboard={storyboardNodeIds.has(node.id)}
                 isOptimizingPrompt={optimizingPromptNodeIds.has(node.id)}
                 storyboardInputAvailable={findConnectedPromptTexts(document, node).length > 0}
                 node={node}
+                layerSplitSource={findLayerSplitSourceImage(document, node)}
                 dropTarget={fileDropTargetNodeId === node.id}
                 onDelete={() => deleteNodes(selectedIdsRef.current.has(node.id) ? selectedIdsRef.current : new Set([node.id]))}
                 onGenerateAudio={() => void generateAudio(node)}
                 onGenerateImage={() => void generateImage(node)}
                 onGenerateStoryboard={() => void generateStoryboard(node)}
                 onGenerateVideo={() => void generateVideo(node)}
+                onAnalyzeImageLayers={(request, sourceFileName, dataUrl) => analyzeLayerNode(node, request, sourceFileName, dataUrl)}
+                onExportImageLayers={(dataUrl, layers, sourceFileName) => exportLayerNode(node, dataUrl, layers, sourceFileName)}
                 onImportImages={() => void importImagesIntoNode(node)}
                 onLoadImage={onLoadImage}
                 onOptimizePrompt={() => void optimizePrompt(node)}
@@ -2247,7 +2527,11 @@ function CanvasConnections({ document, drag, onDelete, onSelect, selectedConnect
   onSelect: (connectionId: string) => void
   selectedConnectionId: string | null
 }>) {
-  const paths = useMemo(() => document.connections.flatMap((connection) => {
+  const paths = useMemo(() => [...document.connections].sort((left, right) => {
+    const leftSource = document.nodes.find((node) => node.id === left.from)
+    const rightSource = document.nodes.find((node) => node.id === right.from)
+    return Number(leftSource?.type === 'layer-split') - Number(rightSource?.type === 'layer-split')
+  }).flatMap((connection) => {
     const from = document.nodes.find((node) => node.id === connection.from)
     const to = document.nodes.find((node) => node.id === connection.to)
     if (!from || !to) return []
@@ -2256,20 +2540,7 @@ function CanvasConnections({ document, drag, onDelete, onSelect, selectedConnect
     const path = connectionPath(start, end)
     const midpoint = bezierMidpoint(start, end)
     const selected = selectedConnectionId === connection.id
-    return [
-      <g className={`connection-interaction${selected ? ' is-selected' : ''}`} key={connection.id}>
-        <path className="connection-shadow" d={path}/>
-        <path className="connection-line" d={path}/>
-        <path className="connection-hit" d={path} onPointerDown={(event) => { event.stopPropagation(); onSelect(connection.id) }}/>
-        <circle className="connection-endpoint" cx={start.x} cy={start.y} r="5"/>
-        <circle className="connection-endpoint" cx={end.x} cy={end.y} r="5"/>
-        {selected && (
-          <g className="connection-delete" onPointerDown={(event) => { event.stopPropagation(); onDelete(connection.id) }} transform={`translate(${midpoint.x} ${midpoint.y})`}>
-            <circle r="10"/><path d="M -3 -3 L 3 3 M 3 -3 L -3 3"/>
-          </g>
-        )}
-      </g>,
-    ]
+    return [{ connection, start, end, path, midpoint, selected, isLayerSplitOutput: from.type === 'layer-split' }]
   }), [document.connections, document.nodes, onDelete, onSelect, selectedConnectionId])
   let temporaryPath: string | null = null
   if (drag) {
@@ -2279,7 +2550,29 @@ function CanvasConnections({ document, drag, onDelete, onSelect, selectedConnect
       temporaryPath = drag.side === 'output' ? connectionPath(port, drag.currentWorld) : connectionPath(drag.currentWorld, port)
     }
   }
-  return <svg className="connections-layer" height="1" width="1">{paths}{temporaryPath && <path className="connection-preview" d={temporaryPath}/>}</svg>
+  return (
+    <svg className="connections-layer" height="1" width="1">
+      {paths.map(({ connection, path, selected, isLayerSplitOutput }) => (
+        <g className={`connection-interaction${selected ? ' is-selected' : ''}${isLayerSplitOutput ? ' is-layer-split-output' : ''}`} key={`${connection.id}-shadow`}>
+          <path className="connection-shadow" d={path}/>
+        </g>
+      ))}
+      {paths.map(({ connection, start, end, path, midpoint, selected, isLayerSplitOutput }) => (
+        <g className={`connection-interaction${selected ? ' is-selected' : ''}${isLayerSplitOutput ? ' is-layer-split-output' : ''}`} key={connection.id}>
+          <path className="connection-line" d={path}/>
+          <path className="connection-hit" d={path} onPointerDown={(event) => { event.stopPropagation(); onSelect(connection.id) }}/>
+          <circle className="connection-endpoint" cx={start.x} cy={start.y} r="5"/>
+          <circle className="connection-endpoint" cx={end.x} cy={end.y} r="5"/>
+          {selected && (
+            <g className="connection-delete" onPointerDown={(event) => { event.stopPropagation(); onDelete(connection.id) }} transform={`translate(${midpoint.x} ${midpoint.y})`}>
+              <circle r="10"/><path d="M -3 -3 L 3 3 M 3 -3 L -3 3"/>
+            </g>
+          )}
+        </g>
+      ))}
+      {temporaryPath && <path className="connection-preview" d={temporaryPath}/>}
+    </svg>
+  )
 }
 
 type CanvasNodeProps = Readonly<{
@@ -2294,13 +2587,16 @@ type CanvasNodeProps = Readonly<{
   hasInputPort: boolean
   hasOutputPort: boolean
   imageModels: ReadonlyArray<CanvasImageModelOption>
+  isAnalyzingLayers: boolean
   isChatting: boolean
+  isExportingLayers: boolean
   isGeneratingStoryboard: boolean
   isOptimizingPrompt: boolean
   storyboardInputAvailable: boolean
   videoPromptOptions: ReadonlyArray<ConnectedVideoPrompt>
   videoModels: ReadonlyArray<CanvasImageModelOption>
   node: CanvasNodeData
+  layerSplitSource: Readonly<{ fileName: string; title: string }> | null
   dropTarget: boolean
   mentionReferenceImages: ReadonlyArray<ConnectedReferenceImage>
   referenceImages: ReadonlyArray<ConnectedReferenceImage>
@@ -2314,6 +2610,8 @@ type CanvasNodeProps = Readonly<{
   onGenerateAudio: () => void
   onGenerateStoryboard: () => void
   onGenerateVideo: () => void
+  onAnalyzeImageLayers: (request: AnalyzeImageLayersRequest, sourceFileName: string, dataUrl: string) => Promise<void>
+  onExportImageLayers: (dataUrl: string, layers: ReadonlyArray<ImageLayerSlice>, sourceFileName: string) => Promise<void>
   onImportImages: () => void
   onLoadImage: (fileName: string) => Promise<string | null>
   onRemoveReference: (reference: ConnectedReferenceImage) => void
@@ -2323,9 +2621,9 @@ type CanvasNodeProps = Readonly<{
   onDelete: () => void
 }>
 
-function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, hasInputPort, hasOutputPort, imageModels, videoModels, videoPromptOptions, node, dropTarget, isChatting, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, mentionReferenceImages, referenceImages, selected, onPointerDown, onPortOpen, onPortPointerDown, onResizePointerDown, onUpdate, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onRemoveReference, onSendChat, onDelete }: CanvasNodeProps) {
+function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAudioModelKey, defaultChatModelKey, defaultImageModelKey, defaultVideoModelKey, generationNow, hasInputPort, hasOutputPort, imageModels, videoModels, videoPromptOptions, node, layerSplitSource, dropTarget, isAnalyzingLayers, isChatting, isExportingLayers, isGeneratingStoryboard, isOptimizingPrompt, storyboardInputAvailable, mentionReferenceImages, referenceImages, selected, onPointerDown, onPortOpen, onPortPointerDown, onResizePointerDown, onUpdate, onAnalyzeImageLayers, onExportImageLayers, onGenerateAudio, onGenerateImage, onGenerateStoryboard, onGenerateVideo, onImportImages, onLoadImage, onOptimizePrompt, onCreatePrompt, onRemoveReference, onSendChat, onDelete }: CanvasNodeProps) {
   const [storyboardHelpOpen, setStoryboardHelpOpen] = useState(false)
-  const renderedHeight = nodeDimensions(node).height
+  const dimensions = nodeDimensions(node)
 
   useEffect(() => {
     if (!storyboardHelpOpen) return
@@ -2352,7 +2650,7 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
       className={`canvas-node node-${node.type}${selected ? ' is-selected' : ''}${dropTarget ? ' is-drop-target' : ''}${node.generationStatus ? ` is-${node.generationStatus}` : ''}${node.collapsed ? ' is-collapsed' : ''}${storyboardHelpOpen ? ' is-help-open' : ''}`}
       data-node-id={node.id}
       onPointerDown={onPointerDown}
-      style={{ left: node.x, top: node.y, width: node.width, height: renderedHeight, minHeight: renderedHeight, '--node-color': node.color ?? '#aaff00' } as CSSProperties}
+      style={{ left: node.x, top: node.y, width: dimensions.width, height: dimensions.height, minHeight: dimensions.height, '--node-color': node.color ?? '#aaff00' } as CSSProperties}
     >
       {hasInputPort && (
         <button
@@ -2442,6 +2740,20 @@ function CanvasNode({ activeGenerationCount, audioModels, chatModels, defaultAud
         />
       )}
       {node.type === 'image' && <CanvasImageNode generationNow={generationNow} node={node} onImportImages={onImportImages} onLoadImage={onLoadImage}/>}
+      {node.type === 'layer-split' && (
+        <ImageLayerSplitNode
+          chatModels={chatModels}
+          defaultChatModelKey={defaultChatModelKey}
+          isAnalyzing={isAnalyzingLayers}
+          isExporting={isExportingLayers}
+          node={node}
+          onAnalyze={onAnalyzeImageLayers}
+          onExport={onExportImageLayers}
+          onLoadImage={onLoadImage}
+          onUpdate={onUpdate}
+          source={layerSplitSource}
+        />
+      )}
       {node.type === 'reference-folder' && <ReferenceFolderNode node={node} onImportImages={onImportImages} onLoadImage={onLoadImage} onUpdate={onUpdate}/>}
       {node.type === 'note' && <textarea aria-label="便签内容" className="note-node-body" onChange={(event) => onUpdate({ subtitle: event.target.value })} value={node.subtitle ?? ''}/>} 
       {node.type === 'chat' && (
@@ -3257,7 +3569,7 @@ function createNodeData(
   videoModels: ReadonlyArray<CanvasImageModelOption>,
 ): CanvasNodeData {
   const count = document.nodes.filter((node) => node.type === type).length + 1
-  const labels: Record<CanvasNodeType, string> = { prompt: '创意提示词', storyboard: '分镜提示词', 'shot-list': '分镜节点', generator: '图像生成', compositor: '图片合成', image: '图片素材', 'reference-folder': '参考图文件夹', note: '新便签', chat: 'AI 对话', video: '视频生成', audio: '语音生成' }
+  const labels: Record<CanvasNodeType, string> = { prompt: '创意提示词', storyboard: '分镜提示词', 'shot-list': '分镜节点', generator: '图像生成', compositor: '图片合成', image: '图片素材', 'layer-split': '图层拆分', 'reference-folder': '参考图文件夹', note: '新便签', chat: 'AI 对话', video: '视频生成', audio: '语音生成' }
   const defaultImageModelName = imageModels.find((model) => model.key === defaultImageModelKey)?.label ?? '默认图片模型'
   const defaultImageSize = defaultImageGenerationSizeForModel(defaultImageModelKey)
   const defaultVideoModelName = videoModels.find((model) => model.key === defaultVideoModelKey)?.label ?? '默认视频模型'
@@ -3316,12 +3628,80 @@ function nodeIdAtClientPoint(clientX: number, clientY: number, excludedNodeId: s
 }
 
 function connectionPath(start: CanvasPoint, end: CanvasPoint): string {
-  const bend = Math.max(80, Math.abs(end.x - start.x) * 0.45)
-  return `M ${start.x} ${start.y} C ${start.x + bend} ${start.y}, ${end.x - bend} ${end.y}, ${end.x} ${end.y}`
+  const controls = connectionControlPoints(start, end)
+  return `M ${start.x} ${start.y} C ${controls.first.x} ${controls.first.y}, ${controls.second.x} ${controls.second.y}, ${end.x} ${end.y}`
 }
 
 function bezierMidpoint(start: CanvasPoint, end: CanvasPoint): CanvasPoint {
   return { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 }
+}
+
+function connectionControlPoints(start: CanvasPoint, end: CanvasPoint): Readonly<{
+  first: CanvasPoint
+  second: CanvasPoint
+}> {
+  const bend = Math.max(80, Math.abs(end.x - start.x) * 0.45)
+  return {
+    first: { x: start.x + bend, y: start.y },
+    second: { x: end.x - bend, y: end.y },
+  }
+}
+
+function connectionIntersectsBounds(
+  start: CanvasPoint,
+  end: CanvasPoint,
+  bounds: CanvasBounds,
+  padding: number,
+): boolean {
+  const controls = connectionControlPoints(start, end)
+  const paddedBounds = {
+    x: bounds.x - padding,
+    y: bounds.y - padding,
+    width: bounds.width + padding * 2,
+    height: bounds.height + padding * 2,
+  }
+  let previous = start
+  for (let sampleIndex = 1; sampleIndex <= 32; sampleIndex += 1) {
+    const t = sampleIndex / 32
+    const remaining = 1 - t
+    const current = {
+      x: remaining ** 3 * start.x +
+        3 * remaining ** 2 * t * controls.first.x +
+        3 * remaining * t ** 2 * controls.second.x +
+        t ** 3 * end.x,
+      y: remaining ** 3 * start.y +
+        3 * remaining ** 2 * t * controls.first.y +
+        3 * remaining * t ** 2 * controls.second.y +
+        t ** 3 * end.y,
+    }
+    if (lineSegmentIntersectsBounds(previous, current, paddedBounds)) return true
+    previous = current
+  }
+  return false
+}
+
+function lineSegmentIntersectsBounds(start: CanvasPoint, end: CanvasPoint, bounds: CanvasBounds): boolean {
+  const deltaX = end.x - start.x
+  const deltaY = end.y - start.y
+  const constraints: ReadonlyArray<readonly [number, number]> = [
+    [-deltaX, start.x - bounds.x],
+    [deltaX, bounds.x + bounds.width - start.x],
+    [-deltaY, start.y - bounds.y],
+    [deltaY, bounds.y + bounds.height - start.y],
+  ]
+  let minimum = 0
+  let maximum = 1
+  for (const [direction, distance] of constraints) {
+    if (direction === 0) {
+      if (distance < 0) return false
+      continue
+    }
+    const ratio = distance / direction
+    if (direction < 0) minimum = Math.max(minimum, ratio)
+    else maximum = Math.min(maximum, ratio)
+    if (minimum > maximum) return false
+  }
+  return true
 }
 
 function nodeIcon(type: CanvasNodeType) {
@@ -3337,6 +3717,7 @@ function defaultSubtitle(type: CanvasNodeType): string {
     generator: 'GPT Image 2 · 1024 × 1024',
     compositor: '描述多张参考图需要如何组合...',
     image: '拖入图片，或连接生成节点',
+    'layer-split': '连接图片后识别可见图层',
     'reference-folder': '批量管理参考图片',
     note: '记录一个新想法...',
     chat: '开始一段创意对话',
@@ -3347,7 +3728,7 @@ function defaultSubtitle(type: CanvasNodeType): string {
 }
 
 function defaultColor(type: CanvasNodeType): string {
-  const colors: Record<CanvasNodeType, string> = { prompt: '#aaff00', storyboard: '#f59e0b', 'shot-list': '#fbbf24', generator: '#7c5cff', compositor: '#d879ff', image: '#23c8ff', 'reference-folder': '#38bdf8', note: '#ffdb5c', chat: '#fb7185', video: '#f97316', audio: '#14b8a6' }
+  const colors: Record<CanvasNodeType, string> = { prompt: '#aaff00', storyboard: '#f59e0b', 'shot-list': '#fbbf24', generator: '#7c5cff', compositor: '#d879ff', image: '#23c8ff', 'layer-split': '#2dd4bf', 'reference-folder': '#38bdf8', note: '#ffdb5c', chat: '#fb7185', video: '#f97316', audio: '#14b8a6' }
   return colors[type]
 }
 
@@ -3585,6 +3966,20 @@ function findReferenceImageFileNames(
   return findConnectedReferenceImages(document, source).map((reference) => reference.fileName)
 }
 
+function findLayerSplitSourceImage(
+  document: CanvasDocument,
+  source: CanvasNodeData,
+): Readonly<{ fileName: string; title: string }> | null {
+  if (source.type !== 'layer-split') return null
+  const connection = document.connections.find((item) => item.to === source.id)
+  const image = connection
+    ? document.nodes.find((node) => node.id === connection.from && node.type === 'image')
+    : undefined
+  return image?.imageFileName
+    ? { fileName: image.imageFileName, title: image.title }
+    : null
+}
+
 function findConnectedReferenceImages(
   document: CanvasDocument,
   source: CanvasNodeData,
@@ -3707,6 +4102,105 @@ function countActiveGenerationTasks(document: CanvasDocument, sourceNodeId: stri
   ).length
 }
 
+function activeOperationNodeIds(operationKeys: ReadonlySet<string>, documentId: string): ReadonlySet<string> {
+  const prefix = `${documentId}:`
+  return new Set([...operationKeys].flatMap((key) => key.startsWith(prefix) ? [key.slice(prefix.length)] : []))
+}
+
+type CanvasBounds = Readonly<{
+  x: number
+  y: number
+  width: number
+  height: number
+}>
+
+function findAvailableConnectedNodePosition(
+  document: CanvasDocument,
+  source: CanvasNodeData,
+  provisionalNode: CanvasNodeData,
+  side: 'input' | 'output',
+): CanvasPoint {
+  const sourceDimensions = nodeDimensions(source)
+  const candidateDimensions = nodeDimensions(provisionalNode)
+  const horizontalGap = 92
+  const baseX = side === 'output'
+    ? source.x + sourceDimensions.width + horizontalGap
+    : source.x - candidateDimensions.width - horizontalGap
+  const baseY = source.y + (sourceDimensions.height - candidateDimensions.height) / 2
+  const horizontalDirection = side === 'output' ? 1 : -1
+  const horizontalStep = Math.max(144, Math.round(candidateDimensions.width * 0.45))
+  const verticalStep = 96
+  const occupiedBounds = document.nodes.map((node) => ({
+    id: node.id,
+    x: node.x,
+    y: node.y,
+    ...nodeDimensions(node),
+  }))
+  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
+  const existingConnections = document.connections.flatMap((connection) => {
+    const from = nodesById.get(connection.from)
+    const to = nodesById.get(connection.to)
+    return from && to
+      ? [{ start: nodePortPoint(from, 'output'), end: nodePortPoint(to, 'input') }]
+      : []
+  })
+  const candidates: Array<CanvasPoint & Readonly<{ distance: number }>> = []
+
+  for (let column = 0; column < 9; column += 1) {
+    for (let ring = 0; ring < 25; ring += 1) {
+      const verticalOffsets = ring === 0 ? [0] : [ring * verticalStep, -ring * verticalStep]
+      for (const verticalOffset of verticalOffsets) {
+        const horizontalOffset = column * horizontalStep
+        candidates.push({
+          x: Math.round(baseX + horizontalDirection * horizontalOffset),
+          y: Math.round(baseY + verticalOffset),
+          distance: Math.hypot(horizontalOffset * 1.15, verticalOffset),
+        })
+      }
+    }
+  }
+  candidates.sort((left, right) => left.distance - right.distance || left.y - right.y)
+
+  let bestFallback: Readonly<{ point: CanvasPoint; obstructionCount: number; distance: number }> | null = null
+  for (const candidate of candidates) {
+    const candidateBounds = { ...candidateDimensions, x: candidate.x, y: candidate.y }
+    if (occupiedBounds.some((bounds) => rectanglesOverlap(candidateBounds, bounds, 56))) continue
+
+    const coveredConnectionCount = existingConnections.reduce((count, connection) =>
+      count + Number(connectionIntersectsBounds(connection.start, connection.end, candidateBounds, 28)), 0)
+    const placedNode = { ...provisionalNode, x: candidate.x, y: candidate.y }
+    const newConnectionStart = side === 'output'
+      ? nodePortPoint(source, 'output')
+      : nodePortPoint(placedNode, 'output')
+    const newConnectionEnd = side === 'output'
+      ? nodePortPoint(placedNode, 'input')
+      : nodePortPoint(source, 'input')
+    const crossedNodeCount = occupiedBounds.reduce((count, bounds) =>
+      bounds.id === source.id
+        ? count
+        : count + Number(connectionIntersectsBounds(newConnectionStart, newConnectionEnd, bounds, 18)), 0)
+    const obstructionCount = coveredConnectionCount + crossedNodeCount
+    const point = { x: candidate.x, y: candidate.y }
+    if (obstructionCount === 0) return point
+    if (
+      !bestFallback ||
+      obstructionCount < bestFallback.obstructionCount ||
+      (obstructionCount === bestFallback.obstructionCount && candidate.distance < bestFallback.distance)
+    ) {
+      bestFallback = { point, obstructionCount, distance: candidate.distance }
+    }
+  }
+
+  if (bestFallback) return bestFallback.point
+  const bounds = graphBounds(document.nodes)
+  return {
+    x: Math.round(side === 'output'
+      ? bounds.x + bounds.width + horizontalGap
+      : bounds.x - candidateDimensions.width - horizontalGap),
+    y: Math.round(baseY),
+  }
+}
+
 function findGenerationNodePositions(
   document: CanvasDocument,
   source: CanvasNodeData,
@@ -3809,6 +4303,7 @@ function workflowFailureMessage(type: CanvasNodeType): string {
     generator: '图片生成失败',
     compositor: '图片合成失败',
     image: '图片资源不可用',
+    'layer-split': '图层拆分节点没有可用图层',
     'reference-folder': '参考图文件夹为空',
     note: '便签节点执行失败',
     chat: 'AI 对话失败',
@@ -3816,6 +4311,513 @@ function workflowFailureMessage(type: CanvasNodeType): string {
     audio: '语音生成失败',
   }
   return messages[type]
+}
+
+async function cropImageLayerFiles(
+  dataUrl: string,
+  layers: ReadonlyArray<ImageLayerSlice>,
+  sourceWidth: number,
+  sourceHeight: number,
+): Promise<ReadonlyArray<File>> {
+  if (
+    !Number.isInteger(sourceWidth) ||
+    !Number.isInteger(sourceHeight) ||
+    sourceWidth < 1 ||
+    sourceHeight < 1
+  ) throw new Error('图层源图片尺寸无效，请重新分析')
+  let totalPixels = 0
+  for (const [index, layer] of layers.entries()) {
+    const { x, y, width, height } = layer.bounds
+    const pixelCount = width * height
+    if (
+      !Number.isInteger(x) ||
+      !Number.isInteger(y) ||
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      x < 0 ||
+      y < 0 ||
+      width < 1 ||
+      height < 1 ||
+      x + width > sourceWidth ||
+      y + height > sourceHeight
+    ) throw new Error(`${layer.name || `图层 ${index + 1}`} 的裁切范围无效，请重新调整`)
+    if (width > 16_384 || height > 16_384 || pixelCount > MAX_LAYER_EXPORT_PIXELS) {
+      throw new Error(`${layer.name || `图层 ${index + 1}`} 尺寸过大，请先缩小裁切范围`)
+    }
+    totalPixels += pixelCount
+    if (totalPixels > MAX_LAYER_EXPORT_TOTAL_PIXELS) {
+      throw new Error('本次图层总尺寸过大，请减少图层数量或缩小裁切范围')
+    }
+  }
+  const source = await loadCanvasImage(dataUrl)
+  const scaleX = source.naturalWidth / sourceWidth
+  const scaleY = source.naturalHeight / sourceHeight
+  const usedNames = new Set<string>()
+  const files: File[] = []
+  let totalBytes = 0
+  for (const [index, layer] of layers.entries()) {
+    const canvas = window.document.createElement('canvas')
+    canvas.width = layer.bounds.width
+    canvas.height = layer.bounds.height
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('当前系统无法创建图层裁切画布')
+    let blob: Blob
+    try {
+      context.imageSmoothingEnabled = true
+      context.imageSmoothingQuality = 'high'
+      context.drawImage(
+        source,
+        layer.bounds.x * scaleX,
+        layer.bounds.y * scaleY,
+        layer.bounds.width * scaleX,
+        layer.bounds.height * scaleY,
+        0,
+        0,
+        layer.bounds.width,
+        layer.bounds.height,
+      )
+      await isolateLayerForeground(context, layer, layers)
+      blob = await canvasToPngBlob(canvas)
+    } finally {
+      canvas.width = 1
+      canvas.height = 1
+    }
+    if (blob.size === 0 || blob.size > MAX_PASTED_IMAGE_BYTES) {
+      throw new Error(`${layer.name} 裁切结果为空或超过 25 MB`)
+    }
+    totalBytes += blob.size
+    if (totalBytes > MAX_LAYER_EXPORT_TOTAL_BYTES) {
+      throw new Error('本次图层文件总大小超过 50 MB，请减少图层数量或缩小裁切范围')
+    }
+    const baseName = safeLayerFileName(layer.name, index + 1)
+    let fileName = `${baseName}.png`
+    let suffix = 2
+    while (usedNames.has(fileName.toLowerCase())) {
+      fileName = `${baseName}-${suffix}.png`
+      suffix += 1
+    }
+    usedNames.add(fileName.toLowerCase())
+    files.push(new File([blob], fileName, { type: 'image/png' }))
+    await yieldToRenderer()
+  }
+  return files
+}
+
+async function refineImageLayerBounds(
+  dataUrl: string,
+  layers: ReadonlyArray<ImageLayerSlice>,
+  sourceWidth: number,
+  sourceHeight: number,
+): Promise<ReadonlyArray<ImageLayerSlice>> {
+  if (layers.length === 0) return layers
+  const source = await loadCanvasImage(dataUrl)
+  const scaleX = source.naturalWidth / sourceWidth
+  const scaleY = source.naturalHeight / sourceHeight
+  let processedPixels = 0
+  const refinedLayers: ImageLayerSlice[] = []
+  for (const layer of layers) {
+    const { width, height } = layer.bounds
+    const pixelCount = width * height
+    processedPixels += pixelCount
+    if (
+      pixelCount > MAX_LAYER_FOREGROUND_PIXELS ||
+      processedPixels > MAX_LAYER_EXPORT_TOTAL_PIXELS
+    ) {
+      refinedLayers.push(layer)
+      await yieldToRenderer()
+      continue
+    }
+    const canvas = window.document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext('2d')
+    if (!context) {
+      refinedLayers.push(layer)
+      continue
+    }
+    let refinedLayer = layer
+    try {
+      context.imageSmoothingEnabled = true
+      context.imageSmoothingQuality = 'high'
+      context.drawImage(
+        source,
+        layer.bounds.x * scaleX,
+        layer.bounds.y * scaleY,
+        width * scaleX,
+        height * scaleY,
+        0,
+        0,
+        width,
+        height,
+      )
+      await isolateLayerForeground(context, layer, layers)
+      const visibleBounds = await findVisiblePixelBounds(
+        context.getImageData(0, 0, width, height).data,
+        width,
+        height,
+      )
+      if (visibleBounds) {
+        const padding = 2
+        const left = Math.max(0, visibleBounds.x - padding)
+        const top = Math.max(0, visibleBounds.y - padding)
+        const right = Math.min(width, visibleBounds.x + visibleBounds.width + padding)
+        const bottom = Math.min(height, visibleBounds.y + visibleBounds.height + padding)
+        if (right - left >= 8 && bottom - top >= 8) {
+          refinedLayer = {
+            ...layer,
+            bounds: {
+              x: layer.bounds.x + left,
+              y: layer.bounds.y + top,
+              width: right - left,
+              height: bottom - top,
+            },
+          }
+        }
+      }
+    } finally {
+      canvas.width = 1
+      canvas.height = 1
+    }
+    refinedLayers.push(refinedLayer)
+    await yieldToRenderer()
+  }
+  return refinedLayers
+}
+
+async function findVisiblePixelBounds(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+): Promise<ImageLayerSlice['bounds'] | null> {
+  let left = width
+  let top = height
+  let right = -1
+  let bottom = -1
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const pixelIndex = y * width + x
+      if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+      if (data[pixelIndex * 4 + 3] <= FOREGROUND_ALPHA_THRESHOLD) continue
+      left = Math.min(left, x)
+      top = Math.min(top, y)
+      right = Math.max(right, x)
+      bottom = Math.max(bottom, y)
+    }
+  }
+  return right < left || bottom < top
+    ? null
+    : { x: left, y: top, width: right - left + 1, height: bottom - top + 1 }
+}
+
+async function isolateLayerForeground(
+  context: CanvasRenderingContext2D,
+  layer: ImageLayerSlice,
+  layers: ReadonlyArray<ImageLayerSlice>,
+): Promise<void> {
+  const { width, height } = layer.bounds
+  const shouldRemoveBackground = layer.kind === 'illustration' ||
+    layer.kind === 'avatar' ||
+    layer.kind === 'product-image' ||
+    layer.kind === 'icon' ||
+    layer.kind === 'logo' ||
+    layer.kind === 'complex-decoration'
+  if (
+    width * height > MAX_LAYER_FOREGROUND_PIXELS ||
+    !shouldRemoveBackground
+  ) return
+  const imageData = context.getImageData(0, 0, width, height)
+  const data = imageData.data
+  let hasTransparentPixels = false
+  for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+    if (data[pixelIndex * 4 + 3] <= FOREGROUND_ALPHA_THRESHOLD) {
+      hasTransparentPixels = true
+      break
+    }
+  }
+  const dominantBorderColor = hasTransparentPixels ? null : findDominantBorderColor(data, width, height)
+  if (dominantBorderColor) {
+    const originalAlpha = await copyAlphaChannel(data)
+    const originalOpaquePixels = await countOpaqueAlpha(originalAlpha)
+    const removedPixels = await clearConnectedBackground(data, width, height, dominantBorderColor)
+    const retainedPixels = originalOpaquePixels - removedPixels
+    if (
+      removedPixels >= originalOpaquePixels * MIN_BACKGROUND_REMOVAL_SHARE &&
+      retainedPixels >= Math.max(8, originalOpaquePixels * MIN_RETAINED_FOREGROUND_SHARE)
+    ) {
+      hasTransparentPixels = true
+    } else {
+      await restoreAlphaChannel(data, originalAlpha)
+    }
+  }
+  if (!hasTransparentPixels) return
+  await clearPixelsOwnedByOtherLayers(data, width, height, layer, layers)
+  if (layer.kind === 'illustration' || layer.kind === 'avatar' || layer.kind === 'product-image') {
+    await removeTinyOpaqueComponents(data, width, height)
+  }
+  context.putImageData(imageData, 0, 0)
+}
+
+async function clearPixelsOwnedByOtherLayers(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  layer: ImageLayerSlice,
+  layers: ReadonlyArray<ImageLayerSlice>,
+): Promise<void> {
+  const overlappingLayers = layers.filter((candidate) =>
+    candidate.id !== layer.id &&
+    candidate.bounds.width * candidate.bounds.height <= width * height * 1.15 &&
+    rectanglesOverlap(layer.bounds, candidate.bounds, 0),
+  )
+  if (overlappingLayers.length === 0) return
+  for (let localY = 0; localY < height; localY += 1) {
+    const sourceY = layer.bounds.y + localY + 0.5
+    for (let localX = 0; localX < width; localX += 1) {
+      const pixelIndex = localY * width + localX
+      if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+      if (data[pixelIndex * 4 + 3] <= FOREGROUND_ALPHA_THRESHOLD) continue
+      const sourceX = layer.bounds.x + localX + 0.5
+      const currentScore = normalizedLayerDistance(sourceX, sourceY, layer.bounds)
+      const belongsToOtherLayer = overlappingLayers.some((candidate) =>
+        pointInsideBounds(sourceX, sourceY, candidate.bounds) &&
+        normalizedLayerDistance(sourceX, sourceY, candidate.bounds) + 0.04 < currentScore,
+      )
+      if (belongsToOtherLayer) data[pixelIndex * 4 + 3] = 0
+    }
+  }
+}
+
+function pointInsideBounds(x: number, y: number, bounds: ImageLayerSlice['bounds']): boolean {
+  return x >= bounds.x && x < bounds.x + bounds.width && y >= bounds.y && y < bounds.y + bounds.height
+}
+
+function normalizedLayerDistance(x: number, y: number, bounds: ImageLayerSlice['bounds']): number {
+  const halfWidth = Math.max(1, bounds.width / 2)
+  const halfHeight = Math.max(1, bounds.height / 2)
+  const deltaX = (x - (bounds.x + halfWidth)) / halfWidth
+  const deltaY = (y - (bounds.y + halfHeight)) / halfHeight
+  return deltaX * deltaX + deltaY * deltaY
+}
+
+type RgbColor = Readonly<{ red: number; green: number; blue: number }>
+
+function findDominantBorderColor(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+): RgbColor | null {
+  const buckets = new Map<number, { count: number; red: number; green: number; blue: number }>()
+  const borderIndexes: number[] = []
+  for (let x = 0; x < width; x += 1) {
+    borderIndexes.push(x, (height - 1) * width + x)
+  }
+  for (let y = 1; y < height - 1; y += 1) {
+    borderIndexes.push(y * width, y * width + width - 1)
+  }
+  let opaqueBorderCount = 0
+  for (const pixelIndex of borderIndexes) {
+    const offset = pixelIndex * 4
+    if (data[offset + 3] <= FOREGROUND_ALPHA_THRESHOLD) continue
+    opaqueBorderCount += 1
+    const key = (data[offset] >> 5) << 10 | (data[offset + 1] >> 5) << 5 | data[offset + 2] >> 5
+    const bucket = buckets.get(key) ?? { count: 0, red: 0, green: 0, blue: 0 }
+    bucket.count += 1
+    bucket.red += data[offset]
+    bucket.green += data[offset + 1]
+    bucket.blue += data[offset + 2]
+    buckets.set(key, bucket)
+  }
+  const dominant = [...buckets.values()].sort((left, right) => right.count - left.count)[0]
+  if (!dominant || dominant.count < Math.max(8, opaqueBorderCount * DOMINANT_BORDER_COLOR_SHARE)) return null
+  return {
+    red: dominant.red / dominant.count,
+    green: dominant.green / dominant.count,
+    blue: dominant.blue / dominant.count,
+  }
+}
+
+async function clearConnectedBackground(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  background: RgbColor,
+): Promise<number> {
+  const pixelCount = width * height
+  const queue = new Int32Array(pixelCount)
+  const queued = new Uint8Array(pixelCount)
+  let readIndex = 0
+  let writeIndex = 0
+  const enqueue = (pixelIndex: number): void => {
+    if (queued[pixelIndex] || !matchesBackground(data, pixelIndex, background)) return
+    queued[pixelIndex] = 1
+    queue[writeIndex] = pixelIndex
+    writeIndex += 1
+  }
+  for (let x = 0; x < width; x += 1) {
+    enqueue(x)
+    enqueue((height - 1) * width + x)
+  }
+  for (let y = 1; y < height - 1; y += 1) {
+    enqueue(y * width)
+    enqueue(y * width + width - 1)
+  }
+  let clearedPixels = 0
+  while (readIndex < writeIndex) {
+    const pixelIndex = queue[readIndex]
+    readIndex += 1
+    data[pixelIndex * 4 + 3] = 0
+    clearedPixels += 1
+    const x = pixelIndex % width
+    if (x > 0) enqueue(pixelIndex - 1)
+    if (x + 1 < width) enqueue(pixelIndex + 1)
+    if (pixelIndex >= width) enqueue(pixelIndex - width)
+    if (pixelIndex + width < pixelCount) enqueue(pixelIndex + width)
+    if (readIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+  }
+  return clearedPixels
+}
+
+function matchesBackground(data: Uint8ClampedArray, pixelIndex: number, background: RgbColor): boolean {
+  const offset = pixelIndex * 4
+  if (data[offset + 3] <= FOREGROUND_ALPHA_THRESHOLD) return false
+  const red = data[offset] - background.red
+  const green = data[offset + 1] - background.green
+  const blue = data[offset + 2] - background.blue
+  return red * red + green * green + blue * blue <= BACKGROUND_COLOR_TOLERANCE ** 2
+}
+
+async function removeTinyOpaqueComponents(data: Uint8ClampedArray, width: number, height: number): Promise<void> {
+  const pixelCount = width * height
+  const visited = new Uint8Array(pixelCount)
+  const queue = new Int32Array(pixelCount)
+  let largestSize = 0
+  for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+    if (visited[pixelIndex] || data[pixelIndex * 4 + 3] <= FOREGROUND_ALPHA_THRESHOLD) continue
+    largestSize = Math.max(largestSize, await visitOpaqueComponent(data, width, height, pixelIndex, visited, queue))
+  }
+  if (largestSize === 0) return
+  const minimumComponentSize = Math.max(6, Math.min(96, Math.ceil(largestSize * 0.0002)))
+  visited.fill(0)
+  for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+    if (visited[pixelIndex] || data[pixelIndex * 4 + 3] <= FOREGROUND_ALPHA_THRESHOLD) continue
+    const componentSize = await visitOpaqueComponent(data, width, height, pixelIndex, visited, queue)
+    if (componentSize < minimumComponentSize) {
+      for (let queueIndex = 0; queueIndex < componentSize; queueIndex += 1) {
+        data[queue[queueIndex] * 4 + 3] = 0
+      }
+    }
+  }
+}
+
+async function visitOpaqueComponent(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  seed: number,
+  visited: Uint8Array,
+  queue: Int32Array,
+): Promise<number> {
+  const pixelCount = width * height
+  let readIndex = 0
+  let writeIndex = 1
+  queue[0] = seed
+  visited[seed] = 1
+  while (readIndex < writeIndex) {
+    const pixelIndex = queue[readIndex]
+    readIndex += 1
+    const x = pixelIndex % width
+    if (x > 0) {
+      const neighbor = pixelIndex - 1
+      if (!visited[neighbor] && data[neighbor * 4 + 3] > FOREGROUND_ALPHA_THRESHOLD) {
+        visited[neighbor] = 1
+        queue[writeIndex] = neighbor
+        writeIndex += 1
+      }
+    }
+    if (x + 1 < width) {
+      const neighbor = pixelIndex + 1
+      if (!visited[neighbor] && data[neighbor * 4 + 3] > FOREGROUND_ALPHA_THRESHOLD) {
+        visited[neighbor] = 1
+        queue[writeIndex] = neighbor
+        writeIndex += 1
+      }
+    }
+    if (pixelIndex >= width) {
+      const neighbor = pixelIndex - width
+      if (!visited[neighbor] && data[neighbor * 4 + 3] > FOREGROUND_ALPHA_THRESHOLD) {
+        visited[neighbor] = 1
+        queue[writeIndex] = neighbor
+        writeIndex += 1
+      }
+    }
+    if (pixelIndex + width < pixelCount) {
+      const neighbor = pixelIndex + width
+      if (!visited[neighbor] && data[neighbor * 4 + 3] > FOREGROUND_ALPHA_THRESHOLD) {
+        visited[neighbor] = 1
+        queue[writeIndex] = neighbor
+        writeIndex += 1
+      }
+    }
+    if (readIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+  }
+  return writeIndex
+}
+
+async function copyAlphaChannel(data: Uint8ClampedArray): Promise<Uint8Array> {
+  const alpha = new Uint8Array(data.length / 4)
+  for (let pixelIndex = 0; pixelIndex < alpha.length; pixelIndex += 1) {
+    alpha[pixelIndex] = data[pixelIndex * 4 + 3]
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+  }
+  return alpha
+}
+
+async function countOpaqueAlpha(alpha: Uint8Array): Promise<number> {
+  let count = 0
+  for (let pixelIndex = 0; pixelIndex < alpha.length; pixelIndex += 1) {
+    if (alpha[pixelIndex] > FOREGROUND_ALPHA_THRESHOLD) count += 1
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+  }
+  return count
+}
+
+async function restoreAlphaChannel(data: Uint8ClampedArray, alpha: Uint8Array): Promise<void> {
+  for (let pixelIndex = 0; pixelIndex < alpha.length; pixelIndex += 1) {
+    data[pixelIndex * 4 + 3] = alpha[pixelIndex]
+    if (pixelIndex > 0 && pixelIndex % PIXEL_WORK_YIELD_INTERVAL === 0) await yieldToRenderer()
+  }
+}
+
+function yieldToRenderer(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0))
+}
+
+function loadCanvasImage(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('源图片无法读取，不能生成图层'))
+    image.src = dataUrl
+  })
+}
+
+function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('图层图片编码失败')), 'image/png')
+  })
+}
+
+function safeLayerFileName(name: string, index: number): string {
+  const normalized = name
+    .trim()
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80)
+  return normalized || `layer-${index}`
 }
 
 function workflowStatusLabel(status: NonNullable<CanvasNodeData['workflowStatus']>): string {

@@ -182,12 +182,39 @@ export type SetProviderModelEnabledRequest = Readonly<{
 
 export type RemoveProviderModelRequest = Readonly<{ key: string }>
 
-export type CanvasNodeType = 'prompt' | 'storyboard' | 'shot-list' | 'generator' | 'compositor' | 'image' | 'reference-folder' | 'note' | 'chat' | 'video' | 'audio'
+export type CanvasNodeType = 'prompt' | 'storyboard' | 'shot-list' | 'generator' | 'compositor' | 'image' | 'layer-split' | 'reference-folder' | 'note' | 'chat' | 'video' | 'audio'
 export type CanvasGenerationStatus = 'queued' | 'generating' | 'succeeded' | 'failed'
 export type CanvasWorkflowStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'skipped'
 export type ImageGenerationCount = 1 | 2 | 3 | 4
 export type VideoGenerationResolution = '720P' | '768P' | '1080P' | '2K'
 export type VideoGenerationRatio = '16:9' | '9:16' | '1:1' | 'adaptive'
+
+export type ImageLayerKind =
+  | 'icon'
+  | 'avatar'
+  | 'illustration'
+  | 'photo'
+  | 'product-image'
+  | 'complex-decoration'
+  | 'complex-chart'
+  | 'logo'
+  | 'other'
+
+export type ImageLayerBounds = Readonly<{
+  x: number
+  y: number
+  width: number
+  height: number
+}>
+
+export type ImageLayerSlice = Readonly<{
+  id: string
+  name: string
+  kind: ImageLayerKind
+  bounds: ImageLayerBounds
+  confidence?: number
+  reason?: string
+}>
 
 export type CanvasChatMessage = Readonly<{
   id: string
@@ -225,6 +252,11 @@ export type CanvasNodeData = Readonly<{
   generationBatchIndex?: number
   imageFileName?: string
   imageFileNames?: ReadonlyArray<string>
+  imageLayerSourceFileName?: string
+  imageLayerSourceWidth?: number
+  imageLayerSourceHeight?: number
+  imageLayers?: ReadonlyArray<ImageLayerSlice>
+  imageLayerError?: string
   collapsed?: boolean
   workflowStatus?: CanvasWorkflowStatus
   workflowError?: string
@@ -375,6 +407,26 @@ export type GeneratedStoryboard = Readonly<{
 
 export type GeneratedImageResult = Readonly<{
   artwork: GeneratedArtwork
+}>
+
+export type AnalyzeImageLayersRequest = Readonly<{
+  image: Readonly<{
+    bytes: Uint8Array
+    mediaType: 'image/png' | 'image/jpeg' | 'image/webp'
+    width: number
+    height: number
+  }>
+  sourceWidth: number
+  sourceHeight: number
+  modelKey?: string
+}>
+
+export type AnalyzedImageLayers = Readonly<{
+  layers: ReadonlyArray<ImageLayerSlice>
+  sourceWidth: number
+  sourceHeight: number
+  modelKey: string
+  modelName: string
 }>
 
 export type LoadGeneratedImageRequest = Readonly<{
@@ -586,6 +638,7 @@ export type DesktopApi = Readonly<{
   }>
   generation: Readonly<{
     generateImage: (request: GenerateImageRequest) => Promise<DesktopResult<GeneratedImageResult>>
+    analyzeImageLayers: (request: AnalyzeImageLayersRequest) => Promise<DesktopResult<AnalyzedImageLayers>>
     generateVideo: (request: GenerateVideoRequest) => Promise<DesktopResult<GeneratedVideoResult>>
     generateAudio: (request: GenerateAudioRequest) => Promise<DesktopResult<GeneratedAudioResult>>
     optimizePrompt: (request: OptimizePromptRequest) => Promise<DesktopResult<OptimizedPromptResult>>

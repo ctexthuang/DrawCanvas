@@ -14,6 +14,7 @@ const canvasNodeTypes: ReadonlySet<CanvasNodeType> = new Set([
   'generator',
   'compositor',
   'image',
+  'layer-split',
   'reference-folder',
   'note',
   'chat',
@@ -174,6 +175,8 @@ function isCanvasNode(value: unknown): value is CanvasNodeData {
       value.imageFileNames.length <= 50 &&
       value.imageFileNames.every((fileName) => isBoundedString(fileName, 260))
     )) &&
+    isImageLayerState(value) &&
+    (value.imageLayerError === undefined || isStringAtMost(value.imageLayerError, 1000)) &&
     (value.collapsed === undefined || typeof value.collapsed === 'boolean') &&
     (value.workflowStatus === undefined || value.workflowStatus === 'idle' || value.workflowStatus === 'running' || value.workflowStatus === 'succeeded' || value.workflowStatus === 'failed' || value.workflowStatus === 'skipped') &&
     (value.workflowError === undefined || isStringAtMost(value.workflowError, 1000)) &&
@@ -234,6 +237,62 @@ function isStoryboardShot(value: unknown): boolean {
     value.durationSeconds <= 60
 }
 
+function isImageLayer(value: unknown, sourceWidth: unknown, sourceHeight: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.bounds)) return false
+  const maximumWidth = isImageLayerDimension(sourceWidth) ? sourceWidth : 100_000
+  const maximumHeight = isImageLayerDimension(sourceHeight) ? sourceHeight : 100_000
+  return (
+    isBoundedString(value.id, 128) &&
+    isStringAtMost(value.name, 120) &&
+    (
+      value.kind === 'icon' ||
+      value.kind === 'avatar' ||
+      value.kind === 'illustration' ||
+      value.kind === 'photo' ||
+      value.kind === 'product-image' ||
+      value.kind === 'complex-decoration' ||
+      value.kind === 'complex-chart' ||
+      value.kind === 'logo' ||
+      value.kind === 'other'
+    ) &&
+    isImageLayerCoordinate(value.bounds.x, maximumWidth) &&
+    isImageLayerCoordinate(value.bounds.y, maximumHeight) &&
+    isImageLayerSize(value.bounds.width, maximumWidth) &&
+    isImageLayerSize(value.bounds.height, maximumHeight) &&
+    value.bounds.x + value.bounds.width <= maximumWidth &&
+    value.bounds.y + value.bounds.height <= maximumHeight &&
+    (value.confidence === undefined || (
+      typeof value.confidence === 'number' &&
+      Number.isFinite(value.confidence) &&
+      value.confidence >= 0 &&
+      value.confidence <= 1
+    )) &&
+    (value.reason === undefined || isStringAtMost(value.reason, 300))
+  )
+}
+
+function isImageLayerState(value: Readonly<Record<string, unknown>>): boolean {
+  const hasLayerState = value.imageLayerSourceFileName !== undefined ||
+    value.imageLayerSourceWidth !== undefined ||
+    value.imageLayerSourceHeight !== undefined ||
+    value.imageLayers !== undefined
+  if (!hasLayerState) return true
+  if (
+    !isBoundedString(value.imageLayerSourceFileName, 260) ||
+    !isImageLayerDimension(value.imageLayerSourceWidth) ||
+    !isImageLayerDimension(value.imageLayerSourceHeight)
+  ) return false
+  return value.imageLayers === undefined || (
+    Array.isArray(value.imageLayers) &&
+    value.imageLayers.length <= 32 &&
+    value.imageLayers.every((layer) => isImageLayer(
+      layer,
+      value.imageLayerSourceWidth,
+      value.imageLayerSourceHeight,
+    ))
+  )
+}
+
 function isCanvasConnection(value: unknown): value is CanvasConnection {
   return isRecord(value) &&
     isBoundedString(value.id, 128) &&
@@ -269,4 +328,16 @@ function isFiniteCoordinate(value: unknown): value is number {
 
 function isFiniteSize(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 10_000
+}
+
+function isImageLayerDimension(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100_000
+}
+
+function isImageLayerCoordinate(value: unknown, maximum: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= maximum
+}
+
+function isImageLayerSize(value: unknown, maximum: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= maximum
 }

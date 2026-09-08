@@ -31,6 +31,7 @@ const defaultWidths: Readonly<Record<CanvasNodeType, number>> = {
   generator: 272,
   compositor: 292,
   image: 292,
+  'layer-split': 430,
   'reference-folder': 328,
   note: 272,
   chat: 272,
@@ -45,6 +46,7 @@ const defaultHeights: Readonly<Record<CanvasNodeType, number>> = {
   generator: 282,
   compositor: 370,
   image: 293,
+  'layer-split': 580,
   'reference-folder': 372,
   note: 162,
   chat: 400,
@@ -58,7 +60,8 @@ const allowedTargets: Readonly<Record<CanvasNodeType, ReadonlySet<CanvasNodeType
   'shot-list': new Set(['generator', 'video', 'audio']),
   generator: new Set(['image']),
   compositor: new Set(['image']),
-  image: new Set(['generator', 'compositor', 'reference-folder', 'video']),
+  image: new Set(['generator', 'compositor', 'layer-split', 'reference-folder', 'video']),
+  'layer-split': new Set(['image']),
   'reference-folder': new Set(['generator', 'compositor', 'video']),
   note: new Set(),
   chat: new Set(['prompt', 'generator', 'audio', 'storyboard']),
@@ -112,8 +115,11 @@ export function canConnect(
   const to = nodes.find((node) => node.id === toId)
   if (!from || !to) return { ok: false, reason: '连接节点不存在' }
   if (!canConnectNodeTypes(from.type, to.type)) return { ok: false, reason: `${from.title} 不能连接到 ${to.title}` }
-  if (from.type === 'image' && !from.imageFileName) {
+  if (from.type === 'image' && !from.imageFileName && to.type !== 'layer-split') {
     return { ok: false, reason: '图片生成或导入完成后才能作为参考图连接' }
+  }
+  if (to.type === 'layer-split' && connections.some((connection) => connection.to === toId)) {
+    return { ok: false, reason: '一个图层拆分节点只能连接一张源图片' }
   }
   if (connections.some((connection) => connection.from === fromId && connection.to === toId)) {
     return { ok: false, reason: '这两个节点已经连接' }

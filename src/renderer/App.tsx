@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import type {
   AddProviderModelRequest,
+  AnalyzeImageLayersRequest,
   AppSettings,
   AppUpdateCheck,
   CanvasDocument,
@@ -41,6 +42,7 @@ import {
   InfiniteCanvas,
   type CanvasImageModelOption,
   type CanvasImageGenerationOutcome,
+  type CanvasImageLayerAnalysisOutcome,
   type CanvasAudioGenerationOutcome,
   type CanvasChatGenerationOutcome,
   type CanvasPromptOptimizationOutcome,
@@ -612,6 +614,16 @@ export function App() {
     return { ok: true, value: result.value }
   }, [])
 
+  const analyzeCanvasImageLayers = useCallback(async (
+    request: AnalyzeImageLayersRequest,
+  ): Promise<CanvasImageLayerAnalysisOutcome> => {
+    if (!window.desktop) return { ok: false, error: '图片图层分析需要在 Electron 桌面端运行' }
+    const result = await window.desktop.generation.analyzeImageLayers(request)
+    return result.ok
+      ? { ok: true, value: result.value }
+      : { ok: false, error: result.error.message }
+  }, [])
+
   const generateCanvasVideo = useCallback(async (request: GenerateVideoRequest): Promise<CanvasVideoGenerationOutcome> => {
     if (!window.desktop) {
       return { ok: false, error: '真实视频生成需要在 Electron 桌面端运行' }
@@ -709,9 +721,10 @@ export function App() {
   const importPastedCanvasReferenceImages = useCallback(async (
     files: ReadonlyArray<File>,
     remoteUrls: ReadonlyArray<string>,
+    options: Readonly<{ notify?: boolean }> = {},
   ): Promise<ReadonlyArray<GeneratedArtwork>> => {
     if (!window.desktop) {
-      notify('粘贴图片需要在 Electron 桌面端运行')
+      if (options.notify !== false) notify('粘贴图片需要在 Electron 桌面端运行')
       return []
     }
     try {
@@ -719,12 +732,12 @@ export function App() {
       let totalBytes = 0
       for (const [index, file] of files.slice(0, 20).entries()) {
         if (file.size <= 0 || file.size > 25 * 1024 * 1024) {
-          notify('粘贴图片不能为空，且单张不能超过 25 MB')
+          if (options.notify !== false) notify('粘贴图片不能为空，且单张不能超过 25 MB')
           return []
         }
         totalBytes += file.size
         if (totalBytes > 50 * 1024 * 1024) {
-          notify('本次粘贴图片总大小不能超过 50 MB')
+          if (options.notify !== false) notify('本次粘贴图片总大小不能超过 50 MB')
           return []
         }
         const rawName = file.name.replace(/\.(?:png|jpe?g|webp)$/i, '').trim()
@@ -738,16 +751,16 @@ export function App() {
         remoteUrls: remoteUrls.slice(0, Math.max(0, 20 - images.length)),
       })
       if (!result.ok) {
-        notify(result.error.message)
+        if (options.notify !== false) notify(result.error.message)
         return []
       }
       const { imported, library } = result.value
       setLibraryCatalog(library)
-      if (imported.length > 0) notify(`已粘贴 ${imported.length} 张参考图`)
+      if (imported.length > 0 && options.notify !== false) notify(`已粘贴 ${imported.length} 张参考图`)
       void refreshStorageStats()
       return imported
     } catch {
-      notify('无法读取剪贴板图片，请重新复制后再试')
+      if (options.notify !== false) notify('无法读取剪贴板图片，请重新复制后再试')
       return []
     }
   }, [notify])
@@ -1072,7 +1085,7 @@ export function App() {
       case 'settings':
         return <SystemSettingsPage changingDirectory={storageChanging} onAccentChange={(color) => void updateSettings({ accentColor: color })} onCheckForUpdates={() => void checkForUpdates()} onChooseDirectory={() => void chooseStorageDirectory()} onOpenDirectory={() => void openStorageDirectory()} onOpenLatestRelease={() => void openLatestRelease()} onThemeChange={(theme: ThemeMode) => void updateSettings({ theme })} settings={settings} stats={stats} updateCheck={updateCheck} updateChecking={updateChecking} updateError={updateError} />
       case 'canvas':
-        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={primaryModelKey(settings.modelRoutes, 'audio') ?? ''} defaultChatModelKey={primaryModelKey(settings.modelRoutes, 'chat') ?? ''} defaultImageModelKey={primaryModelKey(settings.modelRoutes, 'image') ?? ''} defaultVideoModelKey={primaryModelKey(settings.modelRoutes, 'video') ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onImportPastedImages={importPastedCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
+        return <InfiniteCanvas audioModels={audioModels} chatModels={chatModels} defaultAudioModelKey={primaryModelKey(settings.modelRoutes, 'audio') ?? ''} defaultChatModelKey={primaryModelKey(settings.modelRoutes, 'chat') ?? ''} defaultImageModelKey={primaryModelKey(settings.modelRoutes, 'image') ?? ''} defaultVideoModelKey={primaryModelKey(settings.modelRoutes, 'video') ?? ''} document={canvasDocument} imageModels={imageModels} notify={notify} onAnalyzeImageLayers={analyzeCanvasImageLayers} onChange={(nextDocument) => setCanvasDocument((currentDocument) => currentDocument.id === nextDocument.id ? nextDocument : currentDocument)} onClose={() => setPage('home')} onGenerateAudio={generateCanvasAudio} onGenerateChatReply={generateCanvasChatReply} onGenerateImage={generateCanvasImage} onGenerateStoryboard={generateCanvasStoryboard} onGenerateVideo={generateCanvasVideo} onImportDroppedImages={importDroppedCanvasReferenceImages} onImportImages={importCanvasReferenceImages} onImportPastedImages={importPastedCanvasReferenceImages} onLoadImage={loadGeneratedImage} onOpen={() => void openCanvasFile()} onOptimizePrompt={optimizeCanvasPrompt} onSave={() => void saveCanvasFile()} videoModels={videoModels} />
     }
   }
 

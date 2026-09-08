@@ -1,5 +1,6 @@
 export const GENERATION_IPC_CHANNELS = {
   generateImage: 'generation:generate-image',
+  analyzeImageLayers: 'generation:analyze-image-layers',
   generateVideo: 'generation:generate-video',
   generateAudio: 'generation:generate-audio',
   optimizePrompt: 'generation:optimize-prompt',

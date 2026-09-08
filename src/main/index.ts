@@ -17,6 +17,7 @@ import {
 import { clipboard, shell } from 'electron'
 import type {
   AddProviderModelRequest,
+  AnalyzeImageLayersRequest,
   CanvasDocument,
   CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
@@ -97,6 +98,11 @@ import {
   type TextGenerationServiceErrorCode,
 } from './application/text-generation-service'
 import {
+  ImageLayerAnalysisService,
+  ImageLayerAnalysisServiceError,
+  type ImageLayerAnalysisServiceErrorCode,
+} from './application/image-layer-analysis-service'
+import {
   UpdateCheckService,
   UpdateCheckServiceError,
   type UpdateCheckServiceErrorCode,
@@ -113,6 +119,7 @@ const appState = new AppState()
 const imageGenerationService = new ImageGenerationService(appState)
 const promptOptimizationService = new PromptOptimizationService(appState)
 const textGenerationService = new TextGenerationService(appState)
+const imageLayerAnalysisService = new ImageLayerAnalysisService(appState)
 const videoGenerationService = new VideoGenerationService(appState)
 const audioGenerationService = new AudioGenerationService(appState)
 const libraryImageImportService = new LibraryImageImportService(appState)
@@ -183,6 +190,10 @@ function promptOptimizationDesktopErrorCode(
 }
 
 function textGenerationDesktopErrorCode(code: TextGenerationServiceErrorCode): DesktopErrorCode {
+  return promptOptimizationDesktopErrorCode(code)
+}
+
+function imageLayerAnalysisDesktopErrorCode(code: ImageLayerAnalysisServiceErrorCode): DesktopErrorCode {
   return promptOptimizationDesktopErrorCode(code)
 }
 
@@ -358,6 +369,53 @@ function isOptimizePromptRequest(value: unknown): value is OptimizePromptRequest
       request.modelKey.length <= 400
     ))
   )
+}
+
+function isAnalyzeImageLayersRequest(value: unknown): value is AnalyzeImageLayersRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const request = value as Partial<AnalyzeImageLayersRequest>
+  const image = request.image
+  if (!image || typeof image !== 'object' || Array.isArray(image)) return false
+  if (
+    !(image.bytes instanceof Uint8Array) ||
+    image.bytes.byteLength === 0 ||
+    image.bytes.byteLength > 12 * 1024 * 1024 ||
+    !isImageAnalysisMediaType(image.mediaType, image.bytes) ||
+    !isIntegerInRange(image.width, 1, 4096) ||
+    !isIntegerInRange(image.height, 1, 4096) ||
+    !isIntegerInRange(request.sourceWidth, 1, 32_768) ||
+    !isIntegerInRange(request.sourceHeight, 1, 32_768) ||
+    request.sourceWidth * request.sourceHeight > 100_000_000
+  ) return false
+  return request.modelKey === undefined || (
+    typeof request.modelKey === 'string' &&
+    request.modelKey.length > 0 &&
+    request.modelKey.length <= 400
+  )
+}
+
+function isImageAnalysisMediaType(
+  mediaType: unknown,
+  bytes: Uint8Array,
+): mediaType is AnalyzeImageLayersRequest['image']['mediaType'] {
+  if (mediaType === 'image/png') {
+    return bytes.byteLength >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a
+  }
+  if (mediaType === 'image/jpeg') {
+    return bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+  }
+  if (mediaType === 'image/webp') {
+    return bytes.byteLength >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  }
+  return false
+}
+
+function isIntegerInRange(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= minimum && value <= maximum
 }
 
 function isGenerateChatReplyRequest(value: unknown): value is GenerateChatReplyRequest {
@@ -1159,6 +1217,23 @@ function registerIpc(): void {
         return success(await imageGenerationService.loadImage(request.fileName))
       } catch {
         return failure('NOT_FOUND', '本地图片资源不存在或无法读取')
+      }
+    }),
+  )
+
+  ipcMain.handle(
+    GENERATION_IPC_CHANNELS.analyzeImageLayers,
+    trustedHandler(async (request: AnalyzeImageLayersRequest) => {
+      if (!isAnalyzeImageLayersRequest(request)) {
+        return failure('INVALID_INPUT', '待分析图片无效、尺寸过大或模型参数不完整')
+      }
+      try {
+        return success(await imageLayerAnalysisService.analyze(request))
+      } catch (error) {
+        if (error instanceof ImageLayerAnalysisServiceError) {
+          return failure(imageLayerAnalysisDesktopErrorCode(error.code), error.message)
+        }
+        return failure('PROVIDER_ERROR', '图片图层分析失败，请稍后重试')
       }
     }),
   )

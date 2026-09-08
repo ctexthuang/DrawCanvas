@@ -2,6 +2,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   AddProviderModelRequest,
+  AnalyzeImageLayersRequest,
   CanvasDocument,
   CheckForUpdatesRequest,
   ClearProviderApiKeyRequest,
@@ -134,6 +135,8 @@ const desktopApi: FileDropDesktopApi = {
   },
   generation: {
     generateImage: (request: GenerateImageRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateImage, request),
+    analyzeImageLayers: (request: AnalyzeImageLayersRequest) =>
+      ipcRenderer.invoke(GENERATION_IPC_CHANNELS.analyzeImageLayers, request),
     generateVideo: (request: GenerateVideoRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateVideo, request),
     generateAudio: (request: GenerateAudioRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.generateAudio, request),
     optimizePrompt: (request: OptimizePromptRequest) => ipcRenderer.invoke(GENERATION_IPC_CHANNELS.optimizePrompt, request),
