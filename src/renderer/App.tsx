@@ -257,14 +257,16 @@ export function App() {
     }
 
     const defaultImageModelKey = primaryModelKey(settings.modelRoutes, 'image') ?? ''
-    const defaultImageModelName = settings.models.find(
+    const defaultImageModel = settings.models.find(
       (model) => model.key === defaultImageModelKey,
-    )?.displayName ?? '默认图片模型'
+    )
+    const defaultImageProvider = settings.providers.find((provider) => provider.id === defaultImageModel?.providerId)
     setCanvasDocument(createInitialCanvas(
       nextUntitledCanvasName(knownProjects, canvasIsActive ? canvasDocument.name : undefined),
       prompt,
       defaultImageModelKey,
-      defaultImageModelName,
+      defaultImageModel?.displayName ?? '默认图片模型',
+      defaultImageProvider?.adapterId,
     ))
     setCanvasIsActive(true)
     setPage('canvas')

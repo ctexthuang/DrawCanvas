@@ -2025,18 +2025,20 @@ function normalizeConfiguredModels(
   providers: ReadonlyArray<StoredProvider>,
 ): ReadonlyArray<ConfiguredProviderModel> {
   if (!Array.isArray(value)) return []
-  const providerIds = new Set(providers.map((provider) => provider.id))
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const keys = new Set<string>()
   const models: ConfiguredProviderModel[] = []
   for (const item of value) {
     if (!item || typeof item !== 'object') continue
     if (!isBoundedString(item.key, 400) || keys.has(item.key)) continue
-    if (!isBoundedString(item.providerId, 128) || !providerIds.has(item.providerId)) continue
+    if (!isBoundedString(item.providerId, 128)) continue
+    const provider = providersById.get(item.providerId)
+    if (!provider) continue
     if (!isBoundedString(item.remoteModelId, 200)) continue
     if (item.key !== createProviderModelKey(item.providerId, item.remoteModelId)) continue
     if (!isBoundedString(item.displayName, 200) || !isModelKind(item.kind)) continue
     if (item.source !== 'builtin' && item.source !== 'discovered' && item.source !== 'manual') continue
-    const builtin = findBuiltinModelByKey(item.key)
+    const builtin = findBuiltinModelByKey(item.key, provider.adapterId ?? legacyProviderAdapter(provider.id))
     keys.add(item.key)
     models.push({
       ...(builtin ?? {}),

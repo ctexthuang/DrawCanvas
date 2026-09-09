@@ -1,14 +1,16 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { InfiniteCanvas } from '../../src/renderer/features/canvas/InfiniteCanvas'
+import { createInitialCanvas, InfiniteCanvas, type CanvasImageModelOption } from '../../src/renderer/features/canvas/InfiniteCanvas'
 import '../../src/renderer/styles.css'
-import type { CanvasDocument } from '../../src/shared/contracts/desktop'
+import type { CanvasDocument, GenerateImageRequest } from '../../src/shared/contracts/desktop'
 
 declare global {
   interface Window {
     regressionDocument: CanvasDocument
     setRegressionDocument: (document: CanvasDocument) => void
     regressionFiles: File[]
+    regressionImageRequests: GenerateImageRequest[]
+    createRegressionCanvas: typeof createInitialCanvas
   }
 }
 
@@ -27,6 +29,13 @@ const noop = () => {}
 const noResult = async () => ({ ok: false as const, error: 'No provider calls in regression tests' })
 const noImages = async () => []
 const loadImage = async () => dataUrl
+const imageModels: ReadonlyArray<CanvasImageModelOption> = [
+  { key: 'custom-openai:gpt-image-2.5-flare', label: 'GPT Image 2.5 Flare', adapterId: 'openai' },
+  { key: 'custom-relay:gpt-image-2.5-sunburst', label: 'GPT Image 2.5 Sunburst', adapterId: 'openai-sub2api' },
+  { key: 'custom-openai:gpt-image-1', label: 'GPT Image 1', adapterId: 'openai' },
+]
+window.regressionImageRequests = []
+window.createRegressionCanvas = createInitialCanvas
 
 const initial: CanvasDocument = {
   version: 1,
@@ -61,10 +70,13 @@ function Fixture() {
   window.setRegressionDocument = setValue
   return <div style={{ height: '100vh' }}>
     <InfiniteCanvas
-      document={value} onChange={setValue} audioModels={[]} chatModels={[]} imageModels={[]} videoModels={[]}
-      defaultAudioModelKey="" defaultChatModelKey="" defaultImageModelKey="" defaultVideoModelKey=""
+      document={value} onChange={setValue} audioModels={[]} chatModels={[]} imageModels={imageModels} videoModels={[]}
+      defaultAudioModelKey="" defaultChatModelKey="" defaultImageModelKey={imageModels[0].key} defaultVideoModelKey=""
       onAnalyzeImageLayers={noResult} onGenerateAudio={noResult} onGenerateChatReply={noResult}
-      onGenerateImage={noResult} onGenerateStoryboard={noResult} onGenerateVideo={noResult}
+      onGenerateImage={async (request) => {
+        window.regressionImageRequests.push(request)
+        return noResult()
+      }} onGenerateStoryboard={noResult} onGenerateVideo={noResult}
       onOptimizePrompt={noResult} onImportImages={noImages} onImportDroppedImages={noImages}
       onImportPastedImages={async (files) => {
         window.regressionFiles = [...files]

@@ -124,7 +124,38 @@ function imageSizeMapping(
 
 type OpenAiModelCatalogEntry = Readonly<Omit<ProviderModelDefinition, 'key' | 'providerId'>>
 
+const GPT_IMAGE_2_SIZE_MAPPINGS: ReadonlyArray<ImageGenerationSizeMapping> = [
+  imageSizeMapping('1024x1024', '1:1', 'standard'),
+  imageSizeMapping('1536x1024', '3:2', 'standard'),
+  imageSizeMapping('1024x1536', '2:3', 'standard'),
+  imageSizeMapping('2048x2048', '1:1', '2k'),
+  imageSizeMapping('2048x1152', '16:9', '2k'),
+  imageSizeMapping('3840x2160', '16:9', '4k'),
+  imageSizeMapping('2160x3840', '9:16', '4k'),
+]
+
 const OPENAI_MODEL_CATALOG: ReadonlyArray<OpenAiModelCatalogEntry> = [
+  ...([
+    {
+      remoteModelId: 'gpt-image-2.5-flare',
+      displayName: 'GPT Image 2.5 Flare',
+      description: '适合日常高质量图像生成与快速编辑',
+    },
+    {
+      remoteModelId: 'gpt-image-2.5-sunburst',
+      displayName: 'GPT Image 2.5 Sunburst',
+      description: '适合高质量图像生成与精细编辑',
+    },
+  ] as const).flatMap((model): ReadonlyArray<OpenAiModelCatalogEntry> =>
+    ['', '-2026-09-08'].map((snapshot) => ({
+      ...model,
+      remoteModelId: `${model.remoteModelId}${snapshot}`,
+      displayName: `${model.displayName}${snapshot ? ' (2026-09-08)' : ''}`,
+      kind: 'image',
+      supportsAutomaticImageSize: true,
+      imageSizeMappings: GPT_IMAGE_2_SIZE_MAPPINGS,
+    })),
+  ),
   {
     remoteModelId: 'gpt-image-2',
     displayName: 'GPT Image 2',
@@ -132,15 +163,7 @@ const OPENAI_MODEL_CATALOG: ReadonlyArray<OpenAiModelCatalogEntry> = [
     description: '默认图像生成模型',
     badge: '推荐',
     supportsAutomaticImageSize: true,
-    imageSizeMappings: [
-      imageSizeMapping('1024x1024', '1:1', 'standard'),
-      imageSizeMapping('1536x1024', '3:2', 'standard'),
-      imageSizeMapping('1024x1536', '2:3', 'standard'),
-      imageSizeMapping('2048x2048', '1:1', '2k'),
-      imageSizeMapping('2048x1152', '16:9', '2k'),
-      imageSizeMapping('3840x2160', '16:9', '4k'),
-      imageSizeMapping('2160x3840', '9:16', '4k'),
-    ],
+    imageSizeMappings: GPT_IMAGE_2_SIZE_MAPPINGS,
   },
   {
     remoteModelId: 'gpt-image-1.5',
@@ -445,7 +468,18 @@ export const BUILTIN_PROVIDER_MODELS: ReadonlyArray<ProviderModelDefinition> = [
   // },
 ]
 
-export function findBuiltinModelByKey(key: string): ProviderModelDefinition | undefined {
+export function findBuiltinModelByKey(
+  key: string,
+  adapterId?: ProviderAdapterId,
+): ProviderModelDefinition | undefined {
+  if (adapterId) {
+    const separator = key.indexOf(':')
+    if (separator <= 0) return undefined
+    const remoteModelId = key.slice(separator + 1)
+    return BUILTIN_PROVIDER_MODELS.find((model) =>
+      model.providerId === adapterId && model.remoteModelId === remoteModelId,
+    )
+  }
   return BUILTIN_PROVIDER_MODELS.find((model) => model.key === key)
 }
 
@@ -459,8 +493,11 @@ export function isImageGenerationSize(value: unknown): value is ImageGenerationS
   return typeof value === 'string' && IMAGE_GENERATION_SIZE_SET.has(value)
 }
 
-export function imageGenerationSizeOptionsForModel(modelKey: string): ReadonlyArray<ImageGenerationSizeOption> {
-  const model = findBuiltinModelByKey(modelKey)
+export function imageGenerationSizeOptionsForModel(
+  modelKey: string,
+  adapterId?: ProviderAdapterId,
+): ReadonlyArray<ImageGenerationSizeOption> {
+  const model = findBuiltinModelByKey(modelKey, adapterId)
   const mappings = model?.kind === 'image' && model.imageSizeMappings?.length
     ? model.imageSizeMappings
     : [imageSizeMapping('1024x1024', '1:1', 'standard')]
@@ -473,15 +510,19 @@ export function imageGenerationSizeOptionsForModel(modelKey: string): ReadonlyAr
     : mappedOptions
 }
 
-export function defaultImageGenerationSizeForModel(modelKey: string): ImageGenerationSize {
-  const model = findBuiltinModelByKey(modelKey)
+export function defaultImageGenerationSizeForModel(modelKey: string, adapterId?: ProviderAdapterId): ImageGenerationSize {
+  const model = findBuiltinModelByKey(modelKey, adapterId)
   return model?.kind === 'image' && model.imageSizeMappings?.length
     ? model.imageSizeMappings[0].value
     : '1024x1024'
 }
 
-export function isImageGenerationSizeSupported(modelKey: string, size: ImageGenerationSize): boolean {
-  const model = findBuiltinModelByKey(modelKey)
+export function isImageGenerationSizeSupported(
+  modelKey: string,
+  size: ImageGenerationSize,
+  adapterId?: ProviderAdapterId,
+): boolean {
+  const model = findBuiltinModelByKey(modelKey, adapterId)
   if (!model) return size === '1024x1024'
   if (model.kind !== 'image') return false
   if (size === 'auto') return model.supportsAutomaticImageSize === true
@@ -491,9 +532,10 @@ export function isImageGenerationSizeSupported(modelKey: string, size: ImageGene
 export function normalizeImageGenerationSize(
   modelKey: string,
   size: ImageGenerationSize | undefined,
+  adapterId?: ProviderAdapterId,
 ): ImageGenerationSize {
-  if (size && isImageGenerationSizeSupported(modelKey, size)) return size
-  const model = findBuiltinModelByKey(modelKey)
+  if (size && isImageGenerationSizeSupported(modelKey, size, adapterId)) return size
+  const model = findBuiltinModelByKey(modelKey, adapterId)
   if (size && size !== 'auto' && model?.kind === 'image' && model.imageSizeMappings?.length) {
     const sourceRatio = imageSizeRatio(size)
     const matchingRatio = model.imageSizeMappings.find((candidate) =>
@@ -508,7 +550,7 @@ export function normalizeImageGenerationSize(
     )
     return nearestRatio.value
   }
-  return defaultImageGenerationSizeForModel(modelKey)
+  return defaultImageGenerationSizeForModel(modelKey, adapterId)
 }
 
 function imageGenerationSizeLabel(mapping: ImageGenerationSizeMapping): string {

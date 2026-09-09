@@ -132,7 +132,7 @@ export async function generateOpenAiCompatibleImage(
           prompt,
           size,
           n: 1,
-          ...(profile === 'sub2api' ? { response_format: 'b64_json' } : {}),
+          ...(requiresExplicitImageResponseFormat(model, profile) ? { response_format: 'b64_json' } : {}),
         }),
         signal: controller.signal,
         bypassCustomProtocolHandlers: true,
@@ -430,11 +430,16 @@ function createImageEditForm(
   body.set('prompt', prompt)
   body.set('size', size)
   body.set('n', '1')
-  if (profile === 'sub2api') body.set('response_format', 'b64_json')
+  if (requiresExplicitImageResponseFormat(model, profile)) body.set('response_format', 'b64_json')
   for (const reference of referenceImages) {
     body.append('image[]', new Blob([Uint8Array.from(reference.bytes).buffer], { type: reference.mediaType }), reference.fileName)
   }
   return body
+}
+
+function requiresExplicitImageResponseFormat(model: string, profile: OpenAiCompatibleProfile): boolean {
+  // GPT Image always returns base64 and rejects the legacy response_format parameter.
+  return profile === 'sub2api' && !model.startsWith('gpt-image-')
 }
 
 function referenceImageDataUrl(reference: ImageReferenceInput): string {

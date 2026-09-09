@@ -313,8 +313,9 @@ export function createInitialCanvas(
   prompt?: string,
   defaultImageModelKey = DEFAULT_IMAGE_MODEL_KEY,
   defaultImageModelName = 'GPT Image 2',
+  defaultImageAdapterId?: ProviderAdapterId,
 ): CanvasDocument {
-  const defaultImageSize = defaultImageGenerationSizeForModel(defaultImageModelKey)
+  const defaultImageSize = defaultImageGenerationSizeForModel(defaultImageModelKey, defaultImageAdapterId)
   return {
     version: 1,
     id: crypto.randomUUID(),
@@ -1252,6 +1253,7 @@ export function InfiniteCanvas({ audioModels, chatModels, defaultAudioModelKey, 
       latestSource.type === 'generator' || latestSource.type === 'compositor'
         ? latestSource.imageSize
         : undefined,
+      imageModels.find((model) => model.key === effectiveModelKey)?.adapterId,
     )
     const count = latestSource.type === 'generator' || latestSource.type === 'compositor'
       ? latestSource.generationCount ?? 1
@@ -3143,8 +3145,8 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
 }>) {
   const effectiveModelKey = node.modelKey ?? defaultImageModelKey
   const selectedModel = imageModels.find((model) => model.key === effectiveModelKey)
-  const sizeOptions = imageGenerationSizeOptionsForModel(effectiveModelKey)
-  const selectedImageSize = normalizeImageGenerationSize(effectiveModelKey, node.imageSize)
+  const sizeOptions = imageGenerationSizeOptionsForModel(effectiveModelKey, selectedModel?.adapterId)
+  const selectedImageSize = normalizeImageGenerationSize(effectiveModelKey, node.imageSize, selectedModel?.adapterId)
   return (
     <div className="generator-node-body">
       {isCompositor && (
@@ -3174,7 +3176,7 @@ function ImageGenerationNodeControls({ activeGenerationCount, defaultImageModelK
             const modelKey = event.target.value || undefined
             const nextEffectiveModelKey = modelKey ?? defaultImageModelKey
             const model = imageModels.find((item) => item.key === nextEffectiveModelKey)
-            const imageSize = normalizeImageGenerationSize(nextEffectiveModelKey, node.imageSize)
+            const imageSize = normalizeImageGenerationSize(nextEffectiveModelKey, node.imageSize, model?.adapterId)
             onUpdate(isCompositor
               ? { modelKey, imageSize }
               : { modelKey, imageSize, subtitle: `${modelKey ? '' : '跟随默认 · '}${model?.label ?? '图片模型'} · ${formatImageSize(imageSize)}` })
@@ -3570,8 +3572,9 @@ function createNodeData(
 ): CanvasNodeData {
   const count = document.nodes.filter((node) => node.type === type).length + 1
   const labels: Record<CanvasNodeType, string> = { prompt: '创意提示词', storyboard: '分镜提示词', 'shot-list': '分镜节点', generator: '图像生成', compositor: '图片合成', image: '图片素材', 'layer-split': '图层拆分', 'reference-folder': '参考图文件夹', note: '新便签', chat: 'AI 对话', video: '视频生成', audio: '语音生成' }
-  const defaultImageModelName = imageModels.find((model) => model.key === defaultImageModelKey)?.label ?? '默认图片模型'
-  const defaultImageSize = defaultImageGenerationSizeForModel(defaultImageModelKey)
+  const defaultImageModel = imageModels.find((model) => model.key === defaultImageModelKey)
+  const defaultImageModelName = defaultImageModel?.label ?? '默认图片模型'
+  const defaultImageSize = defaultImageGenerationSizeForModel(defaultImageModelKey, defaultImageModel?.adapterId)
   const defaultVideoModelName = videoModels.find((model) => model.key === defaultVideoModelKey)?.label ?? '默认视频模型'
   return {
     id: `${type}-${crypto.randomUUID()}`,

@@ -102,4 +102,10 @@ macOS 用户首次双击若被 Gatekeeper 拦截，可在尝试启动后的约�
 
 所有 JSON 更新在主进程串行执行，并通过临时文件替换完成原子写入，避免并发请求相互覆盖。旧版散落在 Electron `userData` 根目录的文件会自动迁入统一目录；API Key 使用操作系统安全存储加密，renderer 和 preload 都不会接收已保存的明文密钥。
 
-模型使用 `providerId:remoteModelId` 作为唯一键，例如 `openai-relay:gpt-image-2`。内置映射按服务商隔离；OpenAI Relay 映射 `gpt-image-2`、`gpt-image-1.5` 和 `gpt-image-1`，默认图像模型为 `gpt-image-2`；同时内置常用 GPT 对话模型，默认对话模型为 `gpt-5.6-sol`。接口发现的模型同样归属于执行发现请求的服务商，不会跨服务商混用。
+模型使用 `providerId:remoteModelId` 作为唯一键，例如 `openai-relay:gpt-image-2`。新建 API 服务不会自动填充模型目录；点击“获取模型”或手动添加后才显示模型，默认与备用模型由用户配置，升级不会替换已有选择。
+
+OpenAI 与 OpenAI 兼容协议支持 `gpt-image-2.5-flare`、`gpt-image-2.5-sunburst` 及其 `-2026-09-08` 快照，同时保留 `gpt-image-2`、`gpt-image-1.5` 和 `gpt-image-1` 的映射。图像尺寸能力按实际协议适配器和完整上游模型 ID 匹配，支持自定义服务 ID；模型、密钥和路由仍按服务商隔离。GPT Image 请求使用原始模型 ID 调用文生图或参考图编辑接口，不发送旧模型专用的 `response_format`。2.5 型号提供自动、标准横竖图、2K 和 4K 预设；超过 `2560x1440` 的分辨率在官方接口中仍属于实验性支持，实际可用性取决于上游。
+
+模型回归测试：`node scripts/model-regression.mjs`。测试使用隔离的临时数据目录与模拟 Electron 网络接口，不读取本机模型密钥，也不会产生上游调用费用。
+
+图片默认路由会跳过不支持所选尺寸的候选模型，继续尝试后续选择，不会自动降低分辨率。节点固定选择模型时，尺寸不兼容会直接报错，不切换模型；鉴权失败和上游参数拒绝也不会触发自动切换。

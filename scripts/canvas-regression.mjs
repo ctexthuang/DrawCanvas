@@ -157,6 +157,73 @@ try {
     path: join(outputDirectory, 'connection-port.png'),
     clip: { x: sample.x - 20, y: sample.y - 65, width: 200, height: 130 },
   })
+
+  await page.evaluate(() => {
+    window.regressionImageRequests = []
+    window.setRegressionDocument({
+      version: 1, id: 'image-model-regression', name: 'Image models',
+      updatedAt: new Date().toISOString(), viewport: { x: 20, y: 20, zoom: 1 },
+      nodes: [
+        { id: 'prompt', type: 'prompt', title: 'Prompt', subtitle: 'Test image', x: 0, y: 0 },
+        { id: 'generator', type: 'generator', title: 'Image generation', x: 330, y: 0, imageSize: '1536x1024' },
+        {
+          id: 'compositor', type: 'compositor', title: 'Image editing', x: 660, y: 0,
+          subtitle: 'Combine the references', modelKey: 'custom-relay:gpt-image-2.5-sunburst', imageSize: 'auto',
+        },
+        { id: 'reference-1', type: 'image', title: 'Reference 1', x: 0, y: 360, imageFileName: 'source.png' },
+        { id: 'reference-2', type: 'image', title: 'Reference 2', x: 330, y: 360, imageFileName: 'reference-2.png' },
+      ],
+      connections: [
+        { id: 'prompt-generator', from: 'prompt', to: 'generator' },
+        { id: 'reference-1-compositor', from: 'reference-1', to: 'compositor' },
+        { id: 'reference-2-compositor', from: 'reference-2', to: 'compositor' },
+      ],
+    })
+  })
+  const generator = page.locator('article[data-node-id="generator"]')
+  const compositor = page.locator('article[data-node-id="compositor"]')
+  const modelSelect = generator.getByRole('combobox', { name: /^模型/ })
+  const sizeSelect = generator.getByRole('combobox', { name: /^尺寸/ })
+  await generator.waitFor()
+  assert.equal(await sizeSelect.inputValue(), '1536x1024', 'Default custom-provider model preserves landscape size')
+  const expectedSizes = ['auto', '1024x1024', '1536x1024', '1024x1536', '2048x2048', '2048x1152', '3840x2160', '2160x3840']
+  assert.deepEqual(await sizeSelect.locator('option').evaluateAll((items) => items.map((item) => item.value)), expectedSizes)
+  await sizeSelect.selectOption('auto')
+  await generator.getByRole('button', { name: '生成图片', exact: true }).click()
+  await page.waitForFunction(() => window.regressionImageRequests.length === 1)
+  const defaultRequest = await page.evaluate(() => window.regressionImageRequests[0])
+  assert.equal(defaultRequest.modelKey, undefined, 'Following the default must leave fallback routing enabled')
+  assert.equal(defaultRequest.size, 'auto')
+
+  await modelSelect.selectOption('custom-relay:gpt-image-2.5-sunburst')
+  assert.equal(await sizeSelect.inputValue(), 'auto')
+  await sizeSelect.selectOption('3840x2160')
+  await generator.getByRole('button', { name: '生成图片', exact: true }).click()
+  await page.waitForFunction(() => window.regressionImageRequests.length === 2)
+  const explicitRequest = await page.evaluate(() => window.regressionImageRequests[1])
+  assert.equal(explicitRequest.modelKey, 'custom-relay:gpt-image-2.5-sunburst')
+  assert.equal(explicitRequest.size, '3840x2160')
+  await modelSelect.selectOption('custom-openai:gpt-image-1')
+  assert.equal(await sizeSelect.inputValue(), '1536x1024', 'Older models should normalize to a supported size')
+  assert.equal(await sizeSelect.locator('option[value="3840x2160"]').count(), 0)
+
+  await compositor.getByRole('button', { name: '合成图片', exact: true }).click()
+  await page.waitForFunction(() => window.regressionImageRequests.length === 3)
+  const editRequest = await page.evaluate(() => window.regressionImageRequests[2])
+  assert.equal(editRequest.modelKey, 'custom-relay:gpt-image-2.5-sunburst')
+  assert.equal(editRequest.size, 'auto')
+  assert.deepEqual(editRequest.referenceImageFileNames, ['source.png', 'reference-2.png'])
+  await modelSelect.selectOption('custom-openai:gpt-image-2.5-flare')
+  await page.screenshot({ path: join(outputDirectory, 'image-models.png') })
+  console.log('PASS: canvas image-model switching, custom-provider sizes, default routing and reference-image requests')
+
+  const initialGenerator = await page.evaluate(() => window.createRegressionCanvas(
+    'Custom provider', 'Test prompt', 'custom-volcengine:doubao-seedream-5-0-260128', 'Seedream', 'volcengine',
+  ).nodes.find((node) => node.type === 'generator'))
+  assert.equal(initialGenerator.imageSize, '2048x2048', 'New canvases must use the actual adapter when selecting a default size')
+  assert.match(initialGenerator.subtitle, /2048/)
+  assert.equal(initialGenerator.modelKey, undefined, 'New canvases must keep following the default route')
+  console.log('PASS: new-canvas model defaults match custom-provider capabilities')
   assert.deepEqual(errors, [])
   console.log(`PASS: no browser exceptions; screenshots in ${outputDirectory}`)
 } finally {

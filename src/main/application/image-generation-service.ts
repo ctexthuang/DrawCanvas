@@ -1,6 +1,7 @@
 import type {
   GenerateImageRequest,
   GeneratedImageResult,
+  ImageGenerationSize,
   LoadedGeneratedImage,
 } from '../../shared/contracts/desktop'
 import {
@@ -43,6 +44,13 @@ export class ImageGenerationServiceError extends Error {
   }
 }
 
+class UnsupportedImageSizeError extends ImageGenerationServiceError {
+  constructor(modelName: string, size: ImageGenerationSize) {
+    super('PROVIDER_REQUEST', `${modelName} 不支持尺寸 ${size}，请在图像生成节点中重新选择`)
+    this.name = 'UnsupportedImageSizeError'
+  }
+}
+
 export class ImageGenerationService {
   constructor(private readonly appState: AppState) {}
 
@@ -55,11 +63,8 @@ export class ImageGenerationService {
         request.modelKey,
         isRetryableImageError,
         async ({ apiKey, model, provider }) => {
-          if (!isImageGenerationSizeSupported(model.key, request.size)) {
-            throw new ImageGenerationServiceError(
-              'PROVIDER_REQUEST',
-              `${model.displayName} 不支持尺寸 ${request.size}，请在图像生成节点中重新选择`,
-            )
+          if (!isImageGenerationSizeSupported(model.key, request.size, provider.adapterId)) {
+            throw new UnsupportedImageSizeError(model.displayName, request.size)
           }
           const generated = provider.adapterId === 'volcengine'
             ? await generateVolcengineImage(
@@ -145,6 +150,7 @@ function unsupportedImageProvider(): never {
 }
 
 function isRetryableImageError(error: unknown): boolean {
+  if (error instanceof UnsupportedImageSizeError) return true
   return error instanceof ImageGenerationRequestError && (
     error.code === 'NETWORK' ||
     error.code === 'DNS' ||
